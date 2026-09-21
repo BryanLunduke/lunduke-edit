@@ -7,3 +7,5 @@
 *.swp
 .meson/
 .cache/
+
+build/
