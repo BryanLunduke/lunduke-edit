@@ -2,13 +2,13 @@
 
 A light plain-text editor for the Lunduke Computer Operating System (LCOS).
 
-- **Version:** 0.1
+- **Version:** 0.2
 - **License:** GPL-3.0-or-later
-- **Stack:** C++17, Meson, gtkmm-3.0
+- **Stack:** C++17, Meson, gtkmm-3.0, gtksourceviewmm-3.0
 
 ```
 meson setup build && meson compile -C build
 ./build/lunduke-edit
 ```
 
-See `NOTES.md` for gaps vs a full Notepad clone.
+See `NOTES.md` for build notes and known gaps.
