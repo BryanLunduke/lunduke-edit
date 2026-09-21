@@ -1,4 +1,4 @@
-# Lunduke Edit 0.2 — notes
+# Lunduke Edit 0.3 — notes
 
 ## Build
 
@@ -11,31 +11,41 @@ meson compile -C build
 
 Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥3.18**.
 
-LCOS packaging will need `libgtksourceviewmm-3.0` (runtime) and the matching `-dev` package for builds. No `.deb` in this pass.
+## Debian package (overlay apt only)
+
+```
+./packaging/build-deb.sh
+# → packaging/debs/lunduke-edit_0.3-1_amd64.deb
+```
+
+Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
 
 ## Screenshot (dev)
 
 ```
-DISPLAY=:7 ./build/lunduke-edit &
-# open Search → Find… then:
-import -window "$(xdotool search --name 'Find' | head -1)" \
-  /workspace/uploads/lunduke-edit-0.2-find-replace.png
+DISPLAY=:2 ./build/lunduke-edit &
+# File → Print… then:
+import -window "$(xdotool search --name 'Print' | head -1)" \
+  /workspace/uploads/lunduke-edit-0.3-print.png
 ```
 
-## 0.2 features
+## 0.3 features
 
-- **Undo / Redo**: via `GtkSourceView` / `Gsv::Buffer` (`can_undo` / `can_redo`, Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y). Menu items enable from buffer state.
-- **Find & Replace**: BBEdit Lite–inspired dialog (Search → Find…, Ctrl+F). Find Next remains F3. Options: Start at Top, Wrap Around, Search Backwards, Search Selection Only, Extend Selection, Case Sensitive, Match Entire Words. Buttons: Find, Find All, Replace, Replace All, Don’t Find, Cancel. No Grep / multi-file.
+- **Print…** (File → Print…, Ctrl+P): `Gtk::PrintOperation` draw-pages from the text buffer / GtkSourceView (Pango layout, multi-page).
+- **Page Setup…**: `Gtk::run_page_setup_dialog` / print settings retained across jobs; print dialog also embeds page setup.
+
+## 0.2 features (still present)
+
+- **Undo / Redo**: via `GtkSourceView` / `Gsv::Buffer` (`can_undo` / `can_redo`, Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y).
+- **Find & Replace**: BBEdit Lite–inspired dialog (Search → Find…, Ctrl+F).
 - **Go to Line**: Search → Go to Line… (Ctrl+G).
-- **Encoding**: UTF-8 (default) and Latin-1 (ISO-8859-1). Text menu radios + status bar. Open/Save use `Glib::convert`.
-- **Open Recent**: File → Open Recent (last ~8 paths; keyfile under `~/.config/lunduke-edit/recents.txt`, also registered with `Gio::RecentManager`).
+- **Encoding**: UTF-8 / Latin-1.
+- **Open Recent**: File → Open Recent.
 
 ## Known gaps
 
-- **Print / Page Setup**: not implemented.
 - **Grep / multi-file find**: intentionally omitted.
-- **Syntax highlighting**: SourceView is used for undo only; no language styles wired yet.
-- **No .deb / packaging** in this pass.
+- **Syntax highlighting**: SourceView is used for undo; no language styles wired yet.
 - **Find All** highlights all hits with a tag and selects the first; GTK only supports one selection range.
 - **Desktop/metainfo**: minimal `.desktop` only; AppStream / icons optional/future.
 

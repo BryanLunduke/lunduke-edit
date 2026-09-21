@@ -9,3 +9,6 @@
 .cache/
 
 build/
+packaging/src/
+packaging/debs/
+build-deb/

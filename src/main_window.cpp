@@ -16,9 +16,14 @@
 #include <gtkmm/filechooserdialog.h>
 #include <gtkmm/fontchooserdialog.h>
 #include <gtkmm/messagedialog.h>
+#include <gtkmm/pagesetup.h>
+#include <gtkmm/printoperation.h>
+#include <gtkmm/printsettings.h>
 #include <gtkmm/radiobutton.h>
 #include <gtkmm/stock.h>
 #include <gtkmm/stylecontext.h>
+
+#include <cmath>
 
 #include <algorithm>
 #include <fstream>
@@ -28,16 +33,18 @@
 namespace lundukeedit {
 namespace {
 
-const char* kVersion = "0.2";
+const char* kVersion = "0.3";
 
 const char* kSampleText =
-    "LUNDUKE EDIT 0.2.\n"
+    "LUNDUKE EDIT 0.3.\n"
     "\n"
     "This is a toy mashup of Windows 95 Notepad,\n"
     "Macintosh SimpleText, and BBEdit Lite.\n"
     "\n"
     "Just enough features to be useful,\n"
     "but still light, fast, and late-1996.\n"
+    "\n"
+    "File → Print… (Ctrl+P) and Page Setup… ship in 0.3.\n"
     "\n"
     "For fictional use only.\n"
     "— Philip\n";
@@ -229,6 +236,20 @@ void MainWindow::build_menus() {
                              Gdk::CONTROL_MASK | Gdk::SHIFT_MASK,
                              Gtk::ACCEL_VISIBLE);
   file_menu->append(*save_as_i);
+
+  file_menu->append(*Gtk::manage(new Gtk::SeparatorMenuItem()));
+
+  auto* page_setup_i = Gtk::manage(new Gtk::MenuItem("Page Set_up…", true));
+  page_setup_i->signal_activate().connect(
+      sigc::mem_fun(*this, &MainWindow::on_page_setup));
+  file_menu->append(*page_setup_i);
+
+  auto* print_i = Gtk::manage(new Gtk::MenuItem("_Print…", true));
+  print_i->signal_activate().connect(
+      sigc::mem_fun(*this, &MainWindow::on_print));
+  print_i->add_accelerator("activate", get_accel_group(), GDK_KEY_p,
+                           Gdk::CONTROL_MASK, Gtk::ACCEL_VISIBLE);
+  file_menu->append(*print_i);
 
   file_menu->append(*Gtk::manage(new Gtk::SeparatorMenuItem()));
 
@@ -1302,6 +1323,116 @@ void MainWindow::on_font() {
   if (dlg.run() == Gtk::RESPONSE_OK) {
     apply_font(dlg.get_font_desc());
   }
+}
+
+
+void MainWindow::on_page_setup() {
+  if (!print_settings_) {
+    print_settings_ = Gtk::PrintSettings::create();
+  }
+  if (!page_setup_) {
+    page_setup_ = Gtk::PageSetup::create();
+  }
+  page_setup_ =
+      Gtk::run_page_setup_dialog(*this, page_setup_, print_settings_);
+}
+
+void MainWindow::on_begin_print(
+    const Glib::RefPtr<Gtk::PrintContext>& context) {
+  print_layout_ = context->create_pango_layout();
+  print_layout_->set_font_description(font_desc_);
+  print_layout_->set_width(
+      static_cast<int>(std::floor(context->get_width() * Pango::SCALE)));
+  print_layout_->set_wrap(Pango::WRAP_WORD_CHAR);
+  print_layout_->set_text(buffer()->get_text());
+
+  print_page_breaks_.clear();
+
+  const double page_height = context->get_height();
+  double page_used = 0.0;
+  const int n_lines = print_layout_->get_line_count();
+  for (int i = 0; i < n_lines; ++i) {
+    auto line = print_layout_->get_line(i);
+    Pango::Rectangle ink, logical;
+    line->get_extents(ink, logical);
+    const double line_height =
+        static_cast<double>(logical.get_height()) / Pango::SCALE;
+    if (i > 0 && page_used + line_height > page_height) {
+      print_page_breaks_.push_back(i);
+      page_used = 0.0;
+    }
+    page_used += line_height;
+  }
+}
+
+void MainWindow::on_draw_page(const Glib::RefPtr<Gtk::PrintContext>& context,
+                              int page_nr) {
+  if (!print_layout_) {
+    return;
+  }
+  auto cr = context->get_cairo_context();
+  cr->set_source_rgb(0.0, 0.0, 0.0);
+
+  int start_line = 0;
+  if (page_nr > 0) {
+    start_line = print_page_breaks_[static_cast<std::size_t>(page_nr - 1)];
+  }
+  int end_line = print_layout_->get_line_count();
+  if (static_cast<std::size_t>(page_nr) < print_page_breaks_.size()) {
+    end_line = print_page_breaks_[static_cast<std::size_t>(page_nr)];
+  }
+
+  double y = 0.0;
+  for (int i = start_line; i < end_line; ++i) {
+    auto line = print_layout_->get_line(i);
+    Pango::Rectangle ink, logical;
+    line->get_extents(ink, logical);
+    cr->move_to(static_cast<double>(logical.get_x()) / Pango::SCALE, y);
+    line->show_in_cairo_context(cr);
+    y += static_cast<double>(logical.get_height()) / Pango::SCALE;
+  }
+}
+
+void MainWindow::on_print() {
+  if (!print_settings_) {
+    print_settings_ = Gtk::PrintSettings::create();
+  }
+  if (!page_setup_) {
+    page_setup_ = Gtk::PageSetup::create();
+  }
+
+  auto op = Gtk::PrintOperation::create();
+  op->set_print_settings(print_settings_);
+  op->set_default_page_setup(page_setup_);
+  op->set_embed_page_setup(true);
+  op->set_unit(Gtk::UNIT_POINTS);
+  op->set_job_name(current_basename());
+  op->set_allow_async(false);
+
+  op->signal_begin_print().connect(
+      [this, op](const Glib::RefPtr<Gtk::PrintContext>& context) {
+        on_begin_print(context);
+        const int n_pages = static_cast<int>(print_page_breaks_.size()) + 1;
+        op->set_n_pages(std::max(1, n_pages));
+      });
+  op->signal_draw_page().connect(
+      sigc::mem_fun(*this, &MainWindow::on_draw_page));
+
+  try {
+    const auto result =
+        op->run(Gtk::PRINT_OPERATION_ACTION_PRINT_DIALOG, *this);
+    if (result == Gtk::PRINT_OPERATION_RESULT_APPLY) {
+      print_settings_ = op->get_print_settings();
+    }
+  } catch (const Gtk::PrintError& error) {
+    Gtk::MessageDialog err(*this, "Could not print.", false,
+                           Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
+    err.set_secondary_text(error.what());
+    err.run();
+  }
+
+  print_layout_.reset();
+  print_page_breaks_.clear();
 }
 
 void MainWindow::on_about() {

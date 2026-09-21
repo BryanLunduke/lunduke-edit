@@ -17,8 +17,12 @@
 #include <gtkmm/scrolledwindow.h>
 #include <gtkmm/separatormenuitem.h>
 #include <gtkmm/statusbar.h>
+#include <gtkmm/pagesetup.h>
+#include <gtkmm/printoperation.h>
+#include <gtkmm/printsettings.h>
 
 #include <gtksourceviewmm.h>
+#include <pangomm/layout.h>
 
 #include <string>
 #include <vector>
@@ -57,7 +61,12 @@ private:
   void on_open_recent(const std::string& path);
   void on_save();
   void on_save_as();
+  void on_page_setup();
+  void on_print();
   void on_exit();
+
+  void on_begin_print(const Glib::RefPtr<Gtk::PrintContext>& context);
+  void on_draw_page(const Glib::RefPtr<Gtk::PrintContext>& context, int page_nr);
   void rebuild_recents_menu();
   void remember_recent(const std::string& path);
 
@@ -139,6 +148,11 @@ private:
 
   FindOptions find_opts_;
   Glib::RefPtr<Gtk::TextTag> find_tag_;
+
+  Glib::RefPtr<Gtk::PrintSettings> print_settings_;
+  Glib::RefPtr<Gtk::PageSetup> page_setup_;
+  Glib::RefPtr<Pango::Layout> print_layout_;
+  std::vector<int> print_page_breaks_;  // line index starts for each page after 0
 
   static constexpr int kMaxRecents = 8;
   std::vector<std::string> recents_;

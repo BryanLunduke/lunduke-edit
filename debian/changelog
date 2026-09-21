@@ -1,0 +1,6 @@
+lunduke-edit (0.3-1) unstable; urgency=medium
+
+  * Print… (Ctrl+P) via Gtk::PrintOperation; Page Setup… dialog.
+  * Debian packaging for overlay apt (not default ISO).
+
+ -- LCOS <lcos@lunduke.com>  Sun, 20 Sep 2026 20:40:00 -0500
