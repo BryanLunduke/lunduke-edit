@@ -23,6 +23,7 @@
 #include <gtkmm/stock.h>
 #include <gtkmm/stylecontext.h>
 
+#include <cctype>
 #include <cmath>
 
 #include <algorithm>
@@ -33,10 +34,10 @@
 namespace lundukeedit {
 namespace {
 
-const char* kVersion = "0.3";
+const char* kVersion = "0.3.1";
 
 const char* kSampleText =
-    "LUNDUKE EDIT 0.3.\n"
+    "LUNDUKE EDIT 0.3.1.\n"
     "\n"
     "This is a toy mashup of Windows 95 Notepad,\n"
     "Macintosh SimpleText, and BBEdit Lite.\n"
@@ -68,6 +69,57 @@ std::string recents_path() {
       Glib::build_filename(Glib::get_user_config_dir(), "lunduke-edit");
   g_mkdir_with_parents(dir.c_str(), 0700);
   return Glib::build_filename(dir, "recents.txt");
+}
+
+std::string ascii_lower(std::string s) {
+  for (char& c : s) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
+bool has_known_text_extension(const std::string& path) {
+  const std::string base = ascii_lower(Glib::path_get_basename(path));
+  static const char* kExts[] = {".txt", ".md",  ".text", ".csv", ".log",
+                                ".json", ".xml", ".html", ".htm", ".css",
+                                ".c",    ".h",   ".cpp",  ".hpp", ".cc",
+                                ".py",   ".sh",  ".conf", ".cfg", ".ini",
+                                ".yaml", ".yml", ".rs",   ".go",  ".js",
+                                ".ts",   ".toml", nullptr};
+  for (int i = 0; kExts[i]; ++i) {
+    const std::string ext = kExts[i];
+    if (base.size() >= ext.size() &&
+        base.compare(base.size() - ext.size(), ext.size(), ext) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool basename_has_extension(const std::string& path) {
+  const std::string base = Glib::path_get_basename(path);
+  const auto dot = base.find_last_of('.');
+  // Treat leading-dot names (.bashrc) as having no "extension" for Save As.
+  return dot != std::string::npos && dot != 0 && dot + 1 < base.size();
+}
+
+// Prefer existing known text extensions; only append .txt when none.
+// Also collapse portal/filter accidental doubles like foo.txt.txt.
+std::string ensure_save_as_path(std::string path) {
+  while (path.size() >= 8) {
+    const std::string tail = ascii_lower(path.substr(path.size() - 8));
+    if (tail != ".txt.txt") {
+      break;
+    }
+    path.resize(path.size() - 4);
+  }
+  if (has_known_text_extension(path)) {
+    return path;
+  }
+  if (!basename_has_extension(path)) {
+    path += ".txt";
+  }
+  return path;
 }
 
 }  // namespace
@@ -124,8 +176,12 @@ MainWindow::MainWindow(Application& app) : app_(app) {
       sigc::mem_fun(*this, &MainWindow::on_buffer_changed));
   buf->signal_mark_set().connect(
       sigc::mem_fun(*this, &MainWindow::on_cursor_moved));
-  // Undo manager state changes with edits; refresh on changed + idle.
-  buf->signal_changed().connect(
+  // Undo/redo menu sensitivity must track GtkSourceView undo-manager state.
+  // signal_changed() alone is unreliable (keyboard undo via View bindings,
+  // and can-undo often notifies after changed). Use property notify + menu map.
+  buf->property_can_undo().signal_changed().connect(
+      sigc::mem_fun(*this, &MainWindow::update_undo_redo_sensitivity));
+  buf->property_can_redo().signal_changed().connect(
       sigc::mem_fun(*this, &MainWindow::update_undo_redo_sensitivity));
 
   show_all_children();
@@ -264,6 +320,10 @@ void MainWindow::build_menus() {
   auto* edit_item = Gtk::manage(new Gtk::MenuItem("_Edit", true));
   edit_item->set_submenu(*edit_menu);
   menubar_.append(*edit_item);
+  // Refresh Undo/Redo when the Edit menu is opened so items always match
+  // buffer->can_undo() / can_redo() (covers keyboard undo/redo paths).
+  edit_menu->signal_map().connect(
+      sigc::mem_fun(*this, &MainWindow::update_undo_redo_sensitivity));
 
   undo_item_ = Gtk::manage(new Gtk::MenuItem("_Undo", true));
   undo_item_->signal_activate().connect(
@@ -689,13 +749,22 @@ void MainWindow::on_save_as() {
   dlg.set_do_overwrite_confirmation(true);
   dlg.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
   dlg.add_button("_Save", Gtk::RESPONSE_ACCEPT);
+  auto filter = Gtk::FileFilter::create();
+  filter->set_name("Text files");
+  filter->add_mime_type("text/plain");
+  filter->add_pattern("*.txt");
+  filter->add_pattern("*.md");
+  filter->add_pattern("*");
+  dlg.add_filter(filter);
   if (!file_path_.empty()) {
     dlg.set_filename(file_path_);
   } else {
     dlg.set_current_name("readme.txt");
   }
   if (dlg.run() == Gtk::RESPONSE_ACCEPT) {
-    save_to_path(dlg.get_filename());
+    // Do not double-append .txt when the chosen name already has a known
+    // text extension (filter/portal auto-extension can produce foo.txt.txt).
+    save_to_path(ensure_save_as_path(dlg.get_filename()));
   }
 }
 

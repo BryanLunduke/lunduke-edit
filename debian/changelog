@@ -1,3 +1,12 @@
+lunduke-edit (0.3.1-1) unstable; urgency=medium
+
+  * Fix Edit→Undo/Redo menu sensitivity via can-undo/can-redo property notify
+    and Edit submenu map refresh (Ctrl+Z/Y already worked).
+  * Save As: avoid doubling .txt when name already has a text extension.
+  * README version bump to 0.3.1.
+
+ -- LCOS <lcos@lunduke.com>  Sun, 20 Sep 2026 23:30:00 -0500
+
 lunduke-edit (0.3-1) unstable; urgency=medium
 
   * Print… (Ctrl+P) via Gtk::PrintOperation; Page Setup… dialog.

@@ -1,4 +1,4 @@
-# Lunduke Edit 0.3 — notes
+# Lunduke Edit 0.3.1 — notes
 
 ## Build
 
@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.3-1_amd64.deb
+# → packaging/debs/lunduke-edit_0.3.1-1_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -24,10 +24,16 @@ Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (
 
 ```
 DISPLAY=:2 ./build/lunduke-edit &
-# File → Print… then:
-import -window "$(xdotool search --name 'Print' | head -1)" \
-  /workspace/uploads/lunduke-edit-0.3-print.png
+# After typing, open Edit with Undo enabled:
+import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
+  /workspace/uploads/lunduke-edit-0.3.1-undo-menu.png
 ```
+
+## 0.3.1 fixes
+
+- **Edit → Undo / Redo sensitivity**: connect `Gsv::Buffer` `property_can_undo` / `property_can_redo` notify (plus Edit submenu `signal_map`) so menu items track undo-manager state; keyboard Ctrl+Z / Ctrl+Y no longer leave the menu stale.
+- **Save As**: do not double-append `.txt` when the chosen basename already has a known text extension; only add `.txt` when there is no extension.
+- README version line matched to About (**0.3.1**).
 
 ## 0.3 features
 
