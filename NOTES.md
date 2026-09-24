@@ -32,7 +32,7 @@ import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
 ## 0.7
 
 - **LCOS identity**: app version **0.7** / Debian package **0.7-1** now tracks the LCOS release train (same convention as Lunduke Paint). No feature changes vs 0.3.2.
-- **App icon wiring**: `Icon=org.lunduke.LundukeEdit`, `StartupWMClass=lunduke-edit`, `set_default_icon_name` / `set_icon_name` / About `set_logo_icon_name`; meson installs hicolor PNGs when present; postinst runs `gtk-update-icon-cache`. Real artwork still needed from Bob.
+- **App icon**: `Icon=org.lunduke.LundukeEdit`, `StartupWMClass=lunduke-edit`, `set_default_icon_name` / `set_icon_name` / About `set_logo_icon_name`. Bob’s hicolor PNGs (16, 22, 24, 32, 48, 64, 96, 128, 256, 512) ship in the package; 1024 master is in-tree only. postinst runs `gtk-update-icon-cache`.
 - README / About / packaging / AppStream metainfo match **0.7**.
 
 ## 0.3.2 changes
@@ -66,7 +66,7 @@ import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
 - **Grep / multi-file find**: intentionally omitted.
 - **Syntax highlighting**: SourceView is used for undo; no language styles wired yet.
 - **Find All** highlights all hits with a tag and selects the first; GTK only supports one selection range.
-- **Icons**: desktop / WM / About use `org.lunduke.LundukeEdit` (Paint pattern). Hicolor PNGs not shipped yet — Bob owns artwork (`data/icons/README.md`). Until then About/window fall back to `accessories-text-editor`. AppStream metainfo: `org.lunduke.LundukeEdit.metainfo.xml`.
+- **Icons**: desktop / WM / About use `org.lunduke.LundukeEdit` with shipped hicolor PNGs (`data/icons/README.md`). Fallback `accessories-text-editor` remains if the theme lookup fails. AppStream metainfo: `org.lunduke.LundukeEdit.metainfo.xml`.
 
 ## Design notes
 

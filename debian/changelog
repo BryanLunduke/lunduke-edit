@@ -3,12 +3,13 @@ lunduke-edit (0.7-1) unstable; urgency=medium
   * Bump version to 0.7 / package 0.7-1 so Edit tracks LCOS releases
     (same convention as Lunduke Paint).
   * Wire app icon like Paint: Icon=org.lunduke.LundukeEdit, StartupWMClass,
-    set_default_icon_name / set_icon_name / About set_logo_icon_name; fall
-    back to accessories-text-editor until Bob’s hicolor PNGs land.
-  * Meson installs hicolor PNGs when present; postinst refreshes icon cache.
-  * Identity bump plus icon wiring; no feature changes since 0.3.2.
+    set_default_icon_name / set_icon_name / About set_logo_icon_name.
+  * Ship Bob’s hicolor app icon PNGs (16–512 including 96); meson installs
+    each present size; 1024 master stays in-tree only (not installed).
+  * postinst refreshes gtk icon cache.
+  * Identity bump plus app icon; no feature changes since 0.3.2.
 
- -- Phil <phil@brushpad.local>  Wed, 23 Sep 2026 20:25:00 -0700
+ -- Phil <phil@brushpad.local>  Wed, 23 Sep 2026 20:30:00 -0700
 
 lunduke-edit (0.3.2-1) unstable; urgency=medium
 

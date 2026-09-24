@@ -44,6 +44,7 @@ install_data(
 
 # App icon: hicolor PNGs are authoritative (Paint pattern). Install only sizes
 # that exist — Bob owns the artwork; see data/icons/README.md.
+# Do not install data/icons/org.lunduke.LundukeEdit-master.png (1024 source).
 fs = import('fs')
 app_icon_sizes = ['16', '22', '24', '32', '48', '64', '96', '128', '256', '512']
 foreach size : app_icon_sizes
