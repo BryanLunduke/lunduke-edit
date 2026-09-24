@@ -1,3 +1,12 @@
+lunduke-edit (0.7-3) unstable; urgency=medium
+
+  * Find & Replace dialog: tighten label→entry gaps; move Cancel to
+    bottom-right below Replace With; align middle checkbox column under
+    Match Entire Words (layout only).
+  * No Find/Replace behavior changes.
+
+ -- Phil <phil@brushpad.local>  Thu, 24 Sep 2026 00:45:00 -0500
+
 lunduke-edit (0.7-2) unstable; urgency=medium
 
   * Find & Replace dialog: tidy layout/spacing only (button column spacing,

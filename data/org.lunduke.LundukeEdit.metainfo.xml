@@ -27,6 +27,11 @@
     <category>TextEditor</category>
   </categories>
   <releases>
+    <release version="0.7.3" date="2026-09-24">
+      <description>
+        <p>Find &amp; Replace dialog layout tweaks: tighter labels, Cancel bottom-right, aligned checkbox column. Package 0.7-3.</p>
+      </description>
+    </release>
     <release version="0.7.2" date="2026-09-23">
       <description>
         <p>Find &amp; Replace dialog spacing/alignment tidy (layout only). Package 0.7-2.</p>
