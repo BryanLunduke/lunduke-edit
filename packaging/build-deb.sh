@@ -41,7 +41,7 @@ Architecture: amd64
 Installed-Size: ${SIZE}
 Maintainer: LCOS <lcos@lunduke.com>
 Homepage: https://lunduke.com
-Depends: ${SHLIBS_DEPS}, desktop-file-utils
+Depends: ${SHLIBS_DEPS}, desktop-file-utils, gtk-update-icon-cache
 Description: Lunduke Edit, a light GTK3 text editor for Linux X11
  Lunduke Edit is a classic menubar text editor for the Lunduke Computer
  Operating System. Look and feel: Windows 95 Notepad, Macintosh SimpleText,
@@ -54,6 +54,9 @@ set -e
 if [ "$1" = "configure" ]; then
   if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q /usr/share/icons/hicolor >/dev/null 2>&1 || true
   fi
 fi
 exit 0

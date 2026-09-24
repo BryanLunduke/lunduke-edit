@@ -3,7 +3,14 @@
 #include "application.hpp"
 #include "main_window.hpp"
 
+#include <gtkmm/window.h>
+
 namespace lundukeedit {
+namespace {
+
+constexpr const char* kAppId = "org.lunduke.LundukeEdit";
+
+}  // namespace
 
 Glib::RefPtr<Application> Application::create() {
   return Glib::RefPtr<Application>(new Application());
@@ -15,6 +22,8 @@ Application::Application()
 
 void Application::on_startup() {
   Gtk::Application::on_startup();
+  // WM / title-bar icon (xfwm4 etc.): desktop Icon= alone is not enough.
+  Gtk::Window::set_default_icon_name(kAppId);
 }
 
 bool Application::ensure_window() {

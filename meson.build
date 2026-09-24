@@ -42,3 +42,16 @@ install_data(
   install_dir: join_paths(get_option('datadir'), 'metainfo'),
 )
 
+# App icon: hicolor PNGs are authoritative (Paint pattern). Install only sizes
+# that exist — Bob owns the artwork; see data/icons/README.md.
+fs = import('fs')
+app_icon_sizes = ['16', '22', '24', '32', '48', '64', '96', '128', '256', '512']
+foreach size : app_icon_sizes
+  icon = 'data/icons/hicolor/' + size + 'x' + size + '/apps/org.lunduke.LundukeEdit.png'
+  if fs.exists(icon)
+    install_data(
+      icon,
+      install_dir: join_paths(get_option('datadir'), 'icons/hicolor/' + size + 'x' + size + '/apps'),
+    )
+  endif
+endforeach

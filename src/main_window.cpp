@@ -10,6 +10,7 @@
 #include <glibmm/fileutils.h>
 #include <glibmm/miscutils.h>
 #include <gtkmm/aboutdialog.h>
+#include <gtkmm/icontheme.h>
 #include <gtkmm/cssprovider.h>
 #include <gtkmm/dialog.h>
 #include <gtkmm/entry.h>
@@ -35,6 +36,18 @@ namespace lundukeedit {
 namespace {
 
 const char* kVersion = "0.7";
+constexpr const char* kAppId = "org.lunduke.LundukeEdit";
+constexpr const char* kFallbackIcon = "accessories-text-editor";
+
+// Prefer shipped hicolor app id (Paint pattern); fall back to freedesktop
+// text-editor name when Bob's artwork is not installed yet.
+Glib::ustring resolve_app_icon_name() {
+  auto theme = Gtk::IconTheme::get_default();
+  if (theme && theme->has_icon(kAppId)) {
+    return kAppId;
+  }
+  return kFallbackIcon;
+}
 
 std::string format_bytes(std::size_t n) {
   std::string digits = std::to_string(n);
@@ -114,8 +127,8 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   set_title("Untitled — Lunduke Edit");
   set_default_size(640, 420);
   set_border_width(0);
-  set_icon_name("accessories-text-editor");
-  Gtk::Window::set_default_icon_name("accessories-text-editor");
+  // Reinforce default icon for WMs that ignore gtk_window_set_default_icon_name.
+  set_icon_name(resolve_app_icon_name());
 
   font_desc_ = Pango::FontDescription("Monospace 11");
 
@@ -1496,7 +1509,7 @@ void MainWindow::on_about() {
   dlg.set_license_type(Gtk::LICENSE_GPL_3_0);
   dlg.set_comments(
       "A light text editor for the Lunduke Computer Operating System.");
-  dlg.set_logo_icon_name("accessories-text-editor");
+  dlg.set_logo_icon_name(resolve_app_icon_name());
   std::vector<Glib::ustring> authors{"The Lunduke Journal"};
   dlg.set_authors(authors);
   dlg.run();
