@@ -34,7 +34,7 @@
 namespace lundukeedit {
 namespace {
 
-const char* kVersion = "0.3.2";
+const char* kVersion = "0.7";
 
 std::string format_bytes(std::size_t n) {
   std::string digits = std::to_string(n);

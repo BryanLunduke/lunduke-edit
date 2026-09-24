@@ -1,4 +1,4 @@
-# Lunduke Edit 0.3.2 — notes
+# Lunduke Edit 0.7 — notes
 
 ## Build
 
@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.3.2-1_amd64.deb
+# → packaging/debs/lunduke-edit_0.7-1_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -26,8 +26,13 @@ Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (
 DISPLAY=:2 ./build/lunduke-edit &
 # Empty main window titled Untitled — Lunduke Edit:
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
-  /workspace/uploads/lunduke-edit-0.3.2-blank.png
+  /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.7
+
+- **LCOS identity**: app version **0.7** / Debian package **0.7-1** now tracks the LCOS release train (same convention as Lunduke Paint). No feature changes vs 0.3.2.
+- README / About / packaging / AppStream metainfo match **0.7**.
 
 ## 0.3.2 changes
 
@@ -60,7 +65,7 @@ import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
 - **Grep / multi-file find**: intentionally omitted.
 - **Syntax highlighting**: SourceView is used for undo; no language styles wired yet.
 - **Find All** highlights all hits with a tag and selects the first; GTK only supports one selection range.
-- **Desktop/metainfo**: minimal `.desktop` only; AppStream / icons optional/future.
+- **Icons**: uses stock `accessories-text-editor`; custom app icon optional/future. AppStream metainfo ships as `org.lunduke.LundukeEdit.metainfo.xml`.
 
 ## Design notes
 

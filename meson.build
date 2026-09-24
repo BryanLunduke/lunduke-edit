@@ -1,7 +1,7 @@
 project(
   'lunduke-edit',
   'cpp',
-  version: '0.3.2',
+  version: '0.7',
   license: 'GPL-3.0-or-later',
   meson_version: '>=0.56.0',
   default_options: [
@@ -36,3 +36,9 @@ install_data(
   'data/org.lunduke.LundukeEdit.desktop',
   install_dir: join_paths(get_option('datadir'), 'applications'),
 )
+
+install_data(
+  'data/org.lunduke.LundukeEdit.metainfo.xml',
+  install_dir: join_paths(get_option('datadir'), 'metainfo'),
+)
+

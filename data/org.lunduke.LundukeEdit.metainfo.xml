@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.lunduke.LundukeEdit</id>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Lunduke Edit</name>
+  <summary>A light GTK3 text editor for Linux X11</summary>
+  <description>
+    <p>
+      Lunduke Edit is a classic menubar text editor for the Lunduke Computer
+      Operating System. Look and feel: Windows 95 Notepad, Macintosh SimpleText,
+      and BBEdit Lite — with GtkSourceView undo, Find &amp; Replace, and Print.
+    </p>
+  </description>
+  <url type="homepage">https://lunduke.com</url>
+  <launchable type="desktop-id">org.lunduke.LundukeEdit.desktop</launchable>
+  <provides>
+    <binary>lunduke-edit</binary>
+  </provides>
+  <mimetypes>
+    <mimetype>text/plain</mimetype>
+  </mimetypes>
+  <developer_name>The Lunduke Journal</developer_name>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>Utility</category>
+    <category>TextEditor</category>
+  </categories>
+  <releases>
+    <release version="0.7" date="2026-09-23">
+      <description>
+        <p>Lunduke Edit 0.7 for LCOS 0.7. Identity bump so Edit tracks LCOS releases (same convention as Lunduke Paint); no feature changes vs 0.3.2.</p>
+      </description>
+    </release>
+    <release version="0.3.2" date="2026-09-23">
+      <description>
+        <p>Blank untitled on first launch (no sample seed). File→New blank; Save As default Untitled.txt.</p>
+      </description>
+    </release>
+    <release version="0.3.1" date="2026-09-20">
+      <description>
+        <p>Fix Undo/Redo menu sensitivity; Save As no longer doubles .txt.</p>
+      </description>
+    </release>
+    <release version="0.3" date="2026-09-20">
+      <description>
+        <p>Print (Ctrl+P) and Page Setup via Gtk::PrintOperation. Debian packaging for overlay apt.</p>
+      </description>
+    </release>
+  </releases>
+</component>
