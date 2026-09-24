@@ -5,9 +5,11 @@
 #include <gtkmm/checkbutton.h>
 #include <gtkmm/dialog.h>
 #include <gtkmm/entry.h>
+#include <gtkmm/sizegroup.h>
 #include <gtkmm/window.h>
 
 #include <functional>
+#include <vector>
 
 namespace lundukeedit {
 
@@ -66,6 +68,8 @@ private:
   Gtk::Button* replace_all_btn_{nullptr};
   Gtk::Button* dont_find_btn_{nullptr};
   Gtk::Button* cancel_btn_{nullptr};
+
+  std::vector<Glib::RefPtr<Gtk::SizeGroup>> size_groups_;
 };
 
 }  // namespace lundukeedit

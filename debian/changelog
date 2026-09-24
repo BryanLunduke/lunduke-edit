@@ -1,3 +1,11 @@
+lunduke-edit (0.7-2) unstable; urgency=medium
+
+  * Find & Replace dialog: tidy layout/spacing only (button column spacing,
+    control padding, left/right horizontal banding via Gtk::Grid).
+  * No Find/Replace behavior changes.
+
+ -- Phil <phil@brushpad.local>  Wed, 23 Sep 2026 22:20:00 -0700
+
 lunduke-edit (0.7-1) unstable; urgency=medium
 
   * Bump version to 0.7 / package 0.7-1 so Edit tracks LCOS releases

@@ -3,9 +3,8 @@
 #include "find_replace_dialog.hpp"
 
 #include <gtkmm/box.h>
-#include <gtkmm/grid.h>
 #include <gtkmm/label.h>
-#include <gtkmm/separator.h>
+#include <gtkmm/sizegroup.h>
 
 namespace lundukeedit {
 
@@ -17,6 +16,16 @@ enum {
   RESP_REPLACE_ALL = 4,
   RESP_DONT_FIND = 5,
 };
+
+Gtk::Box* make_opt_row(Gtk::Widget& a, Gtk::Widget& b) {
+  auto* row = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 16));
+  row->set_valign(Gtk::ALIGN_CENTER);
+  a.set_valign(Gtk::ALIGN_CENTER);
+  b.set_valign(Gtk::ALIGN_CENTER);
+  row->pack_start(a, Gtk::PACK_SHRINK);
+  row->pack_start(b, Gtk::PACK_SHRINK);
+  return row;
+}
 }  // namespace
 
 FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
@@ -31,6 +40,8 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
   replace_entry_.set_text(initial.replace_with);
   search_entry_.set_activates_default(true);
   search_entry_.set_width_chars(36);
+  search_entry_.set_hexpand(true);
+  replace_entry_.set_hexpand(true);
 
   start_at_top_.set_active(initial.start_at_top);
   wrap_around_.set_active(initial.wrap_around);
@@ -41,43 +52,24 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
   entire_word_.set_active(initial.entire_word);
 
   auto* content = get_content_area();
-  content->set_spacing(8);
-  content->set_border_width(10);
+  content->set_spacing(10);
+  content->set_border_width(12);
 
-  auto* outer = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 10));
+  // Left fields + right buttons share vertical spacing and per-row height bands.
+  constexpr int kBandSpacing = 14;
+  auto* outer = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 14));
   content->pack_start(*outer, Gtk::PACK_EXPAND_WIDGET);
 
-  auto* left = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, 6));
+  auto* left = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, kBandSpacing));
+  auto* buttons =
+      Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, kBandSpacing));
+  buttons->set_valign(Gtk::ALIGN_START);
   outer->pack_start(*left, Gtk::PACK_EXPAND_WIDGET);
+  outer->pack_start(*buttons, Gtk::PACK_SHRINK);
 
   auto* search_label = Gtk::manage(new Gtk::Label("Search For:", true));
   search_label->set_halign(Gtk::ALIGN_START);
-  left->pack_start(*search_label, Gtk::PACK_SHRINK);
-  left->pack_start(search_entry_, Gtk::PACK_SHRINK);
-
-  auto* opts = Gtk::manage(new Gtk::Grid());
-  opts->set_column_spacing(16);
-  opts->set_row_spacing(2);
-  opts->set_margin_top(4);
-  opts->set_margin_bottom(4);
-  opts->attach(start_at_top_, 0, 0, 1, 1);
-  opts->attach(search_selection_only_, 1, 0, 1, 1);
-  opts->attach(wrap_around_, 0, 1, 1, 1);
-  opts->attach(extend_selection_, 1, 1, 1, 1);
-  opts->attach(search_backwards_, 0, 2, 1, 1);
-  opts->attach(entire_word_, 1, 2, 1, 1);
-  opts->attach(case_sensitive_, 0, 3, 1, 1);
-  left->pack_start(*opts, Gtk::PACK_SHRINK);
-
-  auto* replace_label = Gtk::manage(new Gtk::Label("Replace With:", true));
-  replace_label->set_halign(Gtk::ALIGN_START);
-  left->pack_start(*replace_label, Gtk::PACK_SHRINK);
-  left->pack_start(replace_entry_, Gtk::PACK_SHRINK);
-
-  // Vertical button column (BBEdit Lite style).
-  auto* buttons = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, 4));
-  buttons->set_valign(Gtk::ALIGN_START);
-  outer->pack_start(*buttons, Gtk::PACK_SHRINK);
+  search_label->set_valign(Gtk::ALIGN_CENTER);
 
   find_btn_ = Gtk::manage(new Gtk::Button("_Find", true));
   find_all_btn_ = Gtk::manage(new Gtk::Button("Find _All", true));
@@ -88,9 +80,35 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
 
   for (auto* b : {find_btn_, find_all_btn_, replace_btn_, replace_all_btn_,
                   dont_find_btn_, cancel_btn_}) {
-    b->set_size_request(110, -1);
-    buttons->pack_start(*b, Gtk::PACK_SHRINK);
+    b->set_size_request(120, -1);
+    b->set_valign(Gtk::ALIGN_CENTER);
+    b->set_halign(Gtk::ALIGN_FILL);
   }
+
+  auto band = [&](Gtk::Widget& left_w, Gtk::Button& btn) {
+    left_w.set_valign(Gtk::ALIGN_CENTER);
+    auto sg = Gtk::SizeGroup::create(Gtk::SIZE_GROUP_VERTICAL);
+    sg->add_widget(left_w);
+    sg->add_widget(btn);
+    size_groups_.push_back(sg);
+    left->pack_start(left_w, Gtk::PACK_SHRINK);
+    buttons->pack_start(btn, Gtk::PACK_SHRINK);
+  };
+
+  // Six matched bands (BBEdit-style column), then Replace With below.
+  band(*search_label, *find_btn_);
+  band(search_entry_, *find_all_btn_);
+  band(*make_opt_row(start_at_top_, search_selection_only_), *replace_btn_);
+  band(*make_opt_row(wrap_around_, extend_selection_), *replace_all_btn_);
+  band(*make_opt_row(search_backwards_, entire_word_), *dont_find_btn_);
+  case_sensitive_.set_halign(Gtk::ALIGN_START);
+  band(case_sensitive_, *cancel_btn_);
+
+  auto* replace_label = Gtk::manage(new Gtk::Label("Replace With:", true));
+  replace_label->set_halign(Gtk::ALIGN_START);
+  replace_label->set_margin_top(2);
+  left->pack_start(*replace_label, Gtk::PACK_SHRINK);
+  left->pack_start(replace_entry_, Gtk::PACK_SHRINK);
 
   find_btn_->signal_clicked().connect([this]() {
     if (on_action) {
@@ -119,7 +137,7 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
     response(Gtk::RESPONSE_CANCEL);
   });
 
-  // Keep default Enter → Find.
+
   set_default(*find_btn_);
 
   show_all_children();
