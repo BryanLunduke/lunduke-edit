@@ -1,3 +1,12 @@
+lunduke-edit (0.7-4) unstable; urgency=medium
+
+  * Find & Replace dialog: shrink Search For entry→checkbox gap to match
+    dialog spacing; shift button column down so Find aligns with the Search
+    For entry (not the label). Layout only.
+  * No Find/Replace behavior changes.
+
+ -- Phil <phil@brushpad.local>  Thu, 24 Sep 2026 00:56:00 -0500
+
 lunduke-edit (0.7-3) unstable; urgency=medium
 
   * Find & Replace dialog: tighten label→entry gaps; move Cancel to

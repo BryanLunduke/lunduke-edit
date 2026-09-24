@@ -55,15 +55,16 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
   content->set_spacing(10);
   content->set_border_width(12);
 
-  // Left fields + right buttons share vertical spacing and per-row height bands.
+  // Left fields + right buttons: per-child margins so label→entry can stay tight
+  // while checkbox/button bands use the wider dialog spacing.
   constexpr int kBandSpacing = 14;
   constexpr int kLabelEntryGap = 3;
   auto* outer = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 14));
   content->pack_start(*outer, Gtk::PACK_EXPAND_WIDGET);
 
-  auto* left = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, kBandSpacing));
+  auto* left = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, 0));
   auto* buttons =
-      Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, kBandSpacing));
+      Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, 0));
   buttons->set_valign(Gtk::ALIGN_FILL);
   buttons->set_vexpand(true);
   outer->pack_start(*left, Gtk::PACK_EXPAND_WIDGET);
@@ -93,43 +94,40 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
   col1_sg->add_widget(search_backwards_);
   size_groups_.push_back(col1_sg);
 
-  auto band = [&](Gtk::Widget& left_w, Gtk::Button& btn) {
+  auto band = [&](Gtk::Widget& left_w, Gtk::Widget& right_w, int margin_top) {
+    left_w.set_margin_top(margin_top);
+    right_w.set_margin_top(margin_top);
     left_w.set_valign(Gtk::ALIGN_CENTER);
+    right_w.set_valign(Gtk::ALIGN_CENTER);
     auto sg = Gtk::SizeGroup::create(Gtk::SIZE_GROUP_VERTICAL);
     sg->add_widget(left_w);
-    sg->add_widget(btn);
+    sg->add_widget(right_w);
     size_groups_.push_back(sg);
     left->pack_start(left_w, Gtk::PACK_SHRINK);
-    buttons->pack_start(btn, Gtk::PACK_SHRINK);
+    buttons->pack_start(right_w, Gtk::PACK_SHRINK);
   };
 
-  // Search For: tight label→entry (not band-height), paired with Find + Find All.
-  auto* search_block =
-      Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, kLabelEntryGap));
-  search_block->pack_start(*search_label, Gtk::PACK_SHRINK);
-  search_block->pack_start(search_entry_, Gtk::PACK_SHRINK);
+  // Label alone on the left; empty pad shifts the whole button column down so
+  // Find lines up with the Search For entry (not the label).
+  auto* label_pad = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, 0));
+  band(*search_label, *label_pad, 0);
 
-  auto* top_btns =
-      Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, kBandSpacing));
-  top_btns->pack_start(*find_btn_, Gtk::PACK_SHRINK);
-  top_btns->pack_start(*find_all_btn_, Gtk::PACK_SHRINK);
+  // Find ↔ Search For entry; tight gap under the label (not kBandSpacing).
+  band(search_entry_, *find_btn_, kLabelEntryGap);
 
-  {
-    auto sg = Gtk::SizeGroup::create(Gtk::SIZE_GROUP_VERTICAL);
-    sg->add_widget(*search_block);
-    sg->add_widget(*top_btns);
-    size_groups_.push_back(sg);
-    left->pack_start(*search_block, Gtk::PACK_SHRINK);
-    buttons->pack_start(*top_btns, Gtk::PACK_SHRINK);
-  }
-
-  // Checkbox rows matched to Replace / Replace All / Don't Find.
-  band(*make_opt_row(start_at_top_, search_selection_only_), *replace_btn_);
-  band(*make_opt_row(wrap_around_, extend_selection_), *replace_all_btn_);
-  band(*make_opt_row(search_backwards_, entire_word_), *dont_find_btn_);
+  // Remaining buttons stay size-grouped (banded) with left rows. Column shift
+  // places Find All on the first checkbox row; Replace / Replace All / Don't
+  // Find keep vertical banding with the rows beside them. Gap from entry to
+  // first checkbox is plain kBandSpacing (no stretched search-block slack).
+  band(*make_opt_row(start_at_top_, search_selection_only_), *find_all_btn_,
+       kBandSpacing);
+  band(*make_opt_row(wrap_around_, extend_selection_), *replace_btn_,
+       kBandSpacing);
+  band(*make_opt_row(search_backwards_, entire_word_), *replace_all_btn_,
+       kBandSpacing);
 
   case_sensitive_.set_halign(Gtk::ALIGN_START);
-  left->pack_start(case_sensitive_, Gtk::PACK_SHRINK);
+  band(case_sensitive_, *dont_find_btn_, kBandSpacing);
 
   // Replace With: tight label→entry (same gap as Search For).
   auto* replace_label = Gtk::manage(new Gtk::Label("Replace With:", true));
@@ -138,6 +136,7 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
       Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, kLabelEntryGap));
   replace_block->pack_start(*replace_label, Gtk::PACK_SHRINK);
   replace_block->pack_start(replace_entry_, Gtk::PACK_SHRINK);
+  replace_block->set_margin_top(kBandSpacing);
   left->pack_start(*replace_block, Gtk::PACK_SHRINK);
 
   // Cancel at bottom-right, below Replace With — not beside Case Sensitive.
@@ -145,6 +144,7 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
       Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, 0));
   btn_spacer->set_vexpand(true);
   buttons->pack_start(*btn_spacer, Gtk::PACK_EXPAND_WIDGET);
+  cancel_btn_->set_margin_top(kBandSpacing);
   buttons->pack_start(*cancel_btn_, Gtk::PACK_SHRINK);
 
   find_btn_->signal_clicked().connect([this]() {

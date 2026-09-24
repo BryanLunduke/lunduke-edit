@@ -27,6 +27,11 @@
     <category>TextEditor</category>
   </categories>
   <releases>
+    <release version="0.7.4" date="2026-09-24">
+      <description>
+        <p>Find &amp; Replace dialog: tighter Search For entry→checkbox gap; Find button aligns with Search For entry. Package 0.7-4.</p>
+      </description>
+    </release>
     <release version="0.7.3" date="2026-09-24">
       <description>
         <p>Find &amp; Replace dialog layout tweaks: tighter labels, Cancel bottom-right, aligned checkbox column. Package 0.7-3.</p>

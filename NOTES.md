@@ -1,4 +1,4 @@
-# Lunduke Edit 0.7-3 — notes
+# Lunduke Edit 0.7-4 — notes
 
 ## Build
 
@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.7-3_amd64.deb
+# → packaging/debs/lunduke-edit_0.7-4_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,11 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.7-4
+
+- **Find & Replace dialog**: layout-only — reduce gap from Search For entry to first checkbox row (match dialog band spacing); shift right-hand button column down so Find aligns with the Search For entry (not the label). Keeps tight label→entry gaps, Cancel bottom-right, middle checkbox column alignment, and button banding. No Find/Replace behavior changes.
+- Debian package **0.7-4**; About/kVersion **0.7-4**.
 
 ## 0.7-3
 
