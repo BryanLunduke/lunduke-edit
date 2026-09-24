@@ -2,7 +2,7 @@
 
 A light plain-text editor for the Lunduke Computer Operating System (LCOS).
 
-- **Version:** 0.3.1
+- **Version:** 0.3.2
 - **License:** GPL-3.0-or-later
 - **Stack:** C++17, Meson, gtkmm-3.0, gtksourceviewmm-3.0
 

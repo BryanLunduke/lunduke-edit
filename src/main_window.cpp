@@ -34,21 +34,7 @@
 namespace lundukeedit {
 namespace {
 
-const char* kVersion = "0.3.1";
-
-const char* kSampleText =
-    "LUNDUKE EDIT 0.3.1.\n"
-    "\n"
-    "This is a toy mashup of Windows 95 Notepad,\n"
-    "Macintosh SimpleText, and BBEdit Lite.\n"
-    "\n"
-    "Just enough features to be useful,\n"
-    "but still light, fast, and late-1996.\n"
-    "\n"
-    "File → Print… (Ctrl+P) and Page Setup… ship in 0.3.\n"
-    "\n"
-    "For fictional use only.\n"
-    "— Philip\n";
+const char* kVersion = "0.3.2";
 
 std::string format_bytes(std::size_t n) {
   std::string digits = std::to_string(n);
@@ -488,15 +474,14 @@ void MainWindow::apply_css() {
 }
 
 void MainWindow::load_seed_sample() {
+  // Fresh window / first launch: blank untitled document (no demo text).
   seeding_ = true;
   auto buf = buffer();
   buf->begin_not_undoable_action();
-  buf->set_text(kSampleText);
+  clear_find_highlights();
+  buf->set_text("");
   buf->end_not_undoable_action();
-  set_dirty(false);
   file_path_.clear();
-  file_path_ = "/tmp/readme.txt";
-  save_to_path(file_path_);
   set_dirty(false);
   seeding_ = false;
   update_title();
@@ -505,11 +490,7 @@ void MainWindow::load_seed_sample() {
   if (gutter_) {
     gutter_->refresh();
   }
-  auto iter = buf->get_iter_at_line_offset(6, 13);
-  if (!iter) {
-    iter = buf->begin();
-  }
-  buf->place_cursor(iter);
+  buf->place_cursor(buf->begin());
   update_status();
 }
 
@@ -759,7 +740,7 @@ void MainWindow::on_save_as() {
   if (!file_path_.empty()) {
     dlg.set_filename(file_path_);
   } else {
-    dlg.set_current_name("readme.txt");
+    dlg.set_current_name("Untitled.txt");
   }
   if (dlg.run() == Gtk::RESPONSE_ACCEPT) {
     // Do not double-append .txt when the chosen name already has a known

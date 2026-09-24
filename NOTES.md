@@ -1,4 +1,4 @@
-# Lunduke Edit 0.3.1 — notes
+# Lunduke Edit 0.3.2 — notes
 
 ## Build
 
@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.3.1-1_amd64.deb
+# → packaging/debs/lunduke-edit_0.3.2-1_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -24,10 +24,17 @@ Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (
 
 ```
 DISPLAY=:2 ./build/lunduke-edit &
-# After typing, open Edit with Undo enabled:
+# Empty main window titled Untitled — Lunduke Edit:
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
-  /workspace/uploads/lunduke-edit-0.3.1-undo-menu.png
+  /workspace/uploads/lunduke-edit-0.3.2-blank.png
 ```
+
+## 0.3.2 changes
+
+- **Blank first launch**: `load_seed_sample()` no longer seeds demo text or writes `/tmp/readme.txt`; opens an empty untitled buffer (clean, not dirty, undo history cleared via `begin_not_undoable_action`).
+- **File → New** stays consistent (blank untitled).
+- **Save As** default name: `Untitled.txt` when no path is set.
+- README / About / packaging version **0.3.2** (`0.3.2-1` deb).
 
 ## 0.3.1 fixes
 

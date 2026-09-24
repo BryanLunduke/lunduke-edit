@@ -1,3 +1,12 @@
+lunduke-edit (0.3.2-1) unstable; urgency=medium
+
+  * Fresh window / first launch opens a blank untitled document (no sample
+    text, no /tmp/readme.txt seed save).
+  * File→New remains blank untitled; Save As default name Untitled.txt.
+  * Version bump to 0.3.2.
+
+ -- LCOS <lcos@lunduke.com>  Wed, 23 Sep 2026 20:30:00 -0500
+
 lunduke-edit (0.3.1-1) unstable; urgency=medium
 
   * Fix Edit→Undo/Redo menu sensitivity via can-undo/can-redo property notify
