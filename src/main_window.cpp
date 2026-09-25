@@ -35,7 +35,7 @@
 namespace lundukeedit {
 namespace {
 
-const char* kVersion = "0.7-4";
+const char* kVersion = "0.7-5";
 constexpr const char* kAppId = "org.lunduke.LundukeEdit";
 constexpr const char* kFallbackIcon = "accessories-text-editor";
 
@@ -371,6 +371,16 @@ void MainWindow::build_menus() {
   sel_i->add_accelerator("activate", get_accel_group(), GDK_KEY_a,
                          Gdk::CONTROL_MASK, Gtk::ACCEL_VISIBLE);
   edit_menu->append(*sel_i);
+
+  edit_menu->append(*Gtk::manage(new Gtk::SeparatorMenuItem()));
+
+  // Notepad-like: Find under Edit (Search menu keeps a duplicate entry).
+  auto* edit_find_i = Gtk::manage(new Gtk::MenuItem("_Find…", true));
+  edit_find_i->signal_activate().connect(
+      sigc::mem_fun(*this, &MainWindow::on_find));
+  edit_find_i->add_accelerator("activate", get_accel_group(), GDK_KEY_f,
+                               Gdk::CONTROL_MASK, Gtk::ACCEL_VISIBLE);
+  edit_menu->append(*edit_find_i);
 
   // ---- Search ----
   auto* search_menu = Gtk::manage(new Gtk::Menu());
@@ -923,14 +933,73 @@ bool MainWindow::is_entire_word(const Gtk::TextIter& start,
   return left_ok && right_ok;
 }
 
+void MainWindow::ensure_find_marks() {
+  auto buf = text_view_.get_buffer();
+  if (!sel_only_start_mark_) {
+    sel_only_start_mark_ =
+        buf->create_mark("lunduke-sel-only-start", buf->begin(), true);
+    sel_only_end_mark_ =
+        buf->create_mark("lunduke-sel-only-end", buf->begin(), false);
+  }
+  if (!extend_anchor_mark_) {
+    extend_anchor_mark_ =
+        buf->create_mark("lunduke-extend-anchor", buf->begin(), true);
+  }
+}
+
+void MainWindow::pin_selection_only_range() {
+  auto buf = text_view_.get_buffer();
+  Gtk::TextIter a, b;
+  if (!buf->get_selection_bounds(a, b) || a == b) {
+    return;
+  }
+  ensure_find_marks();
+  buf->move_mark(sel_only_start_mark_, a);
+  buf->move_mark(sel_only_end_mark_, b);
+  sel_only_range_valid_ = true;
+}
+
+void MainWindow::clear_selection_only_range() {
+  sel_only_range_valid_ = false;
+}
+
+void MainWindow::clear_extend_anchor() {
+  extend_anchor_valid_ = false;
+}
+
+bool MainWindow::selection_matches_needle(const FindOptions& opts,
+                                          const Gtk::TextIter& a,
+                                          const Gtk::TextIter& b) const {
+  Glib::ustring selected = a.get_text(b);
+  Glib::ustring needle = opts.search_for;
+  if (!opts.case_sensitive) {
+    selected = selected.casefold();
+    needle = needle.casefold();
+  }
+  return selected == needle;
+}
+
 void MainWindow::get_search_bounds(const FindOptions& opts, Gtk::TextIter& begin,
                                    Gtk::TextIter& end) {
   auto buf = text_view_.get_buffer();
   if (opts.search_selection_only) {
+    // Prefer the range pinned when Find opened / Selection Only engaged so a
+    // successful match (which reselection) does not shrink the search scope.
+    if (sel_only_range_valid_ && sel_only_start_mark_ && sel_only_end_mark_) {
+      begin = buf->get_iter_at_mark(sel_only_start_mark_);
+      end = buf->get_iter_at_mark(sel_only_end_mark_);
+      if (begin < end) {
+        return;
+      }
+    }
     Gtk::TextIter sel_a, sel_b;
-    if (buf->get_selection_bounds(sel_a, sel_b)) {
+    if (buf->get_selection_bounds(sel_a, sel_b) && sel_a != sel_b) {
       begin = sel_a;
       end = sel_b;
+      ensure_find_marks();
+      buf->move_mark(sel_only_start_mark_, sel_a);
+      buf->move_mark(sel_only_end_mark_, sel_b);
+      sel_only_range_valid_ = true;
       return;
     }
   }
@@ -945,31 +1014,69 @@ bool MainWindow::find_match(const FindOptions& opts, bool from_next) {
   auto buf = text_view_.get_buffer();
   const auto flags = search_flags(opts);
 
+  if (!opts.search_selection_only) {
+    clear_selection_only_range();
+  }
+  if (!opts.extend_selection) {
+    clear_extend_anchor();
+  }
+
   Gtk::TextIter range_begin, range_end;
   get_search_bounds(opts, range_begin, range_end);
 
   Gtk::TextIter start;
-  if (opts.start_at_top && !from_next) {
+  Gtk::TextIter sel_a, sel_b;
+  const bool have_sel =
+      buf->get_selection_bounds(sel_a, sel_b) && sel_a != sel_b;
+  // Extend continues past an existing selection/anchor so the span can grow.
+  // With no selection yet, Start at Top still applies (FR-B01 / first hit).
+  // When Extend is off, Start at Top is unchanged (FR-D03).
+  const bool extending_existing =
+      opts.extend_selection && (have_sel || extend_anchor_valid_);
+  const bool honor_start_at_top =
+      opts.start_at_top && !from_next && !extending_existing;
+
+  if (honor_start_at_top) {
     start = range_begin;
   } else {
     start = buf->get_iter_at_mark(buf->get_insert());
-    if (opts.search_selection_only) {
-      if (start < range_begin || start > range_end) {
-        start = opts.search_backwards ? range_end : range_begin;
+
+    if (opts.extend_selection && have_sel) {
+      // Grow forward from selection end (or backward from selection start).
+      start = opts.search_backwards ? sel_a : sel_b;
+      if (!extend_anchor_valid_) {
+        ensure_find_marks();
+        buf->move_mark(extend_anchor_mark_,
+                       opts.search_backwards ? sel_b : sel_a);
+        extend_anchor_valid_ = true;
+      }
+    } else {
+      if (opts.search_selection_only) {
+        if (start < range_begin || start > range_end) {
+          start = opts.search_backwards ? range_end : range_begin;
+        }
+      }
+      if (from_next || (!opts.start_at_top) || opts.extend_selection) {
+        // Move past current selection if it is exactly the needle, or when
+        // Find Next asks us to advance.
+        if (have_sel && selection_matches_needle(opts, sel_a, sel_b)) {
+          start = opts.search_backwards ? sel_a : sel_b;
+        } else if (from_next) {
+          if (opts.search_backwards) {
+            start.backward_char();
+          } else {
+            start.forward_char();
+          }
+        }
       }
     }
-    if (from_next || (!opts.start_at_top)) {
-      // Move past current selection if it is the needle.
-      Gtk::TextIter sel_a, sel_b;
-      if (buf->get_selection_bounds(sel_a, sel_b) &&
-          sel_a.get_text(sel_b) == opts.search_for) {
-        start = opts.search_backwards ? sel_a : sel_b;
-      } else if (from_next) {
-        if (opts.search_backwards) {
-          start.backward_char();
-        } else {
-          start.forward_char();
-        }
+
+    if (opts.search_selection_only) {
+      if (start < range_begin) {
+        start = range_begin;
+      }
+      if (start > range_end) {
+        start = range_end;
       }
     }
   }
@@ -994,18 +1101,33 @@ bool MainWindow::find_match(const FindOptions& opts, bool from_next) {
           (match_start >= range_begin && match_end <= range_end)) {
         if (!opts.entire_word || is_entire_word(match_start, match_end)) {
           if (opts.extend_selection) {
-            Gtk::TextIter sel_a, sel_b;
-            if (buf->get_selection_bounds(sel_a, sel_b)) {
-              if (match_start < sel_a) {
-                sel_a = match_start;
+            ensure_find_marks();
+            if (!extend_anchor_valid_) {
+              // Anchor at the far end opposite the search direction so growth
+              // keeps the original hit while adding new matches.
+              Gtk::TextIter cur_a, cur_b;
+              if (buf->get_selection_bounds(cur_a, cur_b) && cur_a != cur_b) {
+                buf->move_mark(extend_anchor_mark_,
+                               opts.search_backwards ? cur_b : cur_a);
+              } else {
+                buf->move_mark(extend_anchor_mark_, match_start);
               }
-              if (match_end > sel_b) {
-                sel_b = match_end;
-              }
-              buf->select_range(sel_a, sel_b);
-            } else {
-              buf->select_range(match_start, match_end);
+              extend_anchor_valid_ = true;
             }
+            Gtk::TextIter anchor = buf->get_iter_at_mark(extend_anchor_mark_);
+            Gtk::TextIter ext_a =
+                anchor < match_start ? anchor : match_start;
+            Gtk::TextIter ext_b = anchor > match_end ? anchor : match_end;
+            Gtk::TextIter cur_a, cur_b;
+            if (buf->get_selection_bounds(cur_a, cur_b) && cur_a != cur_b) {
+              if (cur_a < ext_a) {
+                ext_a = cur_a;
+              }
+              if (cur_b > ext_b) {
+                ext_b = cur_b;
+              }
+            }
+            buf->select_range(ext_a, ext_b);
           } else {
             buf->select_range(match_start, match_end);
           }
@@ -1028,11 +1150,7 @@ bool MainWindow::find_match(const FindOptions& opts, bool from_next) {
   if (try_search(start, false)) {
     return true;
   }
-  if (opts.wrap_around && !opts.search_selection_only) {
-    Gtk::TextIter wrap_from = opts.search_backwards ? range_end : range_begin;
-    return try_search(wrap_from, true);
-  }
-  if (opts.wrap_around && opts.search_selection_only) {
+  if (opts.wrap_around) {
     Gtk::TextIter wrap_from = opts.search_backwards ? range_end : range_begin;
     return try_search(wrap_from, true);
   }
@@ -1179,16 +1297,35 @@ int MainWindow::replace_all(const FindOptions& opts) {
 }
 
 void MainWindow::on_find() {
+  // Capture selection before the dialog takes focus so Search Selection Only
+  // still has the user range after Find reselection. Clear the pin when Find
+  // opens with no selection so a stale range is not reused.
+  {
+    auto buf = text_view_.get_buffer();
+    Gtk::TextIter a, b;
+    if (buf->get_selection_bounds(a, b) && a != b) {
+      pin_selection_only_range();
+    } else {
+      clear_selection_only_range();
+    }
+  }
+  clear_extend_anchor();
+
   FindReplaceDialog dlg(*this, find_opts_);
   dlg.on_action = [this, &dlg](FindReplaceDialog::Action action,
                                const FindOptions& opts) -> bool {
     find_opts_ = opts;
+    if (!opts.search_selection_only) {
+      clear_selection_only_range();
+    } else if (!sel_only_range_valid_) {
+      pin_selection_only_range();
+    }
+    if (!opts.extend_selection) {
+      clear_extend_anchor();
+    }
     switch (action) {
       case FindReplaceDialog::Action::Find: {
         FindOptions o = opts;
-        // After the first Find from the dialog, subsequent Finds act as Find Next.
-        static thread_local bool dummy = false;
-        (void)dummy;
         if (!find_match(o, false)) {
           Gtk::MessageDialog miss(dlg, "Text not found.", false,
                                   Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);

@@ -1,3 +1,13 @@
+lunduke-edit (0.7-5) unstable; urgency=medium
+
+  * Find: Search Selection Only pins the selected range so Find stays inside
+    the selection (FR-B07 / FR-D04).
+  * Find: Extend Selection grows the selection across successive matches
+    (FR-B09 / FR-D05). Start at Top behavior when Extend is off is unchanged.
+  * Edit → Find… opens Find & Replace (FR-E01); Search menu entry kept.
+
+ -- Phil <phil@brushpad.local>  Thu, 24 Sep 2026 20:08:00 -0500
+
 lunduke-edit (0.7-4) unstable; urgency=medium
 
   * Find & Replace dialog: shrink Search For entry→checkbox gap to match

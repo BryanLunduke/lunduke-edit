@@ -110,6 +110,13 @@ private:
   Gtk::TextSearchFlags search_flags(const FindOptions& opts) const;
   void get_search_bounds(const FindOptions& opts, Gtk::TextIter& begin,
                          Gtk::TextIter& end);
+  void ensure_find_marks();
+  void pin_selection_only_range();
+  void clear_selection_only_range();
+  void clear_extend_anchor();
+  bool selection_matches_needle(const FindOptions& opts,
+                                const Gtk::TextIter& a,
+                                const Gtk::TextIter& b) const;
 
   Application& app_;
 
@@ -148,6 +155,13 @@ private:
 
   FindOptions find_opts_;
   Glib::RefPtr<Gtk::TextTag> find_tag_;
+  // Pinned range for Search Selection Only (survives match reselection).
+  Glib::RefPtr<Gtk::TextBuffer::Mark> sel_only_start_mark_;
+  Glib::RefPtr<Gtk::TextBuffer::Mark> sel_only_end_mark_;
+  bool sel_only_range_valid_{false};
+  // Anchor for Extend Selection growth across successive Finds.
+  Glib::RefPtr<Gtk::TextBuffer::Mark> extend_anchor_mark_;
+  bool extend_anchor_valid_{false};
 
   Glib::RefPtr<Gtk::PrintSettings> print_settings_;
   Glib::RefPtr<Gtk::PageSetup> page_setup_;

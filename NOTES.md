@@ -1,4 +1,4 @@
-# Lunduke Edit 0.7-4 — notes
+# Lunduke Edit 0.7-5 — notes
 
 ## Build
 
@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.7-4_amd64.deb
+# → packaging/debs/lunduke-edit_0.7-5_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,13 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.7-5
+
+- **Find — Search Selection Only**: pin the selected range when Find opens so matches stay inside that region (no longer escapes to outside hits after reselection).
+- **Find — Extend Selection**: successive Find grows the selection from the original anchor through later matches (works with Start at Top still checked; Start at Top alone unchanged).
+- **Edit → Find…**: Find is under Edit (Notepad-like); Search → Find remains.
+- Debian package **0.7-5**; About/kVersion **0.7-5**.
 
 ## 0.7-4
 
