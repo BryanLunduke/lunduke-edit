@@ -1,3 +1,10 @@
+lunduke-edit (0.8-1) unstable; urgency=medium
+
+  * LCOS 0.8 track identity bump (0.7-5 → 0.8 / Debian 0.8-1). Features
+    and UI unchanged.
+
+ -- Phil <phil@brushpad.local>  Mon, 28 Sep 2026 21:34:10 -0500
+
 lunduke-edit (0.7-5) unstable; urgency=medium
 
   * Find: Search Selection Only pins the selected range so Find stays inside

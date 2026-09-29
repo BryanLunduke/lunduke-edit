@@ -27,6 +27,11 @@
     <category>TextEditor</category>
   </categories>
   <releases>
+    <release version="0.8.0" date="2026-09-28">
+      <description>
+        <p>LCOS 0.8 track identity bump (0.7-5 → 0.8 / Debian 0.8-1). Features and UI unchanged.</p>
+      </description>
+    </release>
     <release version="0.7.5" date="2026-09-24">
       <description>
         <p>Find fixes: Search Selection Only stays in selection; Extend Selection grows across matches; Edit → Find. Package 0.7-5.</p>
