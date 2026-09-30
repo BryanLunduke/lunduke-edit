@@ -12,7 +12,12 @@ project(
 )
 
 gtkmm_dep = dependency('gtkmm-3.0', version: '>=3.24')
-gtksourceviewmm_dep = dependency('gtksourceviewmm-3.0', version: '>=3.18')
+
+gtksourceviewmm_dep = dependency('gtksourceviewmm-4.0', required: false)
+
+if not gtksourceviewmm_dep.found()
+  gtksourceviewmm_dep = dependency('gtksourceviewmm-3.0', required: true)
+endif
 
 lunduke_edit_inc = include_directories('src')
 
