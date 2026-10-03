@@ -174,6 +174,7 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
     response(Gtk::RESPONSE_CANCEL);
   });
 
+  find_btn_->set_can_default(true);
   set_default(*find_btn_);
 
   show_all_children();
@@ -182,6 +183,10 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
 }
 
 FindOptions FindReplaceDialog::options() const { return collect(); }
+
+void FindReplaceDialog::clear_start_at_top() {
+  start_at_top_.set_active(false);
+}
 
 FindOptions FindReplaceDialog::collect() const {
   FindOptions o;

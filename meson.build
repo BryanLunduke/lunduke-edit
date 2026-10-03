@@ -1,7 +1,7 @@
 project(
   'lunduke-edit',
   'cpp',
-  version: '0.8.0',
+  version: '0.8.1',
   license: 'GPL-3.0-or-later',
   meson_version: '>=0.56.0',
   default_options: [
@@ -31,6 +31,21 @@ executable(
   include_directories: lunduke_edit_inc,
   install: true,
 )
+
+edit_behavior_tests = executable(
+  'edit-behavior-tests',
+  files(
+    'tests/edit_tests.cpp',
+    'src/application.cpp',
+    'src/main_window.cpp',
+    'src/line_gutter.cpp',
+    'src/find_replace_dialog.cpp',
+  ),
+  dependencies: [gtkmm_dep, gtksourceviewmm_dep],
+  include_directories: lunduke_edit_inc,
+)
+
+test('behavior', edit_behavior_tests)
 
 install_data(
   'data/org.lunduke.LundukeEdit.desktop',

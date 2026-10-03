@@ -1,3 +1,31 @@
+lunduke-edit (0.8-2) unstable; urgency=medium
+
+  * A failed save stays unsaved and no longer truncates the file. The new
+    bytes are written to a temporary file and replace the original only
+    after the write succeeds.
+  * Save As writes the path that was confirmed. It does not change the
+    extension after the overwrite prompt, so notes.txt.txt is not saved as
+    notes.txt and a name like report does not silently replace report.txt.
+  * Opening a file that is not UTF-8 keeps the detected Latin-1 encoding.
+    A save with no edits no longer rewrites those bytes as UTF-8.
+  * Opening a file from a second launch or a file manager asks before
+    dropping unsaved edits. Every file named on the command line is opened.
+  * A short or failed read is not treated as the whole file.
+  * Printing no longer clips the top of the first line on each page.
+  * Line numbers scroll with the text.
+  * File → Exit quits the application.
+  * One Replace is a single undo step. Find Next no longer skips a
+    character, so both letters in "xx" can be replaced, and Wrap Around
+    does not jump to an earlier match because of that skip.
+  * Start at Top applies to that search and then turns off. Search
+    Selection Only does nothing when nothing is selected. Replace still
+    replaces the match when Extend Selection has grown the selection.
+  * Undoing back to the saved text clears the unsaved marker.
+  * Go to Line rejects trailing junk such as 12abc. The column readout
+    counts tab stops using the tab width.
+
+ -- Phil <phil@brushpad.local>  Sat, 03 Oct 2026 16:40:00 -0500
+
 lunduke-edit (0.8-1) unstable; urgency=medium
 
   * LCOS 0.8 track identity bump (0.7-5 → 0.8 / Debian 0.8-1). Features

@@ -30,6 +30,7 @@
 namespace lundukeedit {
 
 class Application;
+struct EditChecks;
 
 class MainWindow : public Gtk::ApplicationWindow {
 public:
@@ -37,12 +38,16 @@ public:
 
   void load_seed_sample();
   bool open_file(const std::string& path);
+  // Asks before dropping unsaved edits. False means the caller must keep
+  // the current buffer (Cancel, or Save that did not succeed).
+  bool confirm_discard_or_save();
 
 protected:
   bool on_delete_event(GdkEventAny* event) override;
   bool on_key_press_event(GdkEventKey* event) override;
 
 private:
+  friend struct EditChecks;
   void build_ui();
   void build_menus();
   void apply_css();
@@ -50,8 +55,16 @@ private:
   void update_status();
   void update_undo_redo_sensitivity();
   void set_dirty(bool dirty);
-  bool confirm_discard_or_save();
+  void refresh_dirty_from_buffer();
+  void on_modified_changed();
+  bool save_document();
+  bool save_as_dialog();
   bool save_to_path(const std::string& path);
+  void report_error(const Glib::ustring& primary,
+                    const Glib::ustring& secondary);
+  static std::string ensure_save_as_path(std::string path);
+  static bool parse_go_to_line(const std::string& text, int& line);
+  int display_column_at(const Gtk::TextIter& iter) const;
   Glib::ustring current_basename() const;
   Glib::RefPtr<Gsv::Buffer> buffer();
 
@@ -99,16 +112,20 @@ private:
   void apply_tab_width(int spaces);
   void apply_font(const Pango::FontDescription& desc);
 
+  enum class ReplaceResult { Replaced, Found, NotFound, Blocked };
+
   bool find_match(const FindOptions& opts, bool from_next);
   int count_matches(const FindOptions& opts);
-  bool replace_current(const FindOptions& opts);
+  ReplaceResult replace_current(const FindOptions& opts);
   int replace_all(const FindOptions& opts);
   void clear_find_highlights();
   void highlight_all_matches(const FindOptions& opts);
   bool is_entire_word(const Gtk::TextIter& start,
                       const Gtk::TextIter& end) const;
   Gtk::TextSearchFlags search_flags(const FindOptions& opts) const;
-  void get_search_bounds(const FindOptions& opts, Gtk::TextIter& begin,
+  // False when Search Selection Only is set and there is no selection.
+  // Does not widen an empty selection to the whole buffer.
+  bool get_search_bounds(const FindOptions& opts, Gtk::TextIter& begin,
                          Gtk::TextIter& end);
   void ensure_find_marks();
   void pin_selection_only_range();
@@ -147,6 +164,12 @@ private:
 
   std::string file_path_;
   std::string encoding_{"UTF-8"};
+  // Encoding that matches the bytes last loaded or successfully saved.
+  std::string saved_encoding_{"UTF-8"};
+  bool encoding_dirty_{false};
+  // Menu preference. Auto-detected Latin-1 on one file does not force the
+  // next file to skip the UTF-8 check. An explicit Text menu choice does.
+  bool prefer_utf8_{true};
   bool dirty_{false};
   bool seeding_{false};
   bool overwrite_{false};
@@ -162,6 +185,11 @@ private:
   // Anchor for Extend Selection growth across successive Finds.
   Glib::RefPtr<Gtk::TextBuffer::Mark> extend_anchor_mark_;
   bool extend_anchor_valid_{false};
+  // The needle from the last successful find, even if Extend Selection
+  // has grown the visible selection past it.
+  Glib::RefPtr<Gtk::TextBuffer::Mark> last_match_start_;
+  Glib::RefPtr<Gtk::TextBuffer::Mark> last_match_end_;
+  bool last_match_valid_{false};
 
   Glib::RefPtr<Gtk::PrintSettings> print_settings_;
   Glib::RefPtr<Gtk::PageSetup> page_setup_;

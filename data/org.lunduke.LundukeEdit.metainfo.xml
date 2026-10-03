@@ -27,6 +27,11 @@
     <category>TextEditor</category>
   </categories>
   <releases>
+    <release version="0.8.1" date="2026-10-03">
+      <description>
+        <p>Save, open, print, find, and undo fixes. Debian package 0.8-2. A failed save no longer truncates the file or looks saved. Save As keeps the confirmed path. Non-UTF-8 files keep their encoding. Opening a file asks before dropping unsaved edits, and every command-line file is opened. Short reads, print clipping, line-number scrolling, File → Exit, Replace undo, Find Next, Start at Top, Selection Only, Extend Selection replace, the unsaved marker, Go to Line, and tab columns are fixed.</p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-09-28">
       <description>
         <p>LCOS 0.8 track identity bump (0.7-5 → 0.8 / Debian 0.8-1). Features and UI unchanged.</p>

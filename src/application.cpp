@@ -26,16 +26,44 @@ void Application::on_startup() {
   Gtk::Window::set_default_icon_name(kAppId);
 }
 
+MainWindow* Application::create_window() {
+  auto* w = new MainWindow(*this);
+  add_window(*w);
+  w->signal_hide().connect([this, w]() { forget_window(w); });
+  window_ = w;
+  return w;
+}
+
+void Application::forget_window(MainWindow* window) {
+  if (window_ != window) {
+    return;
+  }
+  window_ = nullptr;
+  for (auto* other : get_windows()) {
+    if (other == window || !other->get_visible()) {
+      continue;
+    }
+    window_ = dynamic_cast<MainWindow*>(other);
+    if (window_) {
+      break;
+    }
+  }
+}
+
 bool Application::ensure_window() {
-  if (window_) {
+  if (window_ && window_->get_visible()) {
     return false;
   }
-  window_ = new MainWindow(*this);
-  add_window(*window_);
-  window_->signal_hide().connect([this]() {
-    // Window deletes itself via delete_on_hide; drop our pointer.
-    window_ = nullptr;
-  });
+  if (!window_) {
+    for (auto* other : get_windows()) {
+      auto* mw = dynamic_cast<MainWindow*>(other);
+      if (mw && mw->get_visible()) {
+        window_ = mw;
+        return false;
+      }
+    }
+  }
+  create_window();
   return true;
 }
 
@@ -47,13 +75,71 @@ void Application::on_activate() {
   window_->present();
 }
 
+void Application::open_files(const std::vector<std::string>& paths) {
+  if (paths.empty()) {
+    on_activate();
+    return;
+  }
+
+  std::size_t index = 0;
+  // Reuse the visible window for the first file only after the user agrees
+  // to drop unsaved edits. Cancel leaves that buffer alone and still opens
+  // every requested file in its own window.
+  if (window_ && window_->get_visible()) {
+    if (window_->confirm_discard_or_save()) {
+      window_->present();
+      window_->open_file(paths[0]);
+      index = 1;
+    }
+  } else if (!window_) {
+    auto* w = create_window();
+    w->present();
+    w->open_file(paths[0]);
+    index = 1;
+  }
+
+  for (; index < paths.size(); ++index) {
+    auto* w = create_window();
+    w->present();
+    w->open_file(paths[index]);
+  }
+}
+
 void Application::on_open(const Gio::Application::type_vec_files& files,
                           const Glib::ustring& /*hint*/) {
-  ensure_window();
-  if (!files.empty()) {
-    window_->open_file(files.front()->get_path());
+  std::vector<std::string> paths;
+  paths.reserve(files.size());
+  for (const auto& file : files) {
+    if (!file) {
+      continue;
+    }
+    std::string path = file->get_path();
+    if (path.empty()) {
+      path = file->get_uri();
+    }
+    if (!path.empty()) {
+      paths.push_back(path);
+    }
   }
-  window_->present();
+  open_files(paths);
+}
+
+bool Application::confirm_quit() {
+  std::vector<MainWindow*> mains;
+  for (auto* w : get_windows()) {
+    if (auto* mw = dynamic_cast<MainWindow*>(w)) {
+      mains.push_back(mw);
+    }
+  }
+  for (auto* mw : mains) {
+    if (!mw->get_visible()) {
+      mw->present();
+    }
+    if (!mw->confirm_discard_or_save()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace lundukeedit
