@@ -2,6 +2,7 @@
 #ifndef LUNDUKEEDIT_LINE_GUTTER_HPP
 #define LUNDUKEEDIT_LINE_GUTTER_HPP
 
+#include <gtkmm/adjustment.h>
 #include <gtkmm/drawingarea.h>
 #include <gtkmm/textview.h>
 
@@ -17,6 +18,9 @@ public:
   bool gutter_visible() const { return visible_; }
 
   void refresh();
+  // Rebind to the adjustment the text view is actually scrolling with.
+  void follow_view_adjustment();
+  bool follows_text_view_adjustment() const;
 
 protected:
   bool on_draw(const Cairo::RefPtr<Cairo::Context>& cr) override;
@@ -30,8 +34,11 @@ private:
   Gtk::TextView& text_view_;
   bool visible_{true};
   int digit_width_{8};
+  Glib::RefPtr<Gtk::Adjustment> bound_vadj_;
   sigc::connection buffer_changed_;
-  sigc::connection vadj_changed_;
+  sigc::connection vadj_value_changed_;
+  sigc::connection vadj_props_changed_;
+  sigc::connection vadj_replaced_;
   sigc::connection mark_set_;
 };
 

@@ -13,13 +13,12 @@ LineGutter::LineGutter(Gtk::TextView& text_view) : text_view_(text_view) {
   set_hexpand(false);
   set_vexpand(true);
 
-  auto vadj = text_view_.get_vadjustment();
-  if (vadj) {
-    vadj_changed_ = vadj->signal_value_changed().connect(
-        sigc::mem_fun(*this, &LineGutter::on_vadj_changed));
-    vadj->signal_changed().connect(
-        sigc::mem_fun(*this, &LineGutter::on_vadj_changed));
-  }
+  // The text view's adjustment is replaced when it is added to a scrolled
+  // window. Follow that property so scroll redraws use the live adjustment,
+  // not the one that existed before the view was packed.
+  vadj_replaced_ = text_view_.property_vadjustment().signal_changed().connect(
+      sigc::mem_fun(*this, &LineGutter::follow_view_adjustment));
+  follow_view_adjustment();
 
   auto buf = text_view_.get_buffer();
   buffer_changed_ = buf->signal_changed().connect(
@@ -55,6 +54,28 @@ void LineGutter::on_buffer_changed() {
 }
 
 void LineGutter::on_vadj_changed() { queue_draw(); }
+
+void LineGutter::follow_view_adjustment() {
+  vadj_value_changed_.disconnect();
+  vadj_props_changed_.disconnect();
+  bound_vadj_.reset();
+
+  auto vadj = text_view_.get_vadjustment();
+  if (!vadj) {
+    return;
+  }
+  bound_vadj_ = vadj;
+  vadj_value_changed_ = vadj->signal_value_changed().connect(
+      sigc::mem_fun(*this, &LineGutter::on_vadj_changed));
+  vadj_props_changed_ = vadj->signal_changed().connect(
+      sigc::mem_fun(*this, &LineGutter::on_vadj_changed));
+  queue_draw();
+}
+
+bool LineGutter::follows_text_view_adjustment() const {
+  auto vadj = text_view_.get_vadjustment();
+  return vadj && bound_vadj_ && vadj == bound_vadj_;
+}
 
 void LineGutter::on_size_allocate(Gtk::Allocation& allocation) {
   Gtk::DrawingArea::on_size_allocate(allocation);

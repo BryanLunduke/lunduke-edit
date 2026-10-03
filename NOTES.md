@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.8-1_amd64.deb
+# → packaging/debs/lunduke-edit_0.8-2_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,20 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.8.1 / Debian 0.8-2
+
+- **Save**: a failed save stays dirty and does not truncate the file. Bytes go to a temporary file and replace the original only after the write succeeds.
+- **Save As**: the confirmed path is the path written. The extension is not rewritten after the overwrite prompt.
+- **Encoding**: a non-UTF-8 file opened as Latin-1 stays Latin-1, so a clean save does not turn a byte such as 0xE9 into UTF-8.
+- **Open**: a file opened in an already running instance asks before dropping unsaved edits. Every command-line file is opened in its own window.
+- **Read errors**: a short read is not marked as a clean copy of the file.
+- **Print**: the first line on each page is not clipped. Line numbers scroll with the text.
+- **File → Exit** quits the process.
+- **Find / Replace**: one Replace is one undo step. Find Next does not skip a character. Start at Top applies once, then clears. Search Selection Only does nothing without a selection. Replace still replaces the found match when Extend Selection has grown the selection.
+- **Undo** back to the saved text clears the unsaved marker.
+- **Go to Line** rejects trailing junk. The column readout uses tab width.
+- Meson **0.8.1**. Debian package **0.8-2**. About / kVersion **0.8-2**.
 
 ## 0.8
 

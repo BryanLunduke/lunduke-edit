@@ -41,6 +41,10 @@ public:
 
   FindOptions options() const;
 
+  // Start at Top applies to the search that just ran, then turns off so the
+  // next Find in this dialog continues from the cursor.
+  void clear_start_at_top();
+
   // Called for Find / Find All / Replace / Replace All while the dialog stays open.
   // Return true if the action succeeded (for Find: a match was selected).
   std::function<bool(Action, const FindOptions&)> on_action;

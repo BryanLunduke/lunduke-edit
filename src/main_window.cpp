@@ -24,18 +24,23 @@
 #include <gtkmm/stock.h>
 #include <gtkmm/stylecontext.h>
 
-#include <cctype>
+#include <cerrno>
 #include <cmath>
+#include <cstring>
 
 #include <algorithm>
+#include <cstdio>
+#include <exception>
 #include <fstream>
-#include <sstream>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace lundukeedit {
 namespace {
 
-const char* kVersion = "0.8-1";
+const char* kVersion = "0.8-2";
 constexpr const char* kAppId = "org.lunduke.LundukeEdit";
 constexpr const char* kFallbackIcon = "accessories-text-editor";
 
@@ -70,58 +75,125 @@ std::string recents_path() {
   return Glib::build_filename(dir, "recents.txt");
 }
 
-std::string ascii_lower(std::string s) {
-  for (char& c : s) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
-  return s;
-}
-
-bool has_known_text_extension(const std::string& path) {
-  const std::string base = ascii_lower(Glib::path_get_basename(path));
-  static const char* kExts[] = {".txt", ".md",  ".text", ".csv", ".log",
-                                ".json", ".xml", ".html", ".htm", ".css",
-                                ".c",    ".h",   ".cpp",  ".hpp", ".cc",
-                                ".py",   ".sh",  ".conf", ".cfg", ".ini",
-                                ".yaml", ".yml", ".rs",   ".go",  ".js",
-                                ".ts",   ".toml", nullptr};
-  for (int i = 0; kExts[i]; ++i) {
-    const std::string ext = kExts[i];
-    if (base.size() >= ext.size() &&
-        base.compare(base.size() - ext.size(), ext.size(), ext) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool basename_has_extension(const std::string& path) {
+// Write bytes to a temp file in the same directory and rename over @path
+// only after the write succeeds. A failed write leaves the original bytes
+// in place (ofstream on the destination would have truncated immediately).
+bool replace_file_contents(const std::string& path, const std::string& bytes,
+                           std::string& error) {
+  const std::string dir = Glib::path_get_dirname(path);
   const std::string base = Glib::path_get_basename(path);
-  const auto dot = base.find_last_of('.');
-  // Treat leading-dot names (.bashrc) as having no "extension" for Save As.
-  return dot != std::string::npos && dot != 0 && dot + 1 < base.size();
+  const std::string pattern =
+      Glib::build_filename(dir, "." + base + ".XXXXXX");
+  std::vector<char> tmpl(pattern.begin(), pattern.end());
+  tmpl.push_back('\0');
+
+  const int fd = mkstemp(tmpl.data());
+  if (fd < 0) {
+    error = std::string("Could not write temporary file: ") +
+            std::strerror(errno);
+    return false;
+  }
+  const std::string tmp_path(tmpl.data());
+
+  struct stat st;
+  const mode_t mode = (stat(path.c_str(), &st) == 0)
+                          ? static_cast<mode_t>(st.st_mode & 0777)
+                          : static_cast<mode_t>(0644);
+  if (fchmod(fd, mode) != 0) {
+    // Keep going; the bytes matter more than the mode bit.
+  }
+  if (close(fd) != 0) {
+    error = std::string("Could not write temporary file: ") +
+            std::strerror(errno);
+    unlink(tmp_path.c_str());
+    return false;
+  }
+
+  {
+    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      error = "Could not write temporary file.";
+      unlink(tmp_path.c_str());
+      return false;
+    }
+    if (!bytes.empty()) {
+      out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    out.flush();
+    if (!out || out.fail() || out.bad()) {
+      error = "Could not write temporary file.";
+      out.close();
+      unlink(tmp_path.c_str());
+      return false;
+    }
+    out.close();
+    if (out.fail() || out.bad()) {
+      error = "Could not write temporary file.";
+      unlink(tmp_path.c_str());
+      return false;
+    }
+  }
+
+  if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    error = std::string("Could not replace file: ") + std::strerror(errno);
+    unlink(tmp_path.c_str());
+    return false;
+  }
+  return true;
 }
 
-// Prefer existing known text extensions; only append .txt when none.
-// Also collapse portal/filter accidental doubles like foo.txt.txt.
-std::string ensure_save_as_path(std::string path) {
-  while (path.size() >= 8) {
-    const std::string tail = ascii_lower(path.substr(path.size() - 8));
-    if (tail != ".txt.txt") {
-      break;
+// Read a regular file in full. A short read (failbit / badbit / gcount)
+// is a failure so the caller does not treat a partial buffer as the file.
+bool read_file_fully(const std::string& path, std::string& raw,
+                     std::string& error) {
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+    error = path;
+    return false;
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    error = path;
+    return false;
+  }
+  raw.assign(static_cast<std::size_t>(st.st_size), '\0');
+  if (st.st_size > 0) {
+    in.read(&raw[0], static_cast<std::streamsize>(st.st_size));
+    if (in.bad() || in.fail() || in.gcount() != st.st_size) {
+      raw.clear();
+      error = path;
+      return false;
     }
-    path.resize(path.size() - 4);
   }
-  if (has_known_text_extension(path)) {
-    return path;
-  }
-  if (!basename_has_extension(path)) {
-    path += ".txt";
-  }
-  return path;
+  return true;
 }
 
 }  // namespace
+
+std::string MainWindow::ensure_save_as_path(std::string path) {
+  // The file chooser already confirmed this path, including overwrite.
+  // Rewriting the extension afterward writes a different file than the one
+  // the user confirmed (notes.txt.txt must stay notes.txt.txt; "report" must
+  // not become report.txt and clobber an existing file).
+  return path;
+}
+
+bool MainWindow::parse_go_to_line(const std::string& text, int& line) {
+  if (text.empty()) {
+    return false;
+  }
+  try {
+    std::size_t consumed = 0;
+    const int value = std::stoi(text, &consumed);
+    if (consumed != text.size()) {
+      return false;
+    }
+    line = value;
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
 
 MainWindow::MainWindow(Application& app) : app_(app) {
   set_title("Untitled — Lunduke Edit");
@@ -173,6 +245,8 @@ MainWindow::MainWindow(Application& app) : app_(app) {
 
   buf->signal_changed().connect(
       sigc::mem_fun(*this, &MainWindow::on_buffer_changed));
+  buf->signal_modified_changed().connect(
+      sigc::mem_fun(*this, &MainWindow::on_modified_changed));
   buf->signal_mark_set().connect(
       sigc::mem_fun(*this, &MainWindow::on_cursor_moved));
   // Undo/redo menu sensitivity must track GtkSourceView undo-manager state.
@@ -202,6 +276,9 @@ void MainWindow::build_ui() {
 
   scrolled_.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
   scrolled_.add(text_view_);
+  // Packing into the scrolled window replaces the text view's vadjustment.
+  // Rebind the gutter to the adjustment that actually scrolls.
+  gutter_->follow_view_adjustment();
   editor_row_.pack_start(scrolled_, Gtk::PACK_EXPAND_WIDGET);
   root_.pack_start(editor_row_, Gtk::PACK_EXPAND_WIDGET);
 
@@ -504,7 +581,11 @@ void MainWindow::load_seed_sample() {
   clear_find_highlights();
   buf->set_text("");
   buf->end_not_undoable_action();
+  buf->set_modified(false);
   file_path_.clear();
+  saved_encoding_ = encoding_;
+  encoding_dirty_ = false;
+  last_match_valid_ = false;
   set_dirty(false);
   seeding_ = false;
   update_title();
@@ -518,46 +599,57 @@ void MainWindow::load_seed_sample() {
 }
 
 bool MainWindow::open_file(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    Gtk::MessageDialog dlg(*this, "Could not open file.", false,
-                           Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
-    dlg.set_secondary_text(path);
-    dlg.run();
+  std::string raw;
+  std::string read_error;
+  if (!read_file_fully(path, raw, read_error)) {
+    report_error("Could not open file.",
+                 read_error.empty() ? path : read_error);
     return false;
   }
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  const std::string raw = ss.str();
 
   Glib::ustring text;
+  std::string loaded_encoding = encoding_;
   try {
-    if (encoding_ == "UTF-8") {
+    if (prefer_utf8_) {
       if (g_utf8_validate(raw.data(), static_cast<gssize>(raw.size()),
                           nullptr)) {
         text = Glib::ustring(raw);
+        loaded_encoding = "UTF-8";
       } else {
-        // Bytes are not valid UTF-8; interpret as Latin-1 so something readable loads.
-        text = Glib::convert_with_fallback(raw, "UTF-8", "ISO-8859-1", "?");
+        // Bytes are not valid UTF-8. Keep them as Latin-1 so a later save
+        // writes the original bytes back instead of UTF-8 (0xE9 must not
+        // become C3 A9 while the buffer still looks clean).
+        text = Glib::convert(raw, "UTF-8", "ISO-8859-1");
+        loaded_encoding = "ISO-8859-1";
       }
     } else {
-      text = Glib::convert_with_fallback(raw, "UTF-8", encoding_, "?");
+      text = Glib::convert(raw, "UTF-8", encoding_);
+      loaded_encoding = encoding_;
     }
   } catch (const Glib::ConvertError& e) {
-    Gtk::MessageDialog dlg(*this, "Encoding error while opening.", false,
-                           Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
-    dlg.set_secondary_text(e.what());
-    dlg.run();
+    report_error("Encoding error while opening.", e.what());
     return false;
   }
 
   seeding_ = true;
+  encoding_ = loaded_encoding;
+  if (loaded_encoding == "ISO-8859-1") {
+    if (enc_latin1_item_ && !enc_latin1_item_->get_active()) {
+      enc_latin1_item_->set_active(true);
+    }
+  } else if (enc_utf8_item_ && !enc_utf8_item_->get_active()) {
+    enc_utf8_item_->set_active(true);
+  }
   auto buf = buffer();
   buf->begin_not_undoable_action();
   clear_find_highlights();
   buf->set_text(text);
   buf->end_not_undoable_action();
+  buf->set_modified(false);
   file_path_ = path;
+  saved_encoding_ = encoding_;
+  encoding_dirty_ = false;
+  last_match_valid_ = false;
   set_dirty(false);
   seeding_ = false;
   update_title();
@@ -599,7 +691,7 @@ void MainWindow::update_status() {
   auto buf = text_view_.get_buffer();
   auto iter = buf->get_iter_at_mark(buf->get_insert());
   const int line = iter.get_line() + 1;
-  const int col = iter.get_line_offset() + 1;
+  const int col = display_column_at(iter);
   status_pos_.set_text("Ln " + std::to_string(line) + ", Col " +
                        std::to_string(col));
   status_mode_.set_text(overwrite_ ? "Overwrite" : "Insert");
@@ -620,13 +712,49 @@ void MainWindow::update_undo_redo_sensitivity() {
 }
 
 void MainWindow::on_buffer_changed() {
-  if (!seeding_) {
-    set_dirty(true);
-  }
+  // Dirty state follows the undo save point (signal_modified_changed),
+  // not every change. Undo back to the saved text must clear the marker.
   update_status();
   if (gutter_) {
     gutter_->queue_draw();
   }
+}
+
+void MainWindow::on_modified_changed() { refresh_dirty_from_buffer(); }
+
+void MainWindow::refresh_dirty_from_buffer() {
+  if (seeding_) {
+    return;
+  }
+  auto buf = buffer();
+  const bool text_dirty = buf && buf->get_modified();
+  set_dirty(text_dirty || encoding_dirty_);
+}
+
+int MainWindow::display_column_at(const Gtk::TextIter& iter) const {
+  Gtk::TextIter line_start = iter;
+  line_start.set_line_offset(0);
+  const int tab = std::max(1, tab_width_);
+  int col = 0;
+  for (auto it = line_start; it.compare(iter) < 0; it.forward_char()) {
+    if (it.get_char() == '\t') {
+      col += tab - (col % tab);
+    } else {
+      col += 1;
+    }
+  }
+  return col + 1;
+}
+
+void MainWindow::report_error(const Glib::ustring& primary,
+                              const Glib::ustring& secondary) {
+  if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
+    return;
+  }
+  Gtk::MessageDialog dlg(*this, primary, false, Gtk::MESSAGE_ERROR,
+                         Gtk::BUTTONS_OK, true);
+  dlg.set_secondary_text(secondary);
+  dlg.run();
 }
 
 void MainWindow::on_cursor_moved(
@@ -641,6 +769,18 @@ bool MainWindow::confirm_discard_or_save() {
   if (!dirty_) {
     return true;
   }
+  // Tests set this so a modal dialog does not block. Unset in normal use.
+  if (const char* choice = g_getenv("LUNDUKE_EDIT_TEST_DISCARD")) {
+    if (std::strcmp(choice, "cancel") == 0) {
+      return false;
+    }
+    if (std::strcmp(choice, "discard") == 0) {
+      return true;
+    }
+    if (std::strcmp(choice, "save") == 0) {
+      return save_document();
+    }
+  }
   Gtk::MessageDialog dlg(*this, "Save changes before continuing?", false,
                          Gtk::MESSAGE_QUESTION, Gtk::BUTTONS_NONE, true);
   dlg.set_secondary_text("\"" + current_basename() +
@@ -654,8 +794,7 @@ bool MainWindow::confirm_discard_or_save() {
     return false;
   }
   if (resp == Gtk::RESPONSE_ACCEPT) {
-    on_save();
-    return !dirty_;
+    return save_document();
   }
   return true;
 }
@@ -670,7 +809,11 @@ void MainWindow::on_new() {
   clear_find_highlights();
   buf->set_text("");
   buf->end_not_undoable_action();
+  buf->set_modified(false);
   file_path_.clear();
+  saved_encoding_ = encoding_;
+  encoding_dirty_ = false;
+  last_match_valid_ = false;
   set_dirty(false);
   seeding_ = false;
   update_title();
@@ -715,39 +858,38 @@ bool MainWindow::save_to_path(const std::string& path) {
       out_bytes = Glib::convert(text, encoding_, "UTF-8");
     }
   } catch (const Glib::ConvertError& e) {
-    Gtk::MessageDialog dlg(*this, "Encoding error while saving.", false,
-                           Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
-    dlg.set_secondary_text(e.what());
-    dlg.run();
+    report_error("Encoding error while saving.", e.what());
     return false;
   }
 
-  std::ofstream out(path, std::ios::binary);
-  if (!out) {
-    Gtk::MessageDialog dlg(*this, "Could not save file.", false,
-                           Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
-    dlg.set_secondary_text(path);
-    dlg.run();
+  std::string write_error;
+  if (!replace_file_contents(path, out_bytes, write_error)) {
+    report_error("Could not save file.",
+                 write_error.empty() ? path : write_error);
     return false;
   }
-  out.write(out_bytes.data(),
-            static_cast<std::streamsize>(out_bytes.size()));
   file_path_ = path;
+  saved_encoding_ = encoding_;
+  encoding_dirty_ = false;
+  // Records an undo save point so undo/redo back to this text clears
+  // the buffer's modified flag.
+  buffer()->set_modified(false);
   set_dirty(false);
   update_status();
   remember_recent(path);
   return true;
 }
 
-void MainWindow::on_save() {
+bool MainWindow::save_document() {
   if (file_path_.empty()) {
-    on_save_as();
-    return;
+    return save_as_dialog();
   }
-  save_to_path(file_path_);
+  return save_to_path(file_path_);
 }
 
-void MainWindow::on_save_as() {
+void MainWindow::on_save() { save_document(); }
+
+bool MainWindow::save_as_dialog() {
   Gtk::FileChooserDialog dlg(*this, "Save As",
                              Gtk::FILE_CHOOSER_ACTION_SAVE);
   dlg.set_do_overwrite_confirmation(true);
@@ -765,17 +907,20 @@ void MainWindow::on_save_as() {
   } else {
     dlg.set_current_name("Untitled.txt");
   }
-  if (dlg.run() == Gtk::RESPONSE_ACCEPT) {
-    // Do not double-append .txt when the chosen name already has a known
-    // text extension (filter/portal auto-extension can produce foo.txt.txt).
-    save_to_path(ensure_save_as_path(dlg.get_filename()));
+  if (dlg.run() != Gtk::RESPONSE_ACCEPT) {
+    return false;
   }
+  return save_to_path(ensure_save_as_path(dlg.get_filename()));
 }
 
+void MainWindow::on_save_as() { save_as_dialog(); }
+
 void MainWindow::on_exit() {
-  if (confirm_discard_or_save()) {
-    hide();
+  if (!app_.confirm_quit()) {
+    return;
   }
+  // hide() leaves the process registered as org.lunduke.LundukeEdit.
+  app_.quit();
 }
 
 bool MainWindow::on_delete_event(GdkEventAny* /*event*/) {
@@ -799,6 +944,7 @@ void MainWindow::on_undo() {
   auto buf = buffer();
   if (buf && buf->can_undo()) {
     buf->undo();
+    refresh_dirty_from_buffer();
     update_undo_redo_sensitivity();
     update_status();
   }
@@ -808,6 +954,7 @@ void MainWindow::on_redo() {
   auto buf = buffer();
   if (buf && buf->can_redo()) {
     buf->redo();
+    refresh_dirty_from_buffer();
     update_undo_redo_sensitivity();
     update_status();
   }
@@ -883,18 +1030,32 @@ void MainWindow::rebuild_recents_menu() {
 }
 
 void MainWindow::set_encoding(const std::string& encoding) {
+  if (encoding_ == encoding) {
+    update_status();
+    return;
+  }
   encoding_ = encoding;
+  if (!seeding_) {
+    encoding_dirty_ = (encoding_ != saved_encoding_);
+    refresh_dirty_from_buffer();
+  }
   update_status();
 }
 
 void MainWindow::on_encoding_utf8() {
   if (enc_utf8_item_ && enc_utf8_item_->get_active()) {
+    if (!seeding_) {
+      prefer_utf8_ = true;
+    }
     set_encoding("UTF-8");
   }
 }
 
 void MainWindow::on_encoding_latin1() {
   if (enc_latin1_item_ && enc_latin1_item_->get_active()) {
+    if (!seeding_) {
+      prefer_utf8_ = false;
+    }
     set_encoding("ISO-8859-1");
   }
 }
@@ -945,6 +1106,12 @@ void MainWindow::ensure_find_marks() {
     extend_anchor_mark_ =
         buf->create_mark("lunduke-extend-anchor", buf->begin(), true);
   }
+  if (!last_match_start_) {
+    last_match_start_ =
+        buf->create_mark("lunduke-last-match-start", buf->begin(), true);
+    last_match_end_ =
+        buf->create_mark("lunduke-last-match-end", buf->begin(), false);
+  }
 }
 
 void MainWindow::pin_selection_only_range() {
@@ -979,7 +1146,7 @@ bool MainWindow::selection_matches_needle(const FindOptions& opts,
   return selected == needle;
 }
 
-void MainWindow::get_search_bounds(const FindOptions& opts, Gtk::TextIter& begin,
+bool MainWindow::get_search_bounds(const FindOptions& opts, Gtk::TextIter& begin,
                                    Gtk::TextIter& end) {
   auto buf = text_view_.get_buffer();
   if (opts.search_selection_only) {
@@ -989,7 +1156,7 @@ void MainWindow::get_search_bounds(const FindOptions& opts, Gtk::TextIter& begin
       begin = buf->get_iter_at_mark(sel_only_start_mark_);
       end = buf->get_iter_at_mark(sel_only_end_mark_);
       if (begin < end) {
-        return;
+        return true;
       }
     }
     Gtk::TextIter sel_a, sel_b;
@@ -1000,11 +1167,16 @@ void MainWindow::get_search_bounds(const FindOptions& opts, Gtk::TextIter& begin
       buf->move_mark(sel_only_start_mark_, sel_a);
       buf->move_mark(sel_only_end_mark_, sel_b);
       sel_only_range_valid_ = true;
-      return;
+      return true;
     }
+    // No selection: do not fall through to the whole buffer.
+    begin = buf->begin();
+    end = begin;
+    return false;
   }
   begin = buf->begin();
   end = buf->end();
+  return true;
 }
 
 bool MainWindow::find_match(const FindOptions& opts, bool from_next) {
@@ -1022,7 +1194,9 @@ bool MainWindow::find_match(const FindOptions& opts, bool from_next) {
   }
 
   Gtk::TextIter range_begin, range_end;
-  get_search_bounds(opts, range_begin, range_end);
+  if (!get_search_bounds(opts, range_begin, range_end)) {
+    return false;
+  }
 
   Gtk::TextIter start;
   Gtk::TextIter sel_a, sel_b;
@@ -1057,16 +1231,12 @@ bool MainWindow::find_match(const FindOptions& opts, bool from_next) {
         }
       }
       if (from_next || (!opts.start_at_top) || opts.extend_selection) {
-        // Move past current selection if it is exactly the needle, or when
-        // Find Next asks us to advance.
+        // Move past the current selection only when it is exactly the needle.
+        // Stepping an extra character when it is not makes forward_search
+        // miss a match that starts at the cursor (the second "x" in "xx",
+        // and Wrap Around then jumps to an earlier hit).
         if (have_sel && selection_matches_needle(opts, sel_a, sel_b)) {
           start = opts.search_backwards ? sel_a : sel_b;
-        } else if (from_next) {
-          if (opts.search_backwards) {
-            start.backward_char();
-          } else {
-            start.forward_char();
-          }
         }
       }
     }
@@ -1131,6 +1301,10 @@ bool MainWindow::find_match(const FindOptions& opts, bool from_next) {
           } else {
             buf->select_range(match_start, match_end);
           }
+          ensure_find_marks();
+          buf->move_mark(last_match_start_, match_start);
+          buf->move_mark(last_match_end_, match_end);
+          last_match_valid_ = true;
           text_view_.scroll_to(match_start);
           update_status();
           return true;
@@ -1164,7 +1338,9 @@ int MainWindow::count_matches(const FindOptions& opts) {
   auto buf = text_view_.get_buffer();
   const auto flags = search_flags(opts);
   Gtk::TextIter range_begin, range_end;
-  get_search_bounds(opts, range_begin, range_end);
+  if (!get_search_bounds(opts, range_begin, range_end)) {
+    return 0;
+  }
 
   int count = 0;
   Gtk::TextIter cursor = range_begin;
@@ -1199,7 +1375,9 @@ void MainWindow::highlight_all_matches(const FindOptions& opts) {
   auto buf = text_view_.get_buffer();
   const auto flags = search_flags(opts);
   Gtk::TextIter range_begin, range_end;
-  get_search_bounds(opts, range_begin, range_end);
+  if (!get_search_bounds(opts, range_begin, range_end)) {
+    return;
+  }
 
   Gtk::TextIter cursor = range_begin;
   Gtk::TextIter match_start, match_end;
@@ -1228,27 +1406,53 @@ void MainWindow::highlight_all_matches(const FindOptions& opts) {
   }
 }
 
-bool MainWindow::replace_current(const FindOptions& opts) {
+MainWindow::ReplaceResult MainWindow::replace_current(const FindOptions& opts) {
   auto buf = text_view_.get_buffer();
+  auto matches_needle = [&](const Gtk::TextIter& a, const Gtk::TextIter& b) {
+    return a != b && selection_matches_needle(opts, a, b) &&
+           (!opts.entire_word || is_entire_word(a, b));
+  };
+  auto replace_span = [&](int start_off, int end_off) {
+    buf->begin_user_action();
+    auto a = buf->get_iter_at_offset(start_off);
+    auto b = buf->get_iter_at_offset(end_off);
+    buf->erase(a, b);
+    a = buf->get_iter_at_offset(start_off);
+    buf->insert(a, opts.replace_with);
+    buf->end_user_action();
+    last_match_valid_ = false;
+    update_undo_redo_sensitivity();
+    find_match(opts, true);
+  };
+
   Gtk::TextIter sel_a, sel_b;
-  if (buf->get_selection_bounds(sel_a, sel_b)) {
-    Glib::ustring selected = sel_a.get_text(sel_b);
-    Glib::ustring needle = opts.search_for;
-    if (!opts.case_sensitive) {
-      selected = selected.casefold();
-      needle = needle.casefold();
-    }
-    if (selected == needle &&
-        (!opts.entire_word || is_entire_word(sel_a, sel_b))) {
-      buf->erase(sel_a, sel_b);
-      // Re-get insert after erase
-      auto insert = buf->get_iter_at_mark(buf->get_insert());
-      buf->insert(insert, opts.replace_with);
-      update_undo_redo_sensitivity();
-      return find_match(opts, true) || true;
+  const bool have_sel =
+      buf->get_selection_bounds(sel_a, sel_b) && sel_a != sel_b;
+  if (have_sel && matches_needle(sel_a, sel_b)) {
+    replace_span(sel_a.get_offset(), sel_b.get_offset());
+    return ReplaceResult::Replaced;
+  }
+
+  // Extend Selection grows the selection past the needle. Replace the match
+  // that was found, not the grown span, and do not search again (that would
+  // grow the selection further without replacing).
+  if (last_match_valid_ && last_match_start_ && last_match_end_) {
+    auto a = buf->get_iter_at_mark(last_match_start_);
+    auto b = buf->get_iter_at_mark(last_match_end_);
+    if (matches_needle(a, b)) {
+      replace_span(a.get_offset(), b.get_offset());
+      return ReplaceResult::Replaced;
     }
   }
-  return find_match(opts, false);
+
+  if (opts.extend_selection && have_sel && !matches_needle(sel_a, sel_b)) {
+    return ReplaceResult::Blocked;
+  }
+
+  if (find_match(opts, false)) {
+    return ReplaceResult::Found;
+  }
+  return ReplaceResult::NotFound;
 }
 
 int MainWindow::replace_all(const FindOptions& opts) {
@@ -1258,7 +1462,9 @@ int MainWindow::replace_all(const FindOptions& opts) {
   auto buf = text_view_.get_buffer();
   const auto flags = search_flags(opts);
   Gtk::TextIter range_begin, range_end;
-  get_search_bounds(opts, range_begin, range_end);
+  if (!get_search_bounds(opts, range_begin, range_end)) {
+    return 0;
+  }
 
   // Collect offsets first so indices stay valid while we edit from end.
   struct Hit {
@@ -1323,20 +1529,46 @@ void MainWindow::on_find() {
     if (!opts.extend_selection) {
       clear_extend_anchor();
     }
+    auto no_selection = [&dlg]() {
+      Gtk::MessageDialog miss(dlg, "No text is selected.", false,
+                              Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
+      miss.set_secondary_text(
+          "Search Selection Only needs a selection.");
+      miss.run();
+    };
+    auto bounds_ok = [this, &opts]() {
+      Gtk::TextIter begin, end;
+      return get_search_bounds(opts, begin, end);
+    };
+
     switch (action) {
       case FindReplaceDialog::Action::Find: {
+        if (!bounds_ok()) {
+          no_selection();
+          return false;
+        }
         FindOptions o = opts;
-        if (!find_match(o, false)) {
+        const bool found = find_match(o, false);
+        // Start at Top applies to this search only. The next Find in the
+        // dialog continues from the cursor. F3 still forces the flag off.
+        if (opts.start_at_top) {
+          dlg.clear_start_at_top();
+          find_opts_.start_at_top = false;
+        }
+        if (!found) {
           Gtk::MessageDialog miss(dlg, "Text not found.", false,
                                   Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
           miss.set_secondary_text(opts.search_for);
           miss.run();
           return false;
         }
-        // Turn off start-at-top for follow-up finds within same dialog session.
         return true;
       }
       case FindReplaceDialog::Action::FindAll: {
+        if (!bounds_ok()) {
+          no_selection();
+          return false;
+        }
         const int n = count_matches(opts);
         highlight_all_matches(opts);
         Gtk::MessageDialog info(dlg,
@@ -1350,7 +1582,21 @@ void MainWindow::on_find() {
         return n > 0;
       }
       case FindReplaceDialog::Action::Replace: {
-        if (!replace_current(opts)) {
+        if (!bounds_ok()) {
+          no_selection();
+          return false;
+        }
+        const ReplaceResult result = replace_current(opts);
+        if (result == ReplaceResult::Blocked) {
+          Gtk::MessageDialog miss(dlg, "Cannot replace this selection.", false,
+                                  Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
+          miss.set_secondary_text(
+              "The selection extends past the match, and that match could "
+              "not be replaced.");
+          miss.run();
+          return false;
+        }
+        if (result == ReplaceResult::NotFound) {
           Gtk::MessageDialog miss(dlg, "Text not found.", false,
                                   Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
           miss.set_secondary_text(opts.search_for);
@@ -1360,6 +1606,10 @@ void MainWindow::on_find() {
         return true;
       }
       case FindReplaceDialog::Action::ReplaceAll: {
+        if (!bounds_ok()) {
+          no_selection();
+          return false;
+        }
         const int n = replace_all(opts);
         Gtk::MessageDialog info(dlg,
                                 "Replaced " + std::to_string(n) +
@@ -1416,8 +1666,12 @@ void MainWindow::on_go_to_line() {
   dlg.show_all();
 
   if (dlg.run() == Gtk::RESPONSE_OK) {
-    try {
-      int line = std::stoi(entry->get_text().raw());
+    int line = 0;
+    if (!parse_go_to_line(entry->get_text().raw(), line)) {
+      Gtk::MessageDialog bad(dlg, "Invalid line number.", false,
+                             Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
+      bad.run();
+    } else {
       if (line < 1) {
         line = 1;
       }
@@ -1429,10 +1683,6 @@ void MainWindow::on_go_to_line() {
       buf->place_cursor(dest);
       text_view_.scroll_to(dest);
       update_status();
-    } catch (...) {
-      Gtk::MessageDialog bad(dlg, "Invalid line number.", false,
-                             Gtk::MESSAGE_ERROR, Gtk::BUTTONS_OK, true);
-      bad.run();
     }
   }
 }
@@ -1582,14 +1832,23 @@ void MainWindow::on_draw_page(const Glib::RefPtr<Gtk::PrintContext>& context,
     end_line = print_page_breaks_[static_cast<std::size_t>(page_nr)];
   }
 
+  // y is the top of the next line box. show_in_cairo_context draws on the
+  // baseline; logical.y is that baseline relative to the top (usually
+  // negative). Starting at y=0 clips the ascent on every page. Page breaks
+  // in on_begin_print use the same logical height, so the baseline offset
+  // stays inside the paginated line box.
   double y = 0.0;
   for (int i = start_line; i < end_line; ++i) {
     auto line = print_layout_->get_line(i);
     Pango::Rectangle ink, logical;
     line->get_extents(ink, logical);
-    cr->move_to(static_cast<double>(logical.get_x()) / Pango::SCALE, y);
+    const double line_height =
+        static_cast<double>(logical.get_height()) / Pango::SCALE;
+    const double baseline =
+        y - static_cast<double>(logical.get_y()) / Pango::SCALE;
+    cr->move_to(static_cast<double>(logical.get_x()) / Pango::SCALE, baseline);
     line->show_in_cairo_context(cr);
-    y += static_cast<double>(logical.get_height()) / Pango::SCALE;
+    y += line_height;
   }
 }
 
