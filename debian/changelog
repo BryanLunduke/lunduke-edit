@@ -1,3 +1,10 @@
+lunduke-edit (0.9-1) unstable; urgency=medium
+
+  * LCOS 0.9 track identity bump (0.8-2 → 0.9 / Debian 0.9-1). Features
+    and UI unchanged.
+
+ -- Phil <phil@brushpad.local>  Sat, 03 Oct 2026 16:50:00 -0500
+
 lunduke-edit (0.8-2) unstable; urgency=medium
 
   * A failed save stays unsaved and no longer truncates the file. The new
