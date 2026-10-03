@@ -40,7 +40,7 @@
 namespace lundukeedit {
 namespace {
 
-const char* kVersion = "0.8-2";
+const char* kVersion = "0.9";
 constexpr const char* kAppId = "org.lunduke.LundukeEdit";
 constexpr const char* kFallbackIcon = "accessories-text-editor";
 
