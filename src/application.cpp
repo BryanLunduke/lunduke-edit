@@ -83,14 +83,15 @@ void Application::open_files(const std::vector<std::string>& paths) {
 
   std::size_t index = 0;
   // Reuse the visible window for the first file only after the user agrees
-  // to drop unsaved edits. Cancel leaves that buffer alone and still opens
-  // every requested file in its own window.
+  // to drop unsaved edits. Cancel aborts the whole open: the dirty buffer
+  // stays, and none of the requested files are opened.
   if (window_ && window_->get_visible()) {
-    if (window_->confirm_discard_or_save()) {
-      window_->present();
-      window_->open_file(paths[0]);
-      index = 1;
+    if (!window_->confirm_discard_or_save()) {
+      return;
     }
+    window_->present();
+    window_->open_file(paths[0]);
+    index = 1;
   } else if (!window_) {
     auto* w = create_window();
     w->present();

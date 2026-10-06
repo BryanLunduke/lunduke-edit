@@ -222,6 +222,26 @@ struct EditChecks {
     expect(!dlg.options().start_at_top, "start at top clears");
   }
 
+  static int main_window_count(Application& app) {
+    int n = 0;
+    for (auto* win : app.get_windows()) {
+      if (dynamic_cast<MainWindow*>(win)) {
+        ++n;
+      }
+    }
+    return n;
+  }
+
+  static bool window_has_path(Application& app, const std::string& path) {
+    for (auto* win : app.get_windows()) {
+      auto* mw = dynamic_cast<MainWindow*>(win);
+      if (mw && mw->file_path_ == path) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   static void test_open_many(Application& app, const std::string& dir) {
     const std::string a = dir + "/a.txt";
     const std::string b = dir + "/b.txt";
@@ -236,6 +256,41 @@ struct EditChecks {
       flush_ui();
     }
     auto* current = app.main_window();
+    expect(main_window_count(app) == 1, "one window before cancelled open");
+
+    current->buffer()->set_text("unsaved-edits");
+    current->buffer()->set_modified(true);
+    current->refresh_dirty_from_buffer();
+    expect(current->dirty_, "window dirty before cancelled open");
+    const std::string kept = current->buffer()->get_text();
+    const std::string kept_path = current->file_path_;
+
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    app.open_files({c});
+    app.open_files({a, b});
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    flush_ui();
+
+    expect(main_window_count(app) == 1, "cancel does not open a second window");
+    expect(app.main_window() == current, "cancel keeps the same window");
+    expect(current->get_visible(), "dirty window stays visible");
+    expect(current->dirty_, "cancel leaves the buffer dirty");
+    expect(current->buffer()->get_text() == kept, "cancel keeps unsaved edits");
+    expect(current->file_path_ == kept_path, "cancel keeps the open path");
+    expect(!window_has_path(app, a), "cancel does not open the first requested file");
+    expect(!window_has_path(app, b), "cancel does not open the second requested file");
+    expect(!window_has_path(app, c), "cancel does not open the new file");
+
+    // Don't Save still replaces the dirty buffer in the same window.
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    app.open_files({c});
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    flush_ui();
+    expect(main_window_count(app) == 1, "don't save reuses the same window");
+    expect(current->file_path_ == c && current->buffer()->get_text() == "file-c",
+           "don't save opens the file in place");
+    expect(!current->dirty_, "don't save open is clean");
+
     current->load_seed_sample();
     expect(!current->dirty_, "seed is clean");
 
@@ -244,11 +299,13 @@ struct EditChecks {
 
     bool saw_a = false;
     bool saw_b = false;
+    int windows = 0;
     for (auto* win : app.get_windows()) {
       auto* mw = dynamic_cast<MainWindow*>(win);
       if (!mw) {
         continue;
       }
+      ++windows;
       if (mw->file_path_ == a && mw->buffer()->get_text() == "file-a") {
         saw_a = true;
       }
@@ -258,25 +315,7 @@ struct EditChecks {
     }
     expect(saw_a, "opened a.txt");
     expect(saw_b, "opened b.txt");
-
-    auto* dirty_win = app.main_window();
-    dirty_win->buffer()->insert(dirty_win->buffer()->end(), "UNSAVED");
-    dirty_win->refresh_dirty_from_buffer();
-    expect(dirty_win->dirty_, "window dirty before second open");
-    const std::string kept = dirty_win->buffer()->get_text();
-    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
-    app.open_files({c});
-    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
-    expect(dirty_win->buffer()->get_text() == kept, "cancel keeps unsaved edits");
-
-    bool saw_c = false;
-    for (auto* win : app.get_windows()) {
-      auto* mw = dynamic_cast<MainWindow*>(win);
-      if (mw && mw->file_path_ == c && mw->buffer()->get_text() == "file-c") {
-        saw_c = true;
-      }
-    }
-    expect(saw_c, "cancelled open still opens the file in another window");
+    expect(windows == 2, "each further command-line file opens its own window");
   }
 
   static int run() {
