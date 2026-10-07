@@ -304,6 +304,7 @@ private:
   bool accepting_cr_{false};
   bool swallow_insert_repeat_{false};
   std::string last_save_error_;
+  std::string last_open_error_;
   // UTF-8 bytes and LF count in the buffer. Status "bytes" is the size
   // save_to_path would write, derived from these plus encoding and newlines.
   std::size_t utf8_bytes_{0};

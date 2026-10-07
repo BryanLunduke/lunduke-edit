@@ -82,7 +82,10 @@ std::string format_bytes(std::size_t n) {
 
 constexpr std::size_t kDefaultMaxOpenBytes = 32u * 1024u * 1024u;
 constexpr std::size_t kDefaultMaxPasteBytes = 32u * 1024u * 1024u;
-constexpr std::size_t kReserveCapBytes = 32u * 1024u * 1024u;
+// Files above the 32 MiB confirm threshold may still be opened, up to this
+// ceiling. There is no "open anyway" past it: the UI thread must not read
+// an unbounded file into a GtkTextBuffer.
+constexpr std::size_t kDefaultMaxOpenHardBytes = 64u * 1024u * 1024u;
 constexpr int kMaxColumnWalk = 4096;
 constexpr int kLongLineChars = 4000;
 constexpr int kDefaultMaxFindHits = 10000;
@@ -117,6 +120,23 @@ int env_int(const char* name, int fallback) {
 
 std::size_t max_open_bytes() {
   return env_size("LUNDUKE_EDIT_TEST_MAX_OPEN", kDefaultMaxOpenBytes);
+}
+
+std::size_t max_open_hard_bytes() {
+  return env_size("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD", kDefaultMaxOpenHardBytes);
+}
+
+std::string hard_open_limit_phrase(std::size_t hard) {
+  const std::size_t mib = 1024u * 1024u;
+  if (hard >= mib && hard % mib == 0) {
+    return std::to_string(hard / mib) + " MiB";
+  }
+  return format_bytes(hard);
+}
+
+std::string hard_open_refusal(std::size_t hard) {
+  return "The file is larger than " + hard_open_limit_phrase(hard) +
+         ". It will not be opened.";
 }
 
 std::size_t max_paste_bytes() {
@@ -605,11 +625,10 @@ enum class ReadStatus { Ok, Failed, TooLarge };
 
 // open + fstat + read until EOF. st_size is only a reserve hint. A reported
 // size of 0 (/proc, /sys, some FUSE) is not treated as an empty file.
-// Reading stops at max_bytes unless unlimited is set, so a sparse st_size
-// cannot force a huge allocation.
+// Reading always stops at max_bytes, so a sparse st_size cannot force a
+// huge allocation and there is no unlimited read.
 ReadStatus read_file_fully(const std::string& path, std::string& raw,
-                           std::string& error, std::size_t max_bytes,
-                           bool unlimited) {
+                           std::string& error, std::size_t max_bytes) {
   raw.clear();
   // O_NONBLOCK so a fifo (or a symlink to one) cannot stall the main loop.
   // The type is checked before any blocking read, then the flag is cleared.
@@ -631,8 +650,8 @@ ReadStatus read_file_fully(const std::string& path, std::string& raw,
   try {
     if (st.st_size > 0) {
       auto hint = static_cast<std::size_t>(st.st_size);
-      if (hint > kReserveCapBytes) {
-        hint = kReserveCapBytes;
+      if (hint > max_bytes) {
+        hint = max_bytes;
       }
       raw.reserve(hint);
     }
@@ -652,7 +671,7 @@ ReadStatus read_file_fully(const std::string& path, std::string& raw,
         return ReadStatus::Failed;
       }
       const auto got = static_cast<std::size_t>(n);
-      if (!unlimited && (got > max_bytes || raw.size() > max_bytes - got)) {
+      if (got > max_bytes || raw.size() > max_bytes - got) {
         raw.clear();
         ::close(fd);
         error = path;
@@ -1379,16 +1398,40 @@ bool MainWindow::open_file_body(const std::string& path) {
   std::string raw;
   std::string read_error;
   const std::size_t cap = max_open_bytes();
+  const std::size_t hard = max_open_hard_bytes();
+  auto refuse_over_hard = [this, hard]() {
+    last_open_error_ = hard_open_refusal(hard);
+    report_error("File is too large to open.", last_open_error_);
+  };
+  // A known size past the hard ceiling is refused before any confirm and
+  // before the bytes are pulled into the text buffer.
+  struct stat size_st {};
+  if (::stat(path.c_str(), &size_st) == 0 && S_ISREG(size_st.st_mode) &&
+      size_st.st_size > 0 &&
+      static_cast<std::size_t>(size_st.st_size) > hard) {
+    refuse_over_hard();
+    return false;
+  }
   ReadStatus status = ReadStatus::Failed;
   try {
-    status = read_file_fully(path, raw, read_error, cap, false);
+    status = read_file_fully(path, raw, read_error, cap);
     if (status == ReadStatus::TooLarge) {
+      if (::stat(path.c_str(), &size_st) == 0 && size_st.st_size > 0 &&
+          static_cast<std::size_t>(size_st.st_size) > hard) {
+        refuse_over_hard();
+        return false;
+      }
       if (!confirm_large_open(path)) {
         report_error("File not opened.",
                      "The file is larger than 32 MiB.");
         return false;
       }
-      status = read_file_fully(path, raw, read_error, cap, true);
+      // The confirm only covers files that still fit under the hard cap.
+      status = read_file_fully(path, raw, read_error, hard);
+      if (status == ReadStatus::TooLarge) {
+        refuse_over_hard();
+        return false;
+      }
     }
   } catch (const std::bad_alloc&) {
     report_error("Not enough memory to open this file.", path);
