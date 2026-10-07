@@ -86,7 +86,10 @@ std::vector<std::string> split_recent_lines(const std::string& data) {
     const std::size_t nl = data.find('\n', start);
     const std::size_t end = (nl == std::string::npos) ? data.size() : nl;
     if (end > start) {
-      lines.push_back(data.substr(start, end - start));
+      std::string line = data.substr(start, end - start);
+      if (line.find('\r') == std::string::npos) {
+        lines.push_back(std::move(line));
+      }
     }
     if (nl == std::string::npos) {
       break;
@@ -254,16 +257,66 @@ void Application::on_activate() {
   w->present();
 }
 
+MainWindow* Application::find_window_editing(const std::string& path) const {
+  if (path.empty()) {
+    return nullptr;
+  }
+  for (auto* window : live_) {
+    if (window && window->get_visible() && window->edits_path(path)) {
+      return window;
+    }
+  }
+  return nullptr;
+}
+
+void Application::push_reentry() { ++reentry_depth_; }
+
+void Application::pop_reentry() {
+  if (reentry_depth_ > 0) {
+    --reentry_depth_;
+  }
+  if (reentry_depth_ == 0) {
+    drain_deferred_opens();
+  }
+}
+
+void Application::defer_open(const std::string& path) {
+  if (!path.empty()) {
+    deferred_opens_.push_back(path);
+  }
+}
+
+void Application::drain_deferred_opens() {
+  while (!deferred_opens_.empty() && reentry_depth_ == 0) {
+    std::vector<std::string> batch;
+    batch.swap(deferred_opens_);
+    open_files(batch);
+  }
+}
+
 void Application::open_files(const std::vector<std::string>& paths) {
   if (paths.empty()) {
     on_activate();
     return;
   }
+  // A dialog or clipboard wait is already iterating the main context.
+  // Opening now would set_text under that dialog. Hold the paths until
+  // the nested loop returns.
+  if (reentry_depth_ > 0) {
+    deferred_opens_.insert(deferred_opens_.end(), paths.begin(), paths.end());
+    return;
+  }
+
+  ++reentry_depth_;
 
   std::size_t index = 0;
-  // Reuse only the focused window, and only while it is still a blank
-  // untitled document. Any other document stays where it is.
-  if (focused_ && focused_->get_visible() && focused_->is_empty_untitled()) {
+  if (MainWindow* existing = find_window_editing(paths[0])) {
+    existing->present();
+    index = 1;
+  } else if (focused_ && focused_->get_visible() &&
+             focused_->is_empty_untitled()) {
+    // Reuse only the focused window, and only while it is still a blank
+    // untitled document. Any other document stays where it is.
     if (focused_->open_file(paths[0])) {
       focused_->present();
     }
@@ -271,12 +324,21 @@ void Application::open_files(const std::vector<std::string>& paths) {
   }
 
   for (; index < paths.size(); ++index) {
+    if (MainWindow* existing = find_window_editing(paths[index])) {
+      existing->present();
+      continue;
+    }
     auto* w = create_window();
     if (!w->open_file(paths[index])) {
       destroy_window_now(w);
       continue;
     }
     w->present();
+  }
+
+  --reentry_depth_;
+  if (reentry_depth_ == 0) {
+    drain_deferred_opens();
   }
 }
 
@@ -295,7 +357,9 @@ void Application::report_non_native(const std::vector<Glib::ustring>& uris) {
   if (MainWindow* w = main_window()) {
     dlg.set_transient_for(*w);
   }
+  push_reentry();
   dlg.run();
+  pop_reentry();
 }
 
 void Application::on_open(const Gio::Application::type_vec_files& files,
@@ -355,7 +419,10 @@ void Application::ensure_recents_loaded() {
   if (fd < 0) {
     return;
   }
-  flock(fd, LOCK_SH);
+  if (flock(fd, LOCK_SH) != 0) {
+    ::close(fd);
+    return;
+  }
   const std::string data = read_fd_all(fd);
   flock(fd, LOCK_UN);
   ::close(fd);
@@ -371,7 +438,10 @@ const std::vector<std::string>& Application::recents() {
 }
 
 void Application::remember_recent(const std::string& path) {
-  if (path.empty()) {
+  // A newline would split into two menu entries. Reject it rather than
+  // escaping; the config file is one path per line.
+  if (path.empty() || path.find('\n') != std::string::npos ||
+      path.find('\r') != std::string::npos) {
     return;
   }
   try {
@@ -384,7 +454,11 @@ void Application::remember_recent(const std::string& path) {
   const int fd =
       ::open(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   if (fd >= 0) {
-    flock(fd, LOCK_EX);
+    if (flock(fd, LOCK_EX) != 0) {
+      // A failed lock must not read-modify-write recents.txt.
+      ::close(fd);
+      return;
+    }
     auto list = split_recent_lines(read_fd_all(fd));
     list.erase(std::remove(list.begin(), list.end(), path), list.end());
     list.insert(list.begin(), path);

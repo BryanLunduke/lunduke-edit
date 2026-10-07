@@ -9,6 +9,11 @@
 #include <giomm/file.h>
 #include <gtkmm/printoperation.h>
 
+#include <gdk/gdkkeysyms.h>
+#include <gtk/gtk.h>
+
+#include <csetjmp>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -17,8 +22,59 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
+
+namespace {
+
+sigjmp_buf hostile_alarm_jmp;
+
+void hostile_alarm(int) { siglongjmp(hostile_alarm_jmp, 1); }
+
+class AlarmGuard {
+ public:
+  AlarmGuard() {
+    struct sigaction sa {};
+    sa.sa_handler = hostile_alarm;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, &old_);
+  }
+  ~AlarmGuard() {
+    alarm(0);
+    sigaction(SIGALRM, &old_, nullptr);
+  }
+  bool arm(unsigned seconds) {
+    if (sigsetjmp(hostile_alarm_jmp, 1) != 0) {
+      return false;
+    }
+    alarm(seconds);
+    return true;
+  }
+  void disarm() { alarm(0); }
+
+ private:
+  struct sigaction old_ {};
+};
+
+int g_short_write_calls = 0;
+
+ssize_t short_inplace_write(int fd, const void* buf, std::size_t n, bool) {
+  if (g_short_write_calls++ == 0 && n > 0) {
+    return ::write(fd, buf, 1);
+  }
+  errno = ENOSPC;
+  return -1;
+}
+
+int fail_dir_fsync(int) {
+  errno = EOPNOTSUPP;
+  return -1;
+}
+
+}  // namespace
 
 namespace lundukeedit {
 
@@ -481,11 +537,14 @@ struct EditChecks {
     expect(w.open_file(latin_path), "open latin for new-document reset");
     expect(w.encoding_ == "ISO-8859-1", "detected latin-1");
     expect(w.prefer_utf8_, "auto-detect does not change the open preference");
-    expect(w.enc_utf8_item_ && w.enc_utf8_item_->get_active(),
-           "auto-detect does not flip the encoding radio");
+    expect(w.enc_latin1_item_ && w.enc_latin1_item_->get_active(),
+           "auto-detect checks the document encoding radio");
+    expect(w.status_enc_.get_text() == "Latin-1", "status shows Latin-1");
     w.on_new();
     expect(w.encoding_ == "UTF-8" && w.saved_encoding_ == "UTF-8",
            "new document is UTF-8");
+    expect(w.enc_utf8_item_ && w.enc_utf8_item_->get_active(),
+           "new document checks the UTF-8 encoding radio");
     expect(w.newline_style_ == MainWindow::NewlineStyle::Lf, "new document is lf");
     expect(w.prefer_utf8_, "new document leaves the open preference alone");
     const Glib::ustring cafe("caf\xc3\xa9");
@@ -497,16 +556,22 @@ struct EditChecks {
 
     expect(w.enc_latin1_item_ != nullptr, "latin-1 radio exists");
     w.enc_latin1_item_->set_active(true);
-    expect(!w.prefer_utf8_ && w.open_charset_ == "ISO-8859-1",
-           "explicit latin-1 sets the open preference");
+    expect(w.prefer_utf8_,
+           "document encoding radio does not change the open preference");
     expect(w.encoding_ == "ISO-8859-1", "explicit latin-1 sets document encoding");
+    expect(w.open_latin1_item_ != nullptr, "open-next radio exists");
+    w.open_latin1_item_->set_active(true);
+    expect(!w.prefer_utf8_ && w.open_charset_ == "ISO-8859-1",
+           "open-next latin-1 sets the open preference");
     expect(!app.prefer_utf8() && app.open_charset() == "ISO-8859-1",
            "open preference is application owned");
     g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
     w.on_new();
     g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
     expect(w.encoding_ == "UTF-8", "new resets document encoding");
-    expect(!w.prefer_utf8_ && w.enc_latin1_item_->get_active(),
+    expect(w.enc_utf8_item_ && w.enc_utf8_item_->get_active(),
+           "new checks the UTF-8 encoding radio");
+    expect(!w.prefer_utf8_ && w.open_latin1_item_->get_active(),
            "new keeps the open-charset radio");
 
     app.set_tab_width(8);
@@ -708,7 +773,8 @@ struct EditChecks {
       printable += "\n";
     }
     w.buffer()->set_text(std::string(5000, 'Q') + "\n" + printable);
-    expect(w.next_print_end(0) == 4000, "print splits a long line");
+    expect(w.next_print_end(0) == 5001,
+           "print keeps a long line together, including its newline");
     const std::string pdf = dir + "/print.pdf";
     ::unlink(pdf.c_str());
     auto op = Gtk::PrintOperation::create();
@@ -737,6 +803,533 @@ struct EditChecks {
     app.on_startup();
   }
 
+  static void test_hostile_review(Application& app, MainWindow& w,
+                                  const std::string& dir) {
+    // 1. Short in-place write of a hard-linked file tears the inode and
+    // stays dirty. The error says the file may be damaged.
+    g_short_write_calls = 0;
+    const std::string hard_a = dir + "/tear-a.txt";
+    const std::string hard_b = dir + "/tear-b.txt";
+    const std::string old_hard = "0123456789abcdef";
+    write_bytes(hard_a, old_hard);
+    ::unlink(hard_b.c_str());
+    expect(::link(hard_a.c_str(), hard_b.c_str()) == 0, "tear hard link");
+    w.encoding_ = "UTF-8";
+    w.newline_style_ = MainWindow::NewlineStyle::Lf;
+    w.buffer()->set_text("xyz");
+    MainWindow::test_write_hook_ = short_inplace_write;
+    expect(!w.save_to_path(hard_a), "short hard-link write fails");
+    MainWindow::test_write_hook_ = nullptr;
+    const std::string torn_a = read_bytes(hard_a);
+    const std::string torn_b = read_bytes(hard_b);
+    expect(torn_a == torn_b, "both hard-link names see the torn inode");
+    expect(torn_a != "xyz" && torn_a != old_hard, "inode is neither old nor new");
+    expect(w.dirty_, "failed hard-link save stays dirty");
+    expect(w.last_save_error_.find("may be damaged") != std::string::npos,
+           "short write says the file may be damaged");
+    expect(w.last_save_error_.find("/") != std::string::npos,
+           "short write names the staged copy");
+
+    // 2. Directory fsync EOPNOTSUPP after rename is still a successful save.
+    const std::string fsync_path = dir + "/dir-fsync.txt";
+    write_bytes(fsync_path, "before");
+    w.buffer()->set_text("after-fsync");
+    MainWindow::test_dir_fsync_hook_ = fail_dir_fsync;
+    expect(w.save_to_path(fsync_path), "dir fsync EOPNOTSUPP still saves");
+    MainWindow::test_dir_fsync_hook_ = nullptr;
+    expect(!w.dirty_, "dir fsync failure does not leave the buffer dirty");
+    expect(read_bytes(fsync_path) == "after-fsync", "disk matches after dir fsync");
+    expect(w.confirm_discard_or_save(), "clean close does not revert the save");
+    expect(read_bytes(fsync_path) == "after-fsync",
+           "Don't Save is not offered for a successful save");
+
+    // 3. Mixed newlines round-trip. A pasted CR is not doubled on save.
+    const std::string mixed = dir + "/mixed-nl.txt";
+    const std::string mixed_bytes = std::string("a\nb\r\n", 5);
+    write_bytes(mixed, mixed_bytes);
+    expect(w.open_file(mixed), "open mixed newlines");
+    expect(w.save_to_path(mixed), "save mixed newlines without edits");
+    expect(read_bytes(mixed) == mixed_bytes, "mixed newlines are not restyled");
+    const std::string stray = dir + "/stray-cr.txt";
+    const std::string stray_bytes = std::string("hello\rworld\n", 12);
+    write_bytes(stray, stray_bytes);
+    expect(w.open_file(stray), "open stray cr");
+    expect(w.save_to_path(stray), "save stray cr without edits");
+    expect(read_bytes(stray) == stray_bytes, "stray cr is not rewritten as lf");
+    const std::string crlf = dir + "/paste-crlf.txt";
+    write_bytes(crlf, "a\r\nb\r\n");
+    expect(w.open_file(crlf), "open crlf for paste");
+    w.buffer()->insert(w.buffer()->end(), "\r\n");
+    expect(w.save_to_path(crlf), "save pasted crlf");
+    expect(read_bytes(crlf) == "a\r\nb\r\n\r\n",
+           "pasted CR is not doubled into CR CR LF");
+
+    // 4. Selection Only and Extend pins do not cover the next file.
+    w.buffer()->set_text("one two one");
+    w.buffer()->select_range(w.buffer()->begin(),
+                             w.buffer()->get_iter_at_offset(3));
+    w.find_opts_.search_for = "one";
+    w.find_opts_.search_selection_only = true;
+    w.find_opts_.extend_selection = true;
+    w.find_opts_.search_backwards = false;
+    w.find_opts_.wrap_around = false;
+    w.find_opts_.start_at_top = false;
+    w.find_opts_.entire_word = false;
+    w.pin_selection_only_range();
+    // Extend starts past the current selection, so this first Find may miss.
+    // The pin must still not leak into the next document.
+    w.find_match(w.find_opts_, false);
+    const std::string sel_other = dir + "/sel-other.txt";
+    write_bytes(sel_other, "xx one xx");
+    expect(w.open_file(sel_other), "open another file over the pin");
+    expect(w.find_opts_.search_selection_only && w.find_opts_.extend_selection,
+           "selection-only and extend flags stay on");
+    expect(!w.sel_only_range_valid_ && !w.extend_anchor_valid_,
+           "open drops the search pins");
+    w.on_find_next();
+    expect(selection_text(w).empty(),
+           "find next does not search outside an empty selection");
+
+    // 5. A fifo is rejected without blocking in open.
+    const std::string fifo = dir + "/edit.fifo";
+    ::unlink(fifo.c_str());
+    expect(::mkfifo(fifo.c_str(), 0600) == 0, "mkfifo");
+    {
+      AlarmGuard guard;
+      if (!guard.arm(2)) {
+        expect(false, "fifo open returned without blocking");
+      } else {
+        const bool opened = w.open_file(fifo);
+        guard.disarm();
+        expect(!opened, "fifo open fails");
+      }
+    }
+    ::unlink(fifo.c_str());
+
+    // 6. A new file follows umask. 077 must not produce 0644.
+    const mode_t old_mask = ::umask(077);
+    const std::string secret = dir + "/secret.txt";
+    ::unlink(secret.c_str());
+    w.encoding_ = "UTF-8";
+    w.newline_style_ = MainWindow::NewlineStyle::Lf;
+    w.buffer()->set_text("hidden");
+    expect(w.save_to_path(secret), "save new file under umask 077");
+    struct stat secret_st {};
+    expect(::stat(secret.c_str(), &secret_st) == 0, "stat new file");
+    expect((secret_st.st_mode & 0777) == 0600, "umask 077 creates mode 0600");
+    ::umask(old_mask);
+
+    // 7. user.* xattr survives Ctrl+S on a clean one-link file, and a
+    // later dirty save copies it onto the replacement inode.
+    const std::string xattr_path = dir + "/xattr.txt";
+    write_bytes(xattr_path, "body");
+    const char note[] = "keep";
+    const bool xattr_set =
+        ::setxattr(xattr_path.c_str(), "user.note", note, 4, 0) == 0;
+    expect(xattr_set, "set user.note");
+    unsigned char acl[36] = {
+        0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00};
+    const bool acl_set =
+        ::setxattr(xattr_path.c_str(), "system.posix_acl_access", acl,
+                   sizeof(acl), 0) == 0;
+    unsigned char acl_stored[64] = {};
+    ssize_t acl_stored_n = 0;
+    if (acl_set) {
+      acl_stored_n = ::getxattr(xattr_path.c_str(), "system.posix_acl_access",
+                                acl_stored, sizeof(acl_stored));
+    }
+    expect(w.open_file(xattr_path), "open xattr file");
+    w.on_save();
+    char got[8] = {};
+    const ssize_t got_n =
+        ::getxattr(xattr_path.c_str(), "user.note", got, sizeof(got));
+    expect(got_n == 4 && std::string(got, got + 4) == "keep",
+           "clean save keeps user.note");
+    if (acl_set && acl_stored_n > 0) {
+      unsigned char got_acl[64] = {};
+      const ssize_t acl_n = ::getxattr(xattr_path.c_str(),
+                                       "system.posix_acl_access", got_acl,
+                                       sizeof(got_acl));
+      expect(acl_n == acl_stored_n &&
+                 std::memcmp(got_acl, acl_stored,
+                             static_cast<std::size_t>(acl_stored_n)) == 0,
+             "clean save keeps the posix acl");
+    }
+    w.buffer()->insert(w.buffer()->end(), "!");
+    expect(w.save_to_path(xattr_path), "dirty save copies xattrs");
+    std::memset(got, 0, sizeof(got));
+    const ssize_t got_n2 =
+        ::getxattr(xattr_path.c_str(), "user.note", got, sizeof(got));
+    expect(got_n2 == 4 && std::string(got, got + 4) == "keep",
+           "dirty save keeps user.note");
+
+    // 8. A 255-character name saves, and a writable file in a
+    // non-writable directory saves in place.
+    const std::string long_name(255, 'a');
+    const std::string long_path = dir + "/" + long_name;
+    write_bytes(long_path, "old");
+    expect(w.open_file(long_path), "open 255-character name");
+    w.buffer()->insert(w.buffer()->end(), "!");
+    expect(w.save_to_path(long_path), "save 255-character name");
+    expect(read_bytes(long_path) == "old!", "255-character name was updated");
+
+    const std::string ro_dir = dir + "/rodir";
+    const std::string ro_file = ro_dir + "/f.txt";
+    ::chmod(ro_dir.c_str(), 0755);
+    ::unlink(ro_file.c_str());
+    ::rmdir(ro_dir.c_str());
+    expect(::mkdir(ro_dir.c_str(), 0755) == 0, "mkdir rodir");
+    write_bytes(ro_file, "hi");
+    expect(::chmod(ro_file.c_str(), 0644) == 0, "chmod file 0644");
+    expect(::chmod(ro_dir.c_str(), 0555) == 0, "chmod dir 0555");
+    expect(w.open_file(ro_file), "open file in read-only directory");
+    w.buffer()->insert(w.buffer()->end(), "!");
+    expect(w.save_to_path(ro_file), "save writable file in read-only directory");
+    expect(::chmod(ro_dir.c_str(), 0755) == 0, "restore directory mode");
+    expect(read_bytes(ro_file) == "hi!", "in-place save updated the file");
+
+    // 9. Shift+Insert pastes. Keypad Insert toggles overwrite in the status.
+    w.buffer()->set_text("abc");
+    w.buffer()->place_cursor(w.buffer()->get_iter_at_offset(1));
+    if (w.text_view_.get_overwrite()) {
+      w.text_view_.set_overwrite(false);
+    }
+    w.sync_overwrite_status();
+    auto clip = Gtk::Clipboard::get();
+    clip->set_text("hello");
+    flush_ui();
+    gtk_widget_grab_focus(GTK_WIDGET(w.text_view_.gobj()));
+    gtk_window_set_focus(GTK_WINDOW(w.gobj()),
+                         GTK_WIDGET(w.text_view_.gobj()));
+    flush_ui();
+    GdkEventKey press {};
+    press.type = GDK_KEY_PRESS;
+    press.window = gtk_widget_get_window(GTK_WIDGET(w.gobj()));
+    press.keyval = GDK_KEY_Insert;
+    press.state = GDK_SHIFT_MASK;
+    press.send_event = 1;
+    w.on_key_press_event(&press);
+    expect(!w.text_view_.get_overwrite() &&
+               w.status_mode_.get_text() == "Insert",
+           "shift+insert does not flip overwrite");
+    // A synthetic GdkEvent does not travel gtk_window_propagate_key_event
+    // in this harness. Activate the text-view binding Shift+Insert maps to
+    // once the window no longer swallows the key.
+    gtk_bindings_activate(G_OBJECT(w.text_view_.gobj()), GDK_KEY_Insert,
+                          GDK_SHIFT_MASK);
+    flush_ui();
+    expect(w.buffer()->get_text().find("hello") != Glib::ustring::npos,
+           "shift+insert pastes");
+    expect(!w.text_view_.get_overwrite() && w.status_mode_.get_text() == "Insert",
+           "shift+insert does not flip overwrite");
+    press.keyval = GDK_KEY_KP_Insert;
+    press.state = 0;
+    w.on_key_press_event(&press);
+    expect(w.text_view_.get_overwrite(), "keypad insert toggles overwrite");
+    expect(w.status_mode_.get_text() == "Overwrite",
+           "keypad insert updates the status");
+    w.text_view_.set_overwrite(false);
+    w.sync_overwrite_status();
+
+    // 10. Middle-click of a too-large primary selection does not insert.
+    g_setenv("LUNDUKE_EDIT_TEST_MAX_PASTE", "32", TRUE);
+    w.buffer()->set_text("keep");
+    const std::string huge(256 * 1024, 'Q');
+    auto primary = Gtk::Clipboard::get(GDK_SELECTION_PRIMARY);
+    primary->set_text(huge);
+    flush_ui();
+    GdkEventButton button {};
+    button.type = GDK_BUTTON_RELEASE;
+    button.button = 2;
+    button.window = gtk_widget_get_window(GTK_WIDGET(w.text_view_.gobj()));
+    {
+      AlarmGuard guard;
+      if (!guard.arm(3)) {
+        expect(false, "middle-click paste returned");
+      } else {
+        expect(w.on_text_button_release(&button), "middle-click is handled");
+        guard.disarm();
+      }
+    }
+    expect(w.buffer()->get_text() == "keep",
+           "oversize primary selection is not inserted");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_PASTE");
+
+    // 11. Cancel after the first Replace All idle rolls the edit back.
+    g_setenv("LUNDUKE_EDIT_TEST_CHUNK", "1", TRUE);
+    const Glib::ustring before_replace = "aaa";
+    w.buffer()->set_text(before_replace);
+    FindOptions repl;
+    repl.search_for = "a";
+    repl.replace_with = "b";
+    w.start_replace_all(repl, nullptr);
+    w.on_find_idle();
+    w.cancel_find_scan();
+    expect(w.buffer()->get_text() == before_replace,
+           "cancelled replace all restores the buffer");
+    g_unsetenv("LUNDUKE_EDIT_TEST_CHUNK");
+
+    // 12. An open delivered while the large-file confirm is up is queued.
+    auto* blank = app.create_window();
+    blank->present();
+    flush_ui();
+    app.note_window_focus(blank);
+    const std::string big = dir + "/queued-big.txt";
+    const std::string other = dir + "/queued-other.txt";
+    write_bytes(big, std::string(20, 'Z'));
+    write_bytes(other, "other-text");
+    g_setenv("LUNDUKE_EDIT_TEST_MAX_OPEN", "8", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_LARGE", "1", TRUE);
+    MainWindow::test_during_large_confirm_ = [&app, &other](MainWindow*) {
+      app.open_files({other});
+    };
+    expect(blank->open_file(big), "large open proceeds");
+    MainWindow::test_during_large_confirm_ = nullptr;
+    g_unsetenv("LUNDUKE_EDIT_TEST_LARGE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
+    expect(blank->buffer()->get_text() == std::string(20, 'Z'),
+           "queued open does not replace the large file");
+    expect(blank->file_path_ == big, "large file keeps the window");
+    expect(window_has_path(app, other), "queued path opens in another window");
+
+    // 13. A path already open is presented, not loaded again. A changed
+    // file is not replaced when the user cancels.
+    const std::string notes = dir + "/notes.txt";
+    write_bytes(notes, "notes-v1");
+    expect(w.open_file(notes), "open notes");
+    auto* second = app.create_window();
+    second->present();
+    flush_ui();
+    expect(!second->open_file(notes), "second window does not load the same path");
+    expect(second->file_path_ != notes, "second window is not a stale copy");
+    w.buffer()->set_text("notes-v2");
+    expect(w.save_to_path(notes), "save the only window on this path");
+    expect(read_bytes(notes) == "notes-v2", "save wrote notes-v2");
+    expect(second->file_path_.empty() || second->dirty_,
+           "the other window is not a clean stale buffer");
+    write_bytes(notes, "external");
+    struct stat notes_st {};
+    expect(::stat(notes.c_str(), &notes_st) == 0, "stat notes");
+    struct timespec times[2] = {};
+    times[0].tv_sec = notes_st.st_atim.tv_sec;
+    times[0].tv_nsec = notes_st.st_atim.tv_nsec;
+    times[1].tv_sec = notes_st.st_mtim.tv_sec + 10;
+    times[1].tv_nsec = 0;
+    ::utimensat(AT_FDCWD, notes.c_str(), times, 0);
+    w.buffer()->set_text("mine");
+    g_setenv("LUNDUKE_EDIT_TEST_REPLACE", "cancel", TRUE);
+    expect(!w.save_to_path(notes), "cancel leaves a changed file alone");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+    expect(read_bytes(notes) == "external", "cancelled save did not replace disk");
+
+    // 14. The encoding radio, the status, and the bytes on disk agree.
+    const std::string latin = dir + "/hostile-latin.txt";
+    const std::string latin_bytes("caf\xE9", 4);
+    write_bytes(latin, latin_bytes);
+    expect(w.open_file(latin), "open latin-1 cafe");
+    expect(w.encoding_ == "ISO-8859-1", "document encoding is latin-1");
+    expect(w.enc_latin1_item_ && w.enc_latin1_item_->get_active(),
+           "latin-1 radio matches the document");
+    expect(w.status_enc_.get_text() == "Latin-1", "status encoding is Latin-1");
+    w.buffer()->insert(w.buffer()->end(), "!");
+    expect(w.save_to_path(latin), "save latin-1 cafe");
+    expect(read_bytes(latin) == std::string("caf\xE9!", 5),
+           "save writes latin-1 bytes, not UTF-8");
+    if (w.open_latin1_item_) {
+      w.open_latin1_item_->set_active(true);
+    }
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    w.on_new();
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.enc_utf8_item_ && w.enc_utf8_item_->get_active(),
+           "new document checks UTF-8");
+    expect(w.status_enc_.get_text() == "UTF-8", "new document status is UTF-8");
+    const Glib::ustring e_acute("caf\xc3\xa9");
+    w.buffer()->set_text(e_acute);
+    const std::string utf_path = dir + "/hostile-utf8.txt";
+    expect(w.save_to_path(utf_path), "save new document");
+    expect(read_bytes(utf_path) == std::string("caf\xc3\xa9", 5),
+           "new document writes UTF-8");
+
+    // 15. Match Entire Words yields inside one chunk.
+    g_setenv("LUNDUKE_EDIT_TEST_CHUNK", "50", TRUE);
+    w.buffer()->set_text(std::string(4000, 'a'));
+    FindOptions words;
+    words.search_for = "a";
+    words.entire_word = true;
+    words.start_at_top = true;
+    w.start_find_all(words, nullptr);
+    expect(w.on_find_idle(), "entire-word scan yields");
+    expect(w.find_scan_.active, "entire-word scan is still active");
+    expect(w.find_scan_.slice_steps > 0 && w.find_scan_.slice_steps <= 50,
+           "one idle stays inside the chunk");
+    expect(w.find_scan_.slice_steps < w.buffer()->get_char_count(),
+           "one idle does not walk the whole buffer");
+    w.cancel_find_scan();
+    g_unsetenv("LUNDUKE_EDIT_TEST_CHUNK");
+
+    // 16. Printed tabs come from the print context, in pango units.
+    // A long tabbed line is one layout sliced across pages.
+    w.apply_tab_width(8);
+    w.buffer()->set_text("\t");
+    const std::string tab_pdf = dir + "/tab-print.pdf";
+    ::unlink(tab_pdf.c_str());
+    int context_tab = -1;
+    auto op = Gtk::PrintOperation::create();
+    op->set_export_filename(tab_pdf);
+    op->signal_begin_print().connect(
+        [&w, op](const Glib::RefPtr<Gtk::PrintContext>& context) {
+          w.on_begin_print(context);
+          op->set_n_pages(static_cast<int>(w.print_page_breaks_.size()) + 1);
+        });
+    op->signal_draw_page().connect(
+        [&w, &context_tab](const Glib::RefPtr<Gtk::PrintContext>& context,
+                           int page) {
+          w.on_draw_page(context, page);
+          if (context_tab < 0 && context) {
+            auto layout = context->create_pango_layout();
+            layout->set_font_description(w.font_desc_);
+            layout->set_text(Glib::ustring(std::max(1, w.tab_width_), ' '));
+            int tw = 0;
+            int th = 0;
+            layout->get_size(tw, th);
+            (void)th;
+            context_tab = tw;
+          }
+        });
+    bool printed = false;
+    try {
+      const auto result = op->run(Gtk::PRINT_OPERATION_ACTION_EXPORT, w);
+      printed = result == Gtk::PRINT_OPERATION_RESULT_APPLY;
+    } catch (const Gtk::PrintError&) {
+      printed = false;
+    }
+    expect(printed, "tab print export succeeds");
+    expect(context_tab > 0 && w.last_print_tab_pos_ == context_tab,
+           "print tab matches the print context");
+    expect(!w.print_tabs_in_pixels_, "print tabs are pango units");
+    auto screen = w.text_view_.create_pango_layout(
+        std::string(static_cast<std::size_t>(std::max(1, w.tab_width_)), ' '));
+    screen->set_font_description(w.font_desc_);
+    int pixel_w = 0;
+    int pixel_h = 0;
+    screen->get_pixel_size(pixel_w, pixel_h);
+    (void)pixel_h;
+    expect(w.last_print_tab_pos_ != pixel_w,
+           "print tab is not the on-screen pixel width");
+
+    std::string long_line(8000, 'b');
+    long_line[5000] = '\t';
+    w.buffer()->set_text(long_line);
+    const std::string long_pdf = dir + "/long-print.pdf";
+    ::unlink(long_pdf.c_str());
+    auto op2 = Gtk::PrintOperation::create();
+    op2->set_export_filename(long_pdf);
+    op2->signal_begin_print().connect(
+        [&w, op2](const Glib::RefPtr<Gtk::PrintContext>& context) {
+          w.on_begin_print(context);
+          op2->set_n_pages(static_cast<int>(w.print_page_breaks_.size()) + 1);
+        });
+    op2->signal_draw_page().connect(
+        [&w](const Glib::RefPtr<Gtk::PrintContext>& context, int page) {
+          w.on_draw_page(context, page);
+        });
+    try {
+      op2->run(Gtk::PRINT_OPERATION_ACTION_EXPORT, w);
+    } catch (const Gtk::PrintError&) {
+    }
+    bool shared_layout = false;
+    if (w.print_pages_.size() >= 2) {
+      for (const auto& slice_a : w.print_pages_[0].slices) {
+        for (const auto& slice_b : w.print_pages_[1].slices) {
+          if (slice_a.layout && slice_a.layout == slice_b.layout) {
+            shared_layout = true;
+          }
+        }
+      }
+    }
+    expect(w.print_pages_.size() >= 2 && shared_layout,
+           "a long tabbed line is one layout sliced across pages");
+
+    // 17. Quit saves the first dirty window and stops when the second cancels.
+    // A save failure also aborts quit.
+    for (auto* win : app.get_windows()) {
+      if (auto* mw = dynamic_cast<MainWindow*>(win)) {
+        if (mw->buffer()) {
+          mw->buffer()->set_modified(false);
+        }
+        mw->set_dirty(false);
+      }
+    }
+    std::vector<MainWindow*> order;
+    for (auto* win : app.get_windows()) {
+      if (auto* mw = dynamic_cast<MainWindow*>(win)) {
+        if (mw->get_visible()) {
+          order.push_back(mw);
+        }
+      }
+    }
+    expect(order.size() >= 2, "quit test has two windows");
+    if (order.size() >= 2) {
+      MainWindow* first = order[0];
+      MainWindow* second = order[1];
+      const std::string quit_path = dir + "/quit-first.txt";
+      write_bytes(quit_path, "old");
+      first->encoding_ = "UTF-8";
+      first->newline_style_ = MainWindow::NewlineStyle::Lf;
+      first->buffer()->set_text("saved-from-quit");
+      expect(first->save_to_path(quit_path), "seed quit file");
+      first->buffer()->insert(first->buffer()->end(), "!");
+      second->buffer()->set_text("still-dirty");
+      second->buffer()->set_modified(true);
+      second->refresh_dirty_from_buffer();
+      MainWindow::test_discard_choice_ = [first, second](MainWindow* mw) {
+        if (mw == first) {
+          return "save";
+        }
+        if (mw == second) {
+          return "cancel";
+        }
+        return "discard";
+      };
+      expect(!app.confirm_quit(), "cancel on the second window aborts quit");
+      expect(!first->dirty_, "first window was saved");
+      expect(read_bytes(quit_path) == "saved-from-quit!",
+             "first window reached disk");
+      expect(second->dirty_ && second->get_visible(),
+             "second window stays dirty and visible");
+      MainWindow::test_discard_choice_ = nullptr;
+
+      for (auto* win : app.get_windows()) {
+        if (auto* mw = dynamic_cast<MainWindow*>(win)) {
+          if (mw->buffer()) {
+            mw->buffer()->set_modified(false);
+          }
+          mw->set_dirty(false);
+        }
+      }
+      first->file_path_ = dir + "/no-such-dir/out.txt";
+      first->buffer()->set_text("cannot-save");
+      first->buffer()->set_modified(true);
+      first->refresh_dirty_from_buffer();
+      MainWindow::test_discard_choice_ = [](MainWindow*) { return "save"; };
+      expect(!app.confirm_quit(), "save failure aborts quit");
+      expect(first->dirty_ && first->get_visible(),
+             "failed save keeps the dirty window");
+      MainWindow::test_discard_choice_ = nullptr;
+    }
+
+    MainWindow::test_write_hook_ = nullptr;
+    MainWindow::test_dir_fsync_hook_ = nullptr;
+    MainWindow::test_during_large_confirm_ = nullptr;
+    MainWindow::test_discard_choice_ = nullptr;
+    w.find_opts_.search_selection_only = false;
+    w.find_opts_.extend_selection = false;
+    w.find_opts_.entire_word = false;
+  }
+
   static int run() {
     failures = 0;
     g_setenv("LUNDUKE_EDIT_TEST", "1", TRUE);
@@ -758,6 +1351,7 @@ struct EditChecks {
     test_find_replace(*w);
     test_open_many(*app.get(), dir);
     test_review_fixes(*app.get(), *w, dir);
+    test_hostile_review(*app.get(), *w, dir);
 
     g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
@@ -766,6 +1360,8 @@ struct EditChecks {
     g_unsetenv("LUNDUKE_EDIT_TEST_CHUNK");
     g_unsetenv("LUNDUKE_EDIT_TEST_HUGE_BYTES");
     g_unsetenv("LUNDUKE_EDIT_TEST_HUGE_UNDO");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_PASTE");
 
     return failures;
   }

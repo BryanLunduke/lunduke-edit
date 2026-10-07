@@ -1,10 +1,10 @@
 #!/bin/sh
-# Build lunduke-edit_0.9-2_amd64.deb into packaging/debs/ (overlay apt only).
+# Build lunduke-edit_0.9-3_amd64.deb into packaging/debs/ (overlay apt only).
 # Does NOT seed lcos-live-06/config/packages.chroot.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="0.9-2"
+VERSION="0.9-3"
 PKGNAME="lunduke-edit_${VERSION}_amd64"
 BUILD="$ROOT/build-deb"
 DEST="$ROOT/packaging/src/lunduke-edit"
@@ -15,6 +15,11 @@ cd "$ROOT"
 rm -rf "$BUILD"
 meson setup "$BUILD" --prefix=/usr --buildtype=release -Dstrip=true
 meson compile -C "$BUILD"
+if [ -z "${DISPLAY:-}" ]; then
+  xvfb-run -a meson test -C "$BUILD"
+else
+  meson test -C "$BUILD"
+fi
 
 rm -rf "$DEST"
 meson install -C "$BUILD" --destdir "$DEST"
