@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9-1_amd64.deb
+# → packaging/debs/lunduke-edit_0.9-2_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,15 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9-2
+
+- **Save**: a symlink save replaces the canonical target. A broken symlink is left alone. Hard-linked files are written in place. Bytes are flushed before the rename, then the parent directory is flushed. The previous mode and, when permitted, owner are kept.
+- **Open**: a second instance reuses a window only when it is focused and still an empty untitled document. A failed open does not present a spare window. Closed windows are freed. Cancelling a dirty close keeps the window.
+- **Size**: the status bar shows the bytes a save would write, cached from edits. Files over 32 MiB ask first. A single paste is capped at 32 MiB. Reads go to EOF, so a reported size of 0 is not an empty file. Non-local locations are rejected.
+- **Find**: Find All and Replace All scan in idle chunks, cap the hit count, and warn before a huge undo. Search Backwards is honored. The match count is a separate label and clears when the buffer changes.
+- **Documents**: one shared recent list. New documents are UTF-8. New windows inherit font, wrap, tab width, and the open charset. Wrap defaults to off and turns off on a very long line. CRLF and CR are remembered and written back. Printing paginates and copies tab stops.
+- App / Meson / About stay **0.9**. Debian package **0.9-2**.
 
 ## 0.9
 
