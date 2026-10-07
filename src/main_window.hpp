@@ -5,8 +5,11 @@
 #include "find_replace_dialog.hpp"
 #include "line_gutter.hpp"
 
+#include <gdkmm/dragcontext.h>
 #include <gtkmm/applicationwindow.h>
 #include <gtkmm/box.h>
+#include <gtkmm/clipboard.h>
+#include <gtkmm/selectiondata.h>
 #include <gtkmm/checkmenuitem.h>
 #include <gtkmm/frame.h>
 #include <gtkmm/label.h>
@@ -26,6 +29,8 @@
 #include <pangomm/layout.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -43,6 +48,7 @@ public:
 
   void load_seed_sample();
   bool open_file(const std::string& path);
+  bool open_file_body(const std::string& path);
   // Asks before dropping unsaved edits. False means the caller must keep
   // the current buffer (Cancel, or Save that did not succeed).
   bool confirm_discard_or_save();
@@ -51,13 +57,25 @@ public:
   // A second-instance open may reuse it only while it is also focused.
   bool is_empty_untitled() const;
 
+  // True when this window is showing the same file as path (symlinks
+  // included). A second open presents that window instead of loading again.
+  bool edits_path(const std::string& path) const;
+
   void rebuild_recents_menu();
+
+  // Test seams. Null unless a behavior test installs them.
+  static ssize_t (*test_write_hook_)(int fd, const void* buf, std::size_t n,
+                                     bool inplace_copy);
+  static int (*test_dir_fsync_hook_)(int fd);
+  static std::function<void(MainWindow*)> test_during_large_confirm_;
+  static std::function<const char*(MainWindow*)> test_discard_choice_;
 
   enum class NewlineStyle { Lf, Crlf, Cr };
 
 protected:
   bool on_delete_event(GdkEventAny* event) override;
   bool on_key_press_event(GdkEventKey* event) override;
+  bool on_key_release_event(GdkEventKey* event) override;
   bool on_focus_in_event(GdkEventFocus* event) override;
 
 private:
@@ -93,6 +111,25 @@ private:
   bool confirm_large_open(const std::string& path);
   bool clipboard_paste_allowed();
   void handle_paste_clipboard(GtkTextView* view);
+  bool read_clipboard_text(const Glib::RefPtr<Gtk::Clipboard>& clip,
+                           Glib::ustring& out);
+  void insert_pasted_text(const Glib::ustring& text);
+  bool on_text_button_release(GdkEventButton* event);
+  void on_drag_data_received(const Glib::RefPtr<Gdk::DragContext>& context,
+                             int x, int y, const Gtk::SelectionData& data,
+                             guint info, guint time);
+  void sync_overwrite_status();
+  void clear_document_search_pins();
+  void sync_encoding_radios();
+  void maybe_restore_wrap();
+  bool buffer_has_long_line();
+  bool confirm_file_changed(const std::string& path);
+  void remember_file_identity(const std::string& path);
+  void remember_source_lines(const Glib::ustring& text,
+                             const std::vector<char>& kinds);
+  void on_find_dialog_hidden();
+  void on_open_pref_utf8();
+  void on_open_pref_latin1();
 
   // File
   void on_new();
@@ -110,11 +147,13 @@ private:
   double measure_print_chunk(const Glib::RefPtr<Gtk::PrintContext>& context,
                              int width_pango, int start, int end,
                              double min_height);
+  int measure_print_tab(const Glib::RefPtr<Gtk::PrintContext>& context) const;
   void configure_print_layout(const Glib::RefPtr<Pango::Layout>& layout,
-                              int width_pango) const;
+                              const Glib::RefPtr<Gtk::PrintContext>& context,
+                              int width_pango);
   void draw_print_layout(const Cairo::RefPtr<Cairo::Context>& cr,
-                         const Glib::RefPtr<Pango::Layout>& layout,
-                         double& y) const;
+                         const Glib::RefPtr<Pango::Layout>& layout, double& y,
+                         int row_begin, int row_end) const;
   void remember_recent(const std::string& path);
 
   // Edit
@@ -148,6 +187,7 @@ private:
   void apply_font(const Pango::FontDescription& desc);
 
   enum class ReplaceResult { Replaced, Found, NotFound, Blocked };
+  enum class SearchStep { Miss, Hit, Yield };
 
   bool find_match(const FindOptions& opts, bool from_next);
   int count_matches(const FindOptions& opts);
@@ -161,8 +201,8 @@ private:
   bool on_find_idle();
   bool pump_find_highlight();
   bool pump_replace();
-  bool step_search(bool backward, int& cursor_off, int& match_start,
-                   int& match_end);
+  SearchStep step_search(bool backward, int& cursor_off, int& match_start,
+                         int& match_end);
   void finish_find_scan(bool show_result);
   void cancel_find_scan();
   void end_find_user_action();
@@ -198,6 +238,7 @@ private:
     int select_end{-1};
     int count{0};
     std::size_t undo_bytes{0};
+    int slice_steps{0};
     FindReplaceDialog* dlg{nullptr};
   };
 
@@ -229,6 +270,8 @@ private:
   Gtk::Menu* recents_menu_{nullptr};
   Gtk::RadioMenuItem* enc_utf8_item_{nullptr};
   Gtk::RadioMenuItem* enc_latin1_item_{nullptr};
+  Gtk::RadioMenuItem* open_utf8_item_{nullptr};
+  Gtk::RadioMenuItem* open_latin1_item_{nullptr};
 
   std::string file_path_;
   std::string encoding_{"UTF-8"};
@@ -241,6 +284,26 @@ private:
   std::string open_charset_{"UTF-8"};
   bool prefer_utf8_{true};
   NewlineStyle newline_style_{NewlineStyle::Lf};
+  NewlineStyle saved_newline_style_{NewlineStyle::Lf};
+  // Per-line break recorded at load, paired with the UTF-8 line text.
+  // Unchanged lines are written back with their own break.
+  struct SourceLine {
+    std::string text;
+    char kind{0};
+  };
+  std::vector<SourceLine> source_lines_;
+  std::string loaded_bytes_;
+  Glib::ustring loaded_text_;
+  bool loaded_bytes_valid_{false};
+  bool have_file_id_{false};
+  std::uint64_t file_dev_{0};
+  std::uint64_t file_ino_{0};
+  std::int64_t file_mtime_sec_{0};
+  std::int64_t file_mtime_nsec_{0};
+  bool opening_{false};
+  bool accepting_cr_{false};
+  bool swallow_insert_repeat_{false};
+  std::string last_save_error_;
   // UTF-8 bytes and LF count in the buffer. Status "bytes" is the size
   // save_to_path would write, derived from these plus encoding and newlines.
   std::size_t utf8_bytes_{0};
@@ -275,6 +338,17 @@ private:
   Glib::RefPtr<Gtk::PageSetup> page_setup_;
   // Char offsets where each page after the first begins.
   std::vector<int> print_page_breaks_;
+  struct PrintSlice {
+    Glib::RefPtr<Pango::Layout> layout;
+    int row_begin{0};
+    int row_end{0};
+  };
+  struct PrintPage {
+    std::vector<PrintSlice> slices;
+  };
+  std::vector<PrintPage> print_pages_;
+  int last_print_tab_pos_{0};
+  bool print_tabs_in_pixels_{false};
 };
 
 }  // namespace lundukeedit

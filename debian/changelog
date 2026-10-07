@@ -1,3 +1,36 @@
+lunduke-edit (0.9-3) unstable; urgency=medium
+
+  * Insert toggles overwrite only with no modifiers, including the keypad,
+    and Shift+Insert / Ctrl+Insert reach the text view. The status mode
+    follows the text view. Paste, middle-click, and drag-and-drop reject
+    an oversized clipboard from the selection length before the text is
+    copied, and the checked text is what gets inserted.
+  * A hard-linked save stages the new bytes before copying them into the
+    existing inode, and a short write says the file may be damaged. A
+    directory flush failure after a successful rename is not a failed
+    save. New files use 0666 masked by umask, and the temporary file stays
+    private until it replaces the destination.
+  * Saving uses openat, O_NOFOLLOW, and renameat. Extended attributes,
+    including ACLs and the security context, are copied onto the new
+    inode. A clean buffer is not rewritten. A writable file in a
+    directory that is not writable, and a very long name, still save.
+  * Mixed newline styles are written back as loaded. Pasted carriage
+    returns are not expanded again. Search Selection Only and Extend
+    Selection pins clear when the buffer is replaced. Fifos are rejected
+    without a blocking open.
+  * Opens that arrive during a dialog or a clipboard wait are queued.
+    Find yields while skipping non-word matches. Cancelling Replace All
+    undoes the partial edit. Closing Find clears highlights. Encoding
+    radios follow the document; the next Open has its own control. A path
+    that is already open is shown instead of loaded again, and a file
+    that changed on disk is not replaced without asking. Wrap stays off
+    while a line is still too long. Recent paths cannot contain a newline,
+    and a failed lock does not rewrite the recent list. Print caches one
+    layout per page, measures tab stops from the print context, and does
+    not split a line into a second layout.
+
+ -- Phil <phil@brushpad.local>  Wed, 07 Oct 2026 14:30:00 -0500
+
 lunduke-edit (0.9-2) unstable; urgency=medium
 
   * Saving through a symlink updates the target and leaves the link in

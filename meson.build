@@ -13,6 +13,7 @@ project(
 
 gtkmm_dep = dependency('gtkmm-3.0', version: '>=3.24')
 gtksourceviewmm_dep = dependency('gtksourceviewmm-3.0', version: '>=3.18')
+x11_dep = dependency('x11')
 
 lunduke_edit_inc = include_directories('src')
 
@@ -27,7 +28,7 @@ lunduke_edit_sources = files(
 executable(
   'lunduke-edit',
   lunduke_edit_sources,
-  dependencies: [gtkmm_dep, gtksourceviewmm_dep],
+  dependencies: [gtkmm_dep, gtksourceviewmm_dep, x11_dep],
   include_directories: lunduke_edit_inc,
   install: true,
 )
@@ -41,7 +42,7 @@ edit_behavior_tests = executable(
     'src/line_gutter.cpp',
     'src/find_replace_dialog.cpp',
   ),
-  dependencies: [gtkmm_dep, gtksourceviewmm_dep],
+  dependencies: [gtkmm_dep, gtksourceviewmm_dep, x11_dep],
   include_directories: lunduke_edit_inc,
 )
 

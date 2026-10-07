@@ -25,6 +25,15 @@ public:
   // The focused editor, or another visible one when nothing has been focused.
   MainWindow* main_window() const;
 
+  // A visible window already editing this path, or nullptr.
+  MainWindow* find_window_editing(const std::string& path) const;
+
+  // While a dialog or clipboard wait is on the stack, Gio opens are queued
+  // and applied after the nested main loop returns.
+  void push_reentry();
+  void pop_reentry();
+  void defer_open(const std::string& path);
+
   // Confirm every open document, then quit the process.
   bool confirm_quit();
 
@@ -62,6 +71,7 @@ private:
   void on_window_hidden(MainWindow* window);
   void destroy_window_now(MainWindow* window);
   void open_files(const std::vector<std::string>& paths);
+  void drain_deferred_opens();
   void ensure_recents_loaded();
   void report_non_native(const std::vector<Glib::ustring>& uris);
   static void install_css();
@@ -70,6 +80,8 @@ private:
   std::unordered_set<MainWindow*> live_;
   std::unordered_map<MainWindow*, sigc::connection> pending_delete_;
   bool destroying_{false};
+  int reentry_depth_{0};
+  std::vector<std::string> deferred_opens_;
 
   std::vector<std::string> recents_;
   bool recents_loaded_{false};
