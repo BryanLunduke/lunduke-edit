@@ -1094,6 +1094,36 @@ struct EditChecks {
     expect(blank->file_path_ == big, "large file keeps the window");
     expect(window_has_path(app, other), "queued path opens in another window");
 
+    // Above the hard cap there is no "open anyway", even when the large
+    // confirm would allow the 32 MiB path. A file between the two caps
+    // still confirms and loads.
+    g_setenv("LUNDUKE_EDIT_TEST_MAX_OPEN", "8", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD", "16", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_LARGE", "1", TRUE);
+    const std::string above_hard = dir + "/above-hard.txt";
+    write_bytes(above_hard, std::string(20, 'Q'));
+    w.buffer()->set_text("keep-hard");
+    bool asked = false;
+    MainWindow::test_during_large_confirm_ = [&asked](MainWindow*) {
+      asked = true;
+    };
+    expect(!w.open_file(above_hard), "file above the hard cap is refused");
+    expect(!asked, "hard cap does not offer an unlimited confirm");
+    expect(w.buffer()->get_text() == "keep-hard",
+           "hard cap refusal keeps the buffer");
+    expect(w.last_open_error_.find("will not be opened") != std::string::npos,
+           "hard cap explains the refusal");
+    const std::string between = dir + "/between-caps.txt";
+    write_bytes(between, std::string(12, 'M'));
+    expect(w.open_file(between), "file between confirm and hard cap still opens");
+    expect(asked, "confirm still runs below the hard cap");
+    expect(w.buffer()->get_text() == std::string(12, 'M'),
+           "between-cap bytes loaded");
+    MainWindow::test_during_large_confirm_ = nullptr;
+    g_unsetenv("LUNDUKE_EDIT_TEST_LARGE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD");
+
     // 13. A path already open is presented, not loaded again. A changed
     // file is not replaced when the user cancels.
     const std::string notes = dir + "/notes.txt";
@@ -1355,6 +1385,7 @@ struct EditChecks {
 
     g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD");
     g_unsetenv("LUNDUKE_EDIT_TEST_LARGE");
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_HITS");
     g_unsetenv("LUNDUKE_EDIT_TEST_CHUNK");

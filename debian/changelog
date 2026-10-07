@@ -18,6 +18,8 @@ lunduke-edit (0.9-3) unstable; urgency=medium
     returns are not expanded again. Search Selection Only and Extend
     Selection pins clear when the buffer is replaced. Fifos are rejected
     without a blocking open.
+  * A file larger than 32 MiB still asks before opening. A file larger
+    than 64 MiB is refused, with no unlimited read on the UI thread.
   * Opens that arrive during a dialog or a clipboard wait are queued.
     Find yields while skipping non-word matches. Cancelling Replace All
     undoes the partial edit. Closing Find clears highlights. Encoding
