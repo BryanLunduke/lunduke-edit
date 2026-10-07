@@ -20,12 +20,16 @@
 #include <gtkmm/pagesetup.h>
 #include <gtkmm/printoperation.h>
 #include <gtkmm/printsettings.h>
+#include <sigc++/connection.h>
 
 #include <gtksourceviewmm.h>
 #include <pangomm/layout.h>
 
+#include <cstddef>
 #include <string>
 #include <vector>
+
+typedef struct _GtkTextView GtkTextView;
 
 namespace lundukeedit {
 
@@ -35,6 +39,7 @@ struct EditChecks;
 class MainWindow : public Gtk::ApplicationWindow {
 public:
   explicit MainWindow(Application& app);
+  ~MainWindow() override;
 
   void load_seed_sample();
   bool open_file(const std::string& path);
@@ -42,17 +47,28 @@ public:
   // the current buffer (Cancel, or Save that did not succeed).
   bool confirm_discard_or_save();
 
+  // True when this window is a clean untitled document with no text.
+  // A second-instance open may reuse it only while it is also focused.
+  bool is_empty_untitled() const;
+
+  void rebuild_recents_menu();
+
+  enum class NewlineStyle { Lf, Crlf, Cr };
+
 protected:
   bool on_delete_event(GdkEventAny* event) override;
   bool on_key_press_event(GdkEventKey* event) override;
+  bool on_focus_in_event(GdkEventFocus* event) override;
 
 private:
   friend struct EditChecks;
   void build_ui();
   void build_menus();
-  void apply_css();
   void update_title();
   void update_status();
+  void update_cursor_status();
+  void update_bytes_status();
+  std::size_t cached_save_bytes() const;
   void update_undo_redo_sensitivity();
   void set_dirty(bool dirty);
   void refresh_dirty_from_buffer();
@@ -68,6 +84,16 @@ private:
   Glib::ustring current_basename() const;
   Glib::RefPtr<Gsv::Buffer> buffer();
 
+  void on_text_inserted(const Gtk::TextBuffer::iterator& pos,
+                        const Glib::ustring& text, int bytes);
+  void on_text_erased(const Gtk::TextBuffer::iterator& start,
+                      const Gtk::TextBuffer::iterator& end);
+  void note_loaded_text(const Glib::ustring& text);
+  void force_wrap_off();
+  bool confirm_large_open(const std::string& path);
+  bool clipboard_paste_allowed();
+  void handle_paste_clipboard(GtkTextView* view);
+
   // File
   void on_new();
   void on_open();
@@ -80,7 +106,15 @@ private:
 
   void on_begin_print(const Glib::RefPtr<Gtk::PrintContext>& context);
   void on_draw_page(const Glib::RefPtr<Gtk::PrintContext>& context, int page_nr);
-  void rebuild_recents_menu();
+  int next_print_end(int offset);
+  double measure_print_chunk(const Glib::RefPtr<Gtk::PrintContext>& context,
+                             int width_pango, int start, int end,
+                             double min_height);
+  void configure_print_layout(const Glib::RefPtr<Pango::Layout>& layout,
+                              int width_pango) const;
+  void draw_print_layout(const Cairo::RefPtr<Cairo::Context>& cr,
+                         const Glib::RefPtr<Pango::Layout>& layout,
+                         double& y) const;
   void remember_recent(const std::string& path);
 
   // Edit
@@ -104,6 +138,7 @@ private:
   void on_encoding_utf8();
   void on_encoding_latin1();
   void set_encoding(const std::string& encoding);
+  void set_open_preference(bool utf8);
   void on_about();
 
   void on_buffer_changed();
@@ -120,6 +155,18 @@ private:
   int replace_all(const FindOptions& opts);
   void clear_find_highlights();
   void highlight_all_matches(const FindOptions& opts);
+  void set_find_count(int n, bool capped);
+  void start_find_all(const FindOptions& opts, FindReplaceDialog* dlg);
+  void start_replace_all(const FindOptions& opts, FindReplaceDialog* dlg);
+  bool on_find_idle();
+  bool pump_find_highlight();
+  bool pump_replace();
+  bool step_search(bool backward, int& cursor_off, int& match_start,
+                   int& match_end);
+  void finish_find_scan(bool show_result);
+  void cancel_find_scan();
+  void end_find_user_action();
+  bool confirm_huge_undo(std::size_t bytes);
   bool is_entire_word(const Gtk::TextIter& start,
                       const Gtk::TextIter& end) const;
   Gtk::TextSearchFlags search_flags(const FindOptions& opts) const;
@@ -135,6 +182,25 @@ private:
                                 const Gtk::TextIter& a,
                                 const Gtk::TextIter& b) const;
 
+  struct FindScan {
+    enum class Kind { None, FindAll, ReplaceAll };
+    Kind kind{Kind::None};
+    bool active{false};
+    bool cancel{false};
+    bool finishing{false};
+    bool started{false};
+    bool counting{false};
+    bool capped{false};
+    bool user_action_open{false};
+    FindOptions opts{};
+    int cursor_off{0};
+    int select_start{-1};
+    int select_end{-1};
+    int count{0};
+    std::size_t undo_bytes{0};
+    FindReplaceDialog* dlg{nullptr};
+  };
+
   Application& app_;
 
   Gtk::Box root_{Gtk::ORIENTATION_VERTICAL};
@@ -148,10 +214,12 @@ private:
   Gtk::Frame status_pos_frame_;
   Gtk::Frame status_mode_frame_;
   Gtk::Frame status_enc_frame_;
+  Gtk::Frame status_find_frame_;
   Gtk::Frame status_bytes_frame_;
   Gtk::Label status_pos_{"Ln 1, Col 1"};
   Gtk::Label status_mode_{"Insert"};
   Gtk::Label status_enc_{"UTF-8"};
+  Gtk::Label status_find_;
   Gtk::Label status_bytes_{"0 bytes"};
 
   Gtk::CheckMenuItem* wrap_item_{nullptr};
@@ -167,12 +235,21 @@ private:
   // Encoding that matches the bytes last loaded or successfully saved.
   std::string saved_encoding_{"UTF-8"};
   bool encoding_dirty_{false};
-  // Menu preference. Auto-detected Latin-1 on one file does not force the
-  // next file to skip the UTF-8 check. An explicit Text menu choice does.
+  // Menu preference for the next Open. Independent of the document encoding.
+  // Auto-detected Latin-1 on one file does not change this. An explicit
+  // Text menu choice does.
+  std::string open_charset_{"UTF-8"};
   bool prefer_utf8_{true};
+  NewlineStyle newline_style_{NewlineStyle::Lf};
+  // UTF-8 bytes and LF count in the buffer. Status "bytes" is the size
+  // save_to_path would write, derived from these plus encoding and newlines.
+  std::size_t utf8_bytes_{0};
+  std::size_t newline_count_{0};
   bool dirty_{false};
   bool seeding_{false};
   bool overwrite_{false};
+  bool suppress_wrap_pref_{false};
+  bool find_highlights_on_{false};
   int tab_width_{4};
   Pango::FontDescription font_desc_;
 
@@ -191,13 +268,13 @@ private:
   Glib::RefPtr<Gtk::TextBuffer::Mark> last_match_end_;
   bool last_match_valid_{false};
 
+  FindScan find_scan_;
+  sigc::connection find_idle_;
+
   Glib::RefPtr<Gtk::PrintSettings> print_settings_;
   Glib::RefPtr<Gtk::PageSetup> page_setup_;
-  Glib::RefPtr<Pango::Layout> print_layout_;
-  std::vector<int> print_page_breaks_;  // line index starts for each page after 0
-
-  static constexpr int kMaxRecents = 8;
-  std::vector<std::string> recents_;
+  // Char offsets where each page after the first begins.
+  std::vector<int> print_page_breaks_;
 };
 
 }  // namespace lundukeedit

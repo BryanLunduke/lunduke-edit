@@ -1,3 +1,32 @@
+lunduke-edit (0.9-2) unstable; urgency=medium
+
+  * Saving through a symlink updates the target and leaves the link in
+    place. A broken symlink is not replaced. A file with other hard links
+    is updated in place. The previous owner is restored when the process
+    is allowed to, and the new bytes and directory entry are flushed.
+  * Opening a file in an already-running instance reuses a window only
+    when that window is focused and still empty. Other documents stay
+    put, and a file that cannot be read does not leave an extra window.
+    A closed window is freed. Cancelling the close of an unsaved document
+    keeps the window.
+  * The status-bar size is the number of bytes a save would write, cached
+    from edits. Cursor motion no longer walks a multi-megabyte line.
+  * Files larger than 32 MiB ask before opening. A paste larger than
+    32 MiB is refused. A read continues to end of file, including files
+    that report a size of zero. Only local files can be opened or saved.
+  * Find All and Replace All run in chunks so Cancel stays responsive,
+    stop after a large number of hits, and ask before storing a huge undo
+    record. Search Backwards is honored. The match count is its own
+    status label and clears when the text changes.
+  * Recent files are one list shared by every window. A new document is
+    UTF-8. The Text menu charset applies to the next Open and is inherited
+    by new windows, along with font, wrap, and tab width. Word wrap
+    defaults to off, and a very long line turns wrap off in that window.
+  * CRLF and CR line endings are kept and written back on save. Printing
+    paginates long documents and uses the editor's tab stops.
+
+ -- Phil <phil@brushpad.local>  Wed, 07 Oct 2026 00:42:00 -0500
+
 lunduke-edit (0.9-1) unstable; urgency=medium
 
   * LCOS 0.9 track identity bump (0.8-2 → 0.9 / Debian 0.9-1). Features
