@@ -352,6 +352,15 @@ private:
   std::string last_save_error_;
   std::string last_open_error_;
   std::string last_notice_;
+  // Error dialogs actually raised. A stat failure must not raise one of
+  // these and then repeat itself on the save question and on Save.
+  int error_reports_{0};
+  Glib::ustring last_error_primary_;
+  Glib::ustring last_error_secondary_;
+  // Set once the user has been told about the current stat failure, either
+  // by the save question or by the one Save / reopen dialog. Later Save
+  // and reopen calls for that same failure stay quiet.
+  bool disk_error_noted_{false};
   // UTF-8 bytes and LF count in the buffer. Status "bytes" is the size
   // save_to_path would write, derived from these plus encoding and newlines.
   std::size_t utf8_bytes_{0};

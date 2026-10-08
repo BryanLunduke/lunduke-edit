@@ -1513,6 +1513,7 @@ void MainWindow::load_seed_sample() {
   have_file_id_ = false;
   file_missing_ = false;
   file_unreadable_ = false;
+  disk_error_noted_ = false;
   note_loaded_text("");
   set_dirty(false);
   seeding_ = false;
@@ -1591,14 +1592,22 @@ bool MainWindow::reopen_same_path(const std::string& path,
                                       file_ino_, file_mtime_sec_,
                                       file_mtime_nsec_);
   if (disk.kind == DiskIdentity::Error) {
+    // The buffer stays. Say why once: the close question may already have
+    // named this failure, and Save must not open another dialog for it.
     last_open_error_ = disk.message;
-    report_error("Could not check the file on disk.", disk.message);
+    file_unreadable_ = true;
+    set_dirty(true);
+    if (!disk_error_noted_) {
+      report_error("Could not check the file on disk.", disk.message);
+      disk_error_noted_ = true;
+    }
     return false;
   }
   if (disk.kind == DiskIdentity::Missing) {
     // Re-reading cannot succeed. Keep the buffer and mark it so Close asks.
     file_missing_ = true;
     file_unreadable_ = false;
+    disk_error_noted_ = false;
     set_dirty(true);
     last_open_error_ = disk.message;
     report_error("This file was deleted.", path);
@@ -1784,6 +1793,7 @@ bool MainWindow::open_file_body(const std::string& path) {
   remember_file_identity(path);
   file_missing_ = false;
   file_unreadable_ = false;
+  disk_error_noted_ = false;
   set_dirty(false);
   seeding_ = false;
   apply_editor_font_tag();
@@ -2022,6 +2032,7 @@ void MainWindow::refresh_disk_flags() {
   file_missing_ = false;
   file_unreadable_ = false;
   if (file_path_.empty() || !have_file_id_) {
+    disk_error_noted_ = false;
     refresh_dirty_from_buffer();
     return;
   }
@@ -2031,10 +2042,14 @@ void MainWindow::refresh_disk_flags() {
   if (disk.kind == DiskIdentity::Missing) {
     file_missing_ = true;
     last_notice_ = disk.message;
+    disk_error_noted_ = false;
   } else if (disk.kind == DiskIdentity::Error) {
+    // Remember the strerror for the save question. Do not also open an
+    // error dialog; Close would then show the same sentence twice.
     file_unreadable_ = true;
     last_notice_ = disk.message;
-    report_error("Could not check the file on disk.", disk.message);
+  } else {
+    disk_error_noted_ = false;
   }
   refresh_dirty_from_buffer();
 }
@@ -2062,6 +2077,9 @@ int MainWindow::display_column_at(const Gtk::TextIter& iter) const {
 
 void MainWindow::report_error(const Glib::ustring& primary,
                               const Glib::ustring& secondary) {
+  ++error_reports_;
+  last_error_primary_ = primary;
+  last_error_secondary_ = secondary;
   if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
     return;
   }
@@ -2112,9 +2130,16 @@ bool MainWindow::confirm_discard_or_save(DiscardKind kind) {
     default_response = Gtk::RESPONSE_ACCEPT;
   } else if (file_unreadable_) {
     primary = "Could not check the file on disk.";
-    secondary = last_notice_.empty()
-                    ? Glib::ustring("Save the text in this window before continuing?")
-                    : Glib::ustring(last_notice_ + "\nSave the text in this window before continuing?");
+    // One dialog for this failure. The strerror is here, and so is the
+    // way out: this path cannot be written, so Save As keeps the text.
+    // Save itself does not open another dialog for the same failure.
+    const Glib::ustring why =
+        last_notice_.empty() ? Glib::ustring()
+                             : Glib::ustring(last_notice_ + "\n");
+    secondary = why +
+                "This path cannot be written. Use Save As to keep the text.\n"
+                "Save the text in this window before continuing?";
+    disk_error_noted_ = true;
     default_response = Gtk::RESPONSE_ACCEPT;
   } else {
     primary = "Save changes before continuing?";
@@ -2187,6 +2212,7 @@ void MainWindow::on_new() {
   have_file_id_ = false;
   file_missing_ = false;
   file_unreadable_ = false;
+  disk_error_noted_ = false;
   note_loaded_text("");
   set_dirty(false);
   seeding_ = false;
@@ -2241,10 +2267,19 @@ bool MainWindow::save_to_path(const std::string& path) {
                         file_mtime_sec_, file_mtime_nsec_);
   }
   if (same_loaded && disk.kind == DiskIdentity::Error && !force_replace_) {
-    last_save_error_ = disk.message;
+    // The close question already explained this. A direct Save says it
+    // once. A second Save, or Save chosen from that question, stays quiet
+    // and leaves Save As as the way to keep the text.
+    last_save_error_ = disk.message +
+                       " This path cannot be written. Use Save As to keep the text.";
     file_unreadable_ = true;
     set_dirty(true);
-    report_error("Could not check the file on disk.", disk.message);
+    if (!disk_error_noted_) {
+      report_error(
+          "This path cannot be written.",
+          std::string("Use Save As to keep the text.\n") + disk.message);
+      disk_error_noted_ = true;
+    }
     return false;
   }
   if (same_loaded && disk.kind == DiskIdentity::Missing) {
@@ -2346,6 +2381,7 @@ bool MainWindow::save_to_path(const std::string& path) {
   remember_file_identity(path);
   file_missing_ = false;
   file_unreadable_ = false;
+  disk_error_noted_ = false;
   // Records an undo save point so undo/redo back to this text clears
   // the buffer's modified flag.
   buffer()->set_modified(false);
@@ -4245,7 +4281,17 @@ void MainWindow::apply_editor_font_tag() {
 void MainWindow::on_font_tag_inserted(const Gtk::TextBuffer::iterator& pos,
                                      const Glib::ustring& text,
                                      int /*bytes*/) {
-  if (!font_tag_ || text.empty() || seeding_ || ending_restore_) {
+  // Runs after the default insert, so pos is the end of the new text.
+  // Tag that range. A forward look tags the characters that were already
+  // there when the insert repeats them (a duplicated first line, a
+  // matching prefix, the same letters mid-line) and leaves the new
+  // characters in the theme monospace.
+  // Open and reload set the whole buffer after seeding_. Undo and redo
+  // reinsert while ending_restore_ is set; those characters need the tag
+  // too. GTK 3 tag-on toggles are right-gravity and there is no per-tag
+  // gravity property, so an insert at offset 0 does not inherit the face
+  // from the following text. This handler is what applies it.
+  if (!font_tag_ || text.empty() || seeding_) {
     return;
   }
   auto buf = buffer();
@@ -4254,18 +4300,11 @@ void MainWindow::on_font_tag_inserted(const Gtk::TextBuffer::iterator& pos,
   }
   const bool modified = buf->get_modified();
   const int n = static_cast<int>(text.length());
-  Gtk::TextIter start = pos;
-  Gtk::TextIter end = pos;
-  bool tagged = false;
-  if (end.forward_chars(n) && start.get_text(end) == text) {
-    buf->apply_tag(font_tag_, start, end);
-    tagged = true;
-  }
-  if (!tagged) {
-    start = pos;
-    end = pos;
+  const int end_off = pos.get_offset();
+  if (end_off >= n) {
+    Gtk::TextIter start = pos;
     if (start.backward_chars(n)) {
-      buf->apply_tag(font_tag_, start, end);
+      buf->apply_tag(font_tag_, start, pos);
     }
   }
   if (buf->get_modified() != modified) {
@@ -4459,8 +4498,43 @@ void MainWindow::on_begin_print(
 
   PrintPage page;
   Glib::ustring pending;
+  // Height of slices already placed on this page. A tab or a wrapped line
+  // flushes earlier lines into those slices. The next short lines have to
+  // add their own height to this, or the page looks empty and keeps
+  // accepting lines that then draw past the bottom.
+  double committed = 0.0;
   double used = 0.0;
   bool page_empty = true;
+
+  auto layout_rows_height = [&](const Glib::RefPtr<Pango::Layout>& layout,
+                                int row_begin, int row_end) -> double {
+    if (!layout) {
+      return 0.0;
+    }
+    double height = 0.0;
+    const int n = layout->get_line_count();
+    if (row_begin < 0) {
+      row_begin = 0;
+    }
+    if (row_end > n) {
+      row_end = n;
+    }
+    for (int i = row_begin; i < row_end; ++i) {
+      auto line = layout->get_line(i);
+      if (!line) {
+        continue;
+      }
+      Pango::Rectangle line_ink;
+      Pango::Rectangle line_logical;
+      line->get_extents(line_ink, line_logical);
+      const double h =
+          static_cast<double>(line_logical.get_height()) / Pango::SCALE;
+      // A blank line can report a zero box. Count the font's line height
+      // so a run of blank lines still fills the page.
+      height += h > 0.0 ? h : line_height;
+    }
+    return height;
+  };
 
   auto flush_pending = [&]() {
     if (pending.empty()) {
@@ -4473,8 +4547,10 @@ void MainWindow::on_begin_print(
     slice.layout = layout;
     slice.row_begin = 0;
     slice.row_end = std::max(1, layout->get_line_count());
+    committed += layout_rows_height(layout, slice.row_begin, slice.row_end);
     page.slices.push_back(std::move(slice));
     pending.clear();
+    used = committed;
   };
 
   // Sum of the line boxes in one layout. That is what draw adds up.
@@ -4487,21 +4563,7 @@ void MainWindow::on_begin_print(
     auto layout = context->create_pango_layout();
     configure_print_layout(layout, context, width);
     layout->set_text(block);
-    double height = 0.0;
-    const int n = layout->get_line_count();
-    for (int i = 0; i < n; ++i) {
-      auto line = layout->get_line(i);
-      if (!line) {
-        continue;
-      }
-      Pango::Rectangle line_ink;
-      Pango::Rectangle line_logical;
-      line->get_extents(line_ink, line_logical);
-      const double h =
-          static_cast<double>(line_logical.get_height()) / Pango::SCALE;
-      height += h > 0.0 ? h : line_height;
-    }
-    return height;
+    return layout_rows_height(layout, 0, layout->get_line_count());
   };
 
   // push the page that just filled. The break is where the next page starts.
@@ -4509,6 +4571,7 @@ void MainWindow::on_begin_print(
     flush_pending();
     if (page.slices.empty()) {
       used = 0.0;
+      committed = 0.0;
       page_empty = true;
       return;
     }
@@ -4516,6 +4579,7 @@ void MainWindow::on_begin_print(
     page = PrintPage{};
     print_page_breaks_.push_back(break_at);
     used = 0.0;
+    committed = 0.0;
     page_empty = true;
   };
 
@@ -4561,20 +4625,22 @@ void MainWindow::on_begin_print(
     if (!complex) {
       // Leave a few points, then compare the combined layout before the
       // page is closed. The per-line probe above still rejects a wrapped
-      // run of wide glyphs.
+      // run of wide glyphs. `committed` is the height already placed
+      // (tabs, wraps, earlier blocks). The new block is added to that,
+      // and the page closes before the sum passes the bottom.
       const double kPrintSlack = 4.0;
       const bool near_end =
           !page_empty && (used + row_height + kPrintSlack > page_height ||
                           used > page_height * 0.85);
       if (near_end) {
-        const double combined = block_height(pending + text);
-        if (combined > page_height) {
+        const double total = committed + block_height(pending + text);
+        if (total > page_height) {
           close_page(offset);
           pending.append(text);
           used = row_height;
         } else {
           pending.append(text);
-          used = combined;
+          used = total;
         }
       } else {
         if (!page_empty && used + row_height > page_height) {
@@ -4632,8 +4698,11 @@ void MainWindow::on_begin_print(
       slice.layout = layout;
       slice.row_begin = row;
       slice.row_end = row_end;
+      const double placed =
+          layout_rows_height(layout, slice.row_begin, slice.row_end);
       page.slices.push_back(std::move(slice));
-      used += slice_h;
+      committed += placed;
+      used += placed;
       page_empty = false;
       row = row_end;
     }

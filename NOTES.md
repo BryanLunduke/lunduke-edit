@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9-5_amd64.deb
+# → packaging/debs/lunduke-edit_0.9-6_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,13 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9-6
+
+- **Font**: text inserted at the start of the buffer, or anywhere it matches the text already there, keeps the editor face. Typing, paste, undo, redo, open, reload, replace-all, and drag-and-drop all tag the inserted range. The font is not stored in the file.
+- **Print**: a page tracks the height already committed, including tabs, wrapped lines, wide glyphs, CJK, and blank lines, and closes before the next line would pass the bottom.
+- **Files**: a stat failure is one save question. Checking the file does not add an error dialog, and Save does not open another. Save As keeps the text.
+- App / Meson / About stay **0.9**. Debian package **0.9-6**.
 
 ## 0.9-5
 
