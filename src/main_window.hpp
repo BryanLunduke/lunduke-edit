@@ -17,7 +17,9 @@
 #include <gtkmm/menubar.h>
 #include <gtkmm/menuitem.h>
 #include <gtkmm/radiomenuitem.h>
+#include <gtkmm/cssprovider.h>
 #include <gtkmm/scrolledwindow.h>
+#include <gtkmm/texttag.h>
 #include <gtkmm/separatormenuitem.h>
 #include <gtkmm/statusbar.h>
 #include <gtkmm/pagesetup.h>
@@ -52,9 +54,12 @@ public:
   // path re-reads the file when it changed on disk.
   bool open_file(const std::string& path, bool discard_already_confirmed = false);
   bool open_file_body(const std::string& path);
+  // Continue is close, quit, and File → New / Open. ReloadDisk is the
+  // question after the user already chose Reload on a file that changed.
+  enum class DiscardKind { Continue, ReloadDisk };
   // Asks before dropping unsaved edits. False means the caller must keep
   // the current buffer (Cancel, or Save that did not succeed).
-  bool confirm_discard_or_save();
+  bool confirm_discard_or_save(DiscardKind kind = DiscardKind::Continue);
 
   // True when this window is a clean untitled document with no text.
   // A second-instance open may reuse it only while it is also focused.
@@ -204,7 +209,14 @@ private:
   void on_cursor_moved(const Gtk::TextBuffer::iterator& loc,
                        const Glib::RefPtr<Gtk::TextBuffer::Mark>& mark);
   void apply_tab_width(int spaces);
-  void apply_font(const Pango::FontDescription& desc);
+  // user_chosen is Text → Font (and a face reloaded from disk). The
+  // default face keeps the monospace style class.
+  void apply_font(const Pango::FontDescription& desc, bool user_chosen = false);
+  void install_editor_font(const Pango::FontDescription& desc);
+  void apply_editor_font_tag();
+  void on_font_tag_inserted(const Gtk::TextBuffer::iterator& pos,
+                           const Glib::ustring& text, int bytes);
+  void refresh_disk_flags();
 
   enum class ReplaceResult { Replaced, Found, NotFound, Blocked };
   enum class SearchStep { Miss, Hit, Yield };
@@ -330,6 +342,10 @@ private:
   std::uint64_t file_ino_{0};
   std::int64_t file_mtime_sec_{0};
   std::int64_t file_mtime_nsec_{0};
+  // The loaded path is gone (ENOENT) or stat failed for another reason.
+  // Close and quit must ask before dropping the buffer.
+  bool file_missing_{false};
+  bool file_unreadable_{false};
   bool opening_{false};
   bool accepting_cr_{false};
   bool swallow_insert_repeat_{false};
@@ -347,6 +363,16 @@ private:
   bool find_highlights_on_{false};
   int tab_width_{4};
   Pango::FontDescription font_desc_;
+  bool font_user_chosen_{false};
+  Glib::RefPtr<Gtk::CssProvider> font_css_;
+  Glib::RefPtr<Gtk::TextTag> font_tag_;
+  // Timestamp of the last middle-button press. Later presses in the same
+  // double- or triple-click do not insert again.
+  std::uint32_t last_middle_paste_time_{0};
+  // What the last save/close question would have focused, for tests.
+  Glib::ustring last_prompt_primary_;
+  Glib::ustring last_prompt_secondary_;
+  int last_prompt_default_{0};
 
   FindOptions find_opts_;
   Glib::RefPtr<Gtk::TextTag> find_tag_;

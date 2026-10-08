@@ -30,11 +30,19 @@ namespace {
 
 constexpr const char* kAppId = "org.lunduke.LundukeEdit";
 
-std::string recents_file_path() {
+std::string config_dir() {
   const std::string dir =
       Glib::build_filename(Glib::get_user_config_dir(), "lunduke-edit");
   g_mkdir_with_parents(dir.c_str(), 0700);
-  return Glib::build_filename(dir, "recents.txt");
+  return dir;
+}
+
+std::string recents_file_path() {
+  return Glib::build_filename(config_dir(), "recents.txt");
+}
+
+std::string font_file_path() {
+  return Glib::build_filename(config_dir(), "font");
 }
 
 std::string read_fd_all(int fd) {
@@ -107,7 +115,10 @@ Glib::RefPtr<Application> Application::create() {
 
 Application::Application()
     : Gtk::Application("org.lunduke.LundukeEdit",
-                       Gio::APPLICATION_HANDLES_OPEN) {}
+                       Gio::APPLICATION_HANDLES_OPEN) {
+  // Before any window is built, so the first view uses the saved face.
+  load_font_setting();
+}
 
 Application::~Application() {
   destroying_ = true;
@@ -153,12 +164,48 @@ void Application::on_startup() {
   // One screen-wide provider. Windows must not add another.
   install_css();
   ensure_recents_loaded();
+  load_font_setting();
 }
 
-void Application::set_font(const std::string& desc) {
-  if (!desc.empty()) {
-    font_ = desc;
+void Application::load_font_setting() {
+  const int fd = ::open(font_file_path().c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return;
   }
+  std::string data = read_fd_all(fd);
+  ::close(fd);
+  while (!data.empty() && (data.back() == '\n' || data.back() == '\r' ||
+                           data.back() == ' ' || data.back() == '\t')) {
+    data.pop_back();
+  }
+  if (data.empty() || data.find('\n') != std::string::npos) {
+    return;
+  }
+  font_ = data;
+  font_chosen_ = true;
+}
+
+void Application::set_font(const std::string& desc, bool persist) {
+  if (desc.empty() || desc.find('\n') != std::string::npos) {
+    return;
+  }
+  font_ = desc;
+  if (!persist) {
+    return;
+  }
+  font_chosen_ = true;
+  const std::string path = font_file_path();
+  const int fd =
+      ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return;
+  }
+  const std::string line = desc + "\n";
+  if (!write_fd_all(fd, line)) {
+    ::close(fd);
+    return;
+  }
+  ::close(fd);
 }
 
 void Application::set_wrap_text(bool on) { wrap_text_ = on; }
@@ -312,6 +359,9 @@ void Application::open_files(const std::vector<std::string>& paths) {
   std::size_t index = 0;
   if (MainWindow* existing = find_window_editing(paths[0])) {
     existing->present();
+    // A second launch of a path this process already shows must reload
+    // when the file changed, the same way File → Open does in that window.
+    existing->open_file(paths[0]);
     index = 1;
   } else if (focused_ && focused_->get_visible() &&
              focused_->is_empty_untitled()) {
@@ -326,6 +376,7 @@ void Application::open_files(const std::vector<std::string>& paths) {
   for (; index < paths.size(); ++index) {
     if (MainWindow* existing = find_window_editing(paths[index])) {
       existing->present();
+      existing->open_file(paths[index]);
       continue;
     }
     auto* w = create_window();

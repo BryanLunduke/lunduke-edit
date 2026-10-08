@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9-4_amd64.deb
+# → packaging/debs/lunduke-edit_0.9-5_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,17 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9-5
+
+- **Files**: a clean file deleted on disk is unsaved. Close and quit ask, and Save writes it back. A stat failure is reported.
+- **Font**: Text → Font changes the face and size on screen. The choice is saved and printed. The default stays monospace 11 pt.
+- **Open**: another window, or a second launch, reloads a file when it changed on disk.
+- **Find**: Find Next does not stay inside the match just found. Extend turns off when Find closes.
+- **Paste**: a middle-button double-click or triple-click pastes once.
+- **Reload**: Don't Save is the default after Reload and loads the disk copy. Save replaces the file and cancels the reload.
+- **Print**: ordinary lines stay inside the page.
+- App / Meson / About stay **0.9**. Debian package **0.9-5**.
 
 ## 0.9-4
 

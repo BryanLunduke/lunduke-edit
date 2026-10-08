@@ -1128,7 +1128,8 @@ struct EditChecks {
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD");
 
-    // 13. A path already open is presented, not loaded again. A changed
+    // 13. A path already open is presented in the window that has it.
+    // An unchanged file is not loaded into the second window. A changed
     // file is not replaced when the user cancels.
     const std::string notes = dir + "/notes.txt";
     write_bytes(notes, "notes-v1");
@@ -1136,7 +1137,9 @@ struct EditChecks {
     auto* second = app.create_window();
     second->present();
     flush_ui();
-    expect(!second->open_file(notes), "second window does not load the same path");
+    expect(second->open_file(notes), "second window presents the window that has the path");
+    expect(w.buffer()->get_text() == "notes-v1", "unchanged file stays as it was");
+    expect(w.file_path_ == notes, "the original window keeps the path");
     expect(second->file_path_ != notes, "second window is not a stale copy");
     w.buffer()->set_text("notes-v2");
     expect(w.save_to_path(notes), "save the only window on this path");
@@ -1738,7 +1741,17 @@ struct EditChecks {
     expect(w.save_to_path(notes), "reload prompt can still save");
     g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
     g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.last_prompt_default_ == Gtk::RESPONSE_REJECT,
+           "reload follow-up focuses Don't Save");
+    expect(w.last_prompt_primary_.find("reloading") != Glib::ustring::npos,
+           "reload follow-up says it is a reload");
+    expect(w.last_prompt_secondary_.find("cancel the reload") !=
+               Glib::ustring::npos,
+           "reload follow-up says Save cancels the reload");
     expect(read_bytes(notes) == "mine", "save from the reload prompt wrote the buffer");
+    expect(w.buffer()->get_text() == "mine", "that save does not load the disk copy");
+    expect(w.last_notice_.find("Reload cancelled") != std::string::npos,
+           "saving from the reload prompt says the reload was cancelled");
 
     // 9. Cancelling the large-file question is not an error. The hard cap
     // still is.
@@ -1782,6 +1795,597 @@ struct EditChecks {
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD");
   }
 
+  struct LaidOutFace {
+    int height{0};
+    int i_width{0};
+    int w_width{0};
+    std::string family;
+  };
+
+  // Line height from the iterator yrange, and the family the layout
+  // actually used. The stored FontDescription is not the check.
+  static LaidOutFace measure_face(MainWindow& w) {
+    w.buffer()->set_text("iW");
+    w.text_view_.queue_resize();
+    flush_ui();
+    LaidOutFace face;
+    auto iter = w.buffer()->get_iter_at_line(0);
+    int y = 0;
+    w.text_view_.get_line_yrange(iter, y, face.height);
+    // gtkmm's default TextAttributes is not a live GtkTextAttributes.
+    // gtk_text_iter_get_attributes merges the tags that the layout uses.
+    GtkTextAttributes* raw = gtk_text_attributes_new();
+    if (gtk_text_iter_get_attributes(iter.gobj(), raw) && raw->font != nullptr) {
+      const char* family = pango_font_description_get_family(raw->font);
+      if (family != nullptr) {
+        face.family = family;
+      }
+    }
+    gtk_text_attributes_unref(raw);
+    Gdk::Rectangle i_rect;
+    Gdk::Rectangle w_rect;
+    w.text_view_.get_iter_location(iter, i_rect);
+    w.text_view_.get_iter_location(w.buffer()->get_iter_at_offset(1), w_rect);
+    face.i_width = i_rect.get_width();
+    face.w_width = w_rect.get_width();
+    return face;
+  }
+
+  static std::string font_config_path() {
+    const char* dir = g_get_user_config_dir();
+    if (dir == nullptr || dir[0] == '\0') {
+      return {};
+    }
+    return std::string(dir) + "/lunduke-edit/font";
+  }
+
+  static bool page_inside(const MainWindow& w, double page_height,
+                          std::string& why) {
+    if (w.print_pages_.empty() || page_height < 1.0) {
+      why = "no pages";
+      return false;
+    }
+    for (std::size_t i = 0; i < w.print_pages_.size(); ++i) {
+      const double h = printed_page_height(w, i);
+      if (h > page_height + 0.2) {
+        why = "page " + std::to_string(i) + " is " + std::to_string(h) +
+              " pt on a " + std::to_string(page_height) + " pt page";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static void test_round4(Application& app, MainWindow& w, const std::string& dir,
+                          const LaidOutFace& startup_face) {
+    // 1. A clean file deleted on disk, and a file that cannot be stat'd.
+    // Close, quit, save, reload, and reopen (this window, another window,
+    // and a second launch) all have to notice.
+    const std::string gone = dir + "/round4-gone.txt";
+    write_bytes(gone, "please-keep-me");
+    expect(w.open_file(gone), "open the file that will be deleted");
+    expect(!w.dirty_, "deleted-file buffer starts clean");
+    expect(::unlink(gone.c_str()) == 0, "delete the open file");
+
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(!w.confirm_discard_or_save(), "close asks after the file is deleted");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.last_prompt_primary_.find("deleted") != Glib::ustring::npos,
+           "close says the file was deleted");
+    expect(w.last_prompt_default_ == Gtk::RESPONSE_ACCEPT,
+           "saving the deleted file again is the default");
+    expect(w.file_missing_, "deleted file is marked missing");
+    expect(w.dirty_, "deleted file marks the buffer unsaved");
+    expect(w.buffer()->get_text() == "please-keep-me", "cancel keeps the text");
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(w.on_delete_event(nullptr), "close is refused");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.get_visible(), "refused close leaves the window open");
+    expect(::access(gone.c_str(), F_OK) != 0, "cancel does not recreate the file");
+
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(!app.confirm_quit(), "quit asks after the file is deleted");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.get_visible(), "quit cancel leaves the window open");
+    expect(w.buffer()->get_text() == "please-keep-me", "quit cancel keeps the text");
+
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "save", TRUE);
+    expect(w.confirm_discard_or_save(), "close can save the deleted file");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(read_bytes(gone) == "please-keep-me", "save writes the deleted file back");
+    expect(!w.dirty_ && !w.file_missing_, "recreated file is clean");
+
+    expect(::unlink(gone.c_str()) == 0, "delete the file again");
+    expect(w.save_document(), "Save recreates a clean deleted file");
+    expect(read_bytes(gone) == "please-keep-me", "Save wrote the buffer back");
+    expect(!w.file_missing_, "Save clears the missing flag");
+
+    expect(::unlink(gone.c_str()) == 0, "delete before reopen");
+    const Glib::ustring kept_gone = w.buffer()->get_text();
+    expect(!w.open_file(gone), "same-window reopen of a deleted file fails");
+    expect(w.buffer()->get_text() == kept_gone, "reopen keeps the buffer");
+    expect(w.file_missing_, "reopen marks the file missing");
+    expect(w.last_open_error_.find("deleted") != std::string::npos,
+           "reopen says the file was deleted");
+    expect(::access(gone.c_str(), F_OK) != 0, "reopen does not recreate the file");
+
+    write_bytes(gone, "please-keep-me");
+    expect(w.open_file(gone), "open again before the other window");
+    expect(::unlink(gone.c_str()) == 0, "delete before the other window");
+    auto* other = app.create_window();
+    other->present();
+    flush_ui();
+    const int before_other = main_window_count(app);
+    expect(!other->open_file(gone), "other window does not drop the deleted file");
+    expect(main_window_count(app) == before_other,
+           "other window does not open a second copy");
+    expect(w.buffer()->get_text() == "please-keep-me",
+           "other window left the buffer in place");
+    expect(w.file_missing_, "other window marks the file missing");
+    const int before_launch = main_window_count(app);
+    app.open_files({gone});
+    flush_ui();
+    expect(main_window_count(app) == before_launch,
+           "second launch does not open another window for a deleted file");
+    expect(w.buffer()->get_text() == "please-keep-me",
+           "second launch keeps the deleted file's text");
+    app.destroy_window_now(other);
+
+    // A changed mtime on a clean buffer is not an unsaved edit. Close must
+    // not write the older text over the file.
+    const std::string notes = dir + "/round4-notes.txt";
+    write_bytes(notes, "version-one");
+    expect(w.open_file(notes), "open notes");
+    write_bytes(notes, "version-two");
+    bump_mtime(notes);
+    w.last_prompt_primary_.clear();
+    expect(w.confirm_discard_or_save(),
+           "close does not ask when a clean file is newer on disk");
+    expect(w.last_prompt_primary_.empty(),
+           "a newer clean file does not open a save question");
+    expect(w.buffer()->get_text() == "version-one", "close leaves the buffer");
+    expect(read_bytes(notes) == "version-two",
+           "close does not overwrite the newer file");
+    expect(w.open_file(notes), "same window reloads the newer file");
+    expect(w.buffer()->get_text() == "version-two", "same window loaded version-two");
+
+    write_bytes(notes, "version-three");
+    bump_mtime(notes);
+    auto* second = app.create_window();
+    second->present();
+    flush_ui();
+    const int before_second = main_window_count(app);
+    expect(second->open_file(notes), "other window reloads a newer file");
+    expect(main_window_count(app) == before_second,
+           "other window presents the one that has the path");
+    expect(w.buffer()->get_text() == "version-three",
+           "other window loaded version-three");
+    write_bytes(notes, "version-four");
+    bump_mtime(notes);
+    const int before_files = main_window_count(app);
+    app.open_files({notes});
+    flush_ui();
+    expect(main_window_count(app) == before_files,
+           "second launch does not add a window");
+    expect(w.buffer()->get_text() == "version-four",
+           "second launch loaded version-four");
+
+    w.buffer()->insert(w.buffer()->end(), "!");
+    expect(w.dirty_, "edit before a second-window reload");
+    write_bytes(notes, "version-five");
+    bump_mtime(notes);
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(!second->open_file(notes), "other window can cancel a dirty reload");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.buffer()->get_text() == "version-four!", "cancel keeps the dirty buffer");
+    expect(read_bytes(notes) == "version-five", "cancel leaves the newer file");
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    app.open_files({notes});
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.buffer()->get_text() == "version-five",
+           "second launch Don't Save loads the disk copy");
+    expect(read_bytes(notes) == "version-five",
+           "second launch Don't Save does not write");
+    app.destroy_window_now(second);
+
+    // stat failing for a reason other than ENOENT is not "unchanged".
+    if (::geteuid() != 0) {
+      const std::string locked_dir = dir + "/round4-locked";
+      g_mkdir_with_parents(locked_dir.c_str(), 0700);
+      const std::string locked = locked_dir + "/file.txt";
+      write_bytes(locked, "locked-bytes");
+      expect(w.open_file(locked), "open the file that will be unstatable");
+      expect(::chmod(locked_dir.c_str(), 0000) == 0, "hide the parent directory");
+      expect(!w.save_to_path(locked), "a stat error is not a successful save");
+      expect(w.file_unreadable_, "a stat error is remembered");
+      expect(w.last_save_error_.find("Could not read file information") !=
+                 std::string::npos,
+             "a stat error says why");
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+      expect(!w.confirm_discard_or_save(), "close asks when stat fails");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      expect(w.last_prompt_primary_.find("Could not check") != Glib::ustring::npos,
+             "close names the stat failure");
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+      expect(w.on_delete_event(nullptr), "close is refused after a stat error");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      expect(w.get_visible(), "stat error keeps the window");
+      expect(::chmod(locked_dir.c_str(), 0700) == 0, "restore the directory");
+      expect(read_bytes(locked) == "locked-bytes", "stat error does not rewrite");
+    }
+
+    // 6. Reload's follow-up focuses Don't Save. Save writes and says the
+    // reload was cancelled. Don't Save loads the disk copy.
+    write_bytes(notes, "on-disk");
+    bump_mtime(notes);
+    expect(w.open_file(notes), "open for the reload follow-up");
+    w.buffer()->insert(w.buffer()->end(), "-edited");
+    w.refresh_dirty_from_buffer();
+    write_bytes(notes, "from-outside");
+    bump_mtime(notes);
+    g_setenv("LUNDUKE_EDIT_TEST_REPLACE", "reload", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(!w.save_to_path(notes), "reload follow-up can cancel");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.last_prompt_default_ == Gtk::RESPONSE_REJECT,
+           "Don't Save is the default after Reload");
+    expect(w.last_prompt_primary_ == "Save changes before reloading?",
+           "reload follow-up names the reload");
+    expect(w.last_prompt_secondary_.find("cancel the reload") !=
+               Glib::ustring::npos,
+           "reload follow-up explains Save");
+    expect(w.buffer()->get_text() == "on-disk-edited", "cancel keeps the edits");
+    expect(read_bytes(notes) == "from-outside", "cancel leaves disk alone");
+
+    g_setenv("LUNDUKE_EDIT_TEST_REPLACE", "reload", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "save", TRUE);
+    expect(w.save_to_path(notes), "explicit Save from the reload follow-up writes");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(read_bytes(notes) == "on-disk-edited", "Save replaced the disk copy");
+    expect(w.buffer()->get_text() == "on-disk-edited", "Save did not load disk");
+    expect(w.last_notice_.find("Reload cancelled") != std::string::npos,
+           "Save says the reload was cancelled");
+
+    w.buffer()->set_text("still-mine");
+    w.buffer()->set_modified(true);
+    w.refresh_dirty_from_buffer();
+    write_bytes(notes, "from-outside-again");
+    bump_mtime(notes);
+    g_setenv("LUNDUKE_EDIT_TEST_REPLACE", "reload", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    expect(!w.save_to_path(notes), "Don't Save reloads instead of writing");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.buffer()->get_text() == "from-outside-again",
+           "Don't Save shows the disk copy");
+    expect(read_bytes(notes) == "from-outside-again", "Don't Save leaves the file");
+    expect(!w.dirty_, "Don't Save leaves a clean buffer");
+
+    // 4. Find Next scope after Search Selection Only, with and without wrap,
+    // with no selection, with a wider selection, and with Extend.
+    w.buffer()->set_text("one two one two");
+    w.find_opts_ = FindOptions{};
+    w.find_opts_.search_for = "one";
+    w.find_opts_.search_selection_only = true;
+    w.find_opts_.extend_selection = true;
+    w.find_opts_.wrap_around = true;
+    w.find_opts_.start_at_top = true;
+    w.buffer()->select_range(w.buffer()->begin(), w.buffer()->end());
+    w.pin_selection_only_range();
+    // The first Find selects the match itself. Extend is on in the dialog
+    // and must turn off when the dialog closes, without changing that hit.
+    w.find_opts_.extend_selection = false;
+    expect(w.find_match(w.find_opts_, false), "find the first one");
+    expect(selection_offset(w) == 0 && selection_text(w) == "one",
+           "the first one is selected");
+    w.find_opts_.extend_selection = true;
+    w.on_find_dialog_hidden();
+    expect(!w.find_opts_.extend_selection, "closing Find turns Extend off");
+    expect(w.find_opts_.search_selection_only,
+           "Search Selection Only stays on after Find closes");
+    expect(!w.sel_only_range_valid_, "closing Find drops the hidden pin");
+    w.last_notice_.clear();
+    w.on_find_next();
+    expect(selection_offset(w) == 8 && selection_text(w) == "one",
+           "Find Next leaves the match it just found");
+    expect(w.last_notice_.empty(), "wrap-on Find Next does not say not found");
+
+    w.find_opts_.wrap_around = false;
+    w.last_notice_.clear();
+    w.on_find_next();
+    expect(w.last_notice_ == "Text not found.",
+           "wrap-off Find Next does not wrap to the first one");
+    expect(selection_offset(w) == 8, "a miss leaves the current match");
+
+    w.find_opts_.wrap_around = true;
+    w.last_notice_.clear();
+    w.on_find_next();
+    expect(selection_offset(w) == 0 && selection_text(w) == "one",
+           "wrap-on Find Next from the last hit finds the first");
+    expect(w.last_notice_.empty(), "wrapping Find Next does not say not found");
+
+    w.buffer()->place_cursor(w.buffer()->end());
+    w.last_notice_.clear();
+    w.on_find_next();
+    expect(w.last_notice_ == "No text is selected.",
+           "Find Next with no selection says so");
+    expect(selection_text(w).empty(), "no selection is not widened");
+
+    w.buffer()->select_range(w.buffer()->get_iter_at_offset(4),
+                             w.buffer()->get_iter_at_offset(7));
+    expect(selection_text(w) == "two", "wider selection is two");
+    w.last_notice_.clear();
+    w.on_find_next();
+    expect(w.last_notice_ == "Text not found.",
+           "a selection that is not the last match is searched on its own");
+    expect(selection_text(w) == "two", "that search does not jump outside");
+
+    w.buffer()->select_range(w.buffer()->get_iter_at_offset(4),
+                             w.buffer()->get_iter_at_offset(11));
+    expect(selection_text(w) == "two one", "selection covers the second one");
+    w.last_notice_.clear();
+    w.on_find_next();
+    expect(selection_offset(w) == 8 && selection_text(w) == "one",
+           "Find Next stays inside the wider selection");
+
+    w.find_opts_.search_selection_only = false;
+    w.buffer()->select_range(w.buffer()->get_iter_at_offset(4),
+                             w.buffer()->get_iter_at_offset(7));
+    w.last_notice_.clear();
+    w.on_find_next();
+    expect(selection_offset(w) == 8 && selection_text(w) == "one",
+           "Find Next without Search Selection Only uses the whole buffer");
+
+    w.find_opts_.extend_selection = true;
+    w.find_opts_.wrap_around = false;
+    w.find_opts_.search_selection_only = false;
+    w.buffer()->select_range(w.buffer()->begin(),
+                             w.buffer()->get_iter_at_offset(3));
+    expect(w.find_match(w.find_opts_, true), "extend reaches the next one");
+    expect(selection_text(w) == "one two one", "extend grows past the needle");
+    w.on_find_dialog_hidden();
+    expect(!w.find_opts_.extend_selection, "hide clears extend again");
+    w.last_notice_.clear();
+    w.on_find_next();
+    expect(selection_text(w) == "one",
+           "Find Next after hide selects the needle and does not keep growing");
+    expect(selection_text(w).size() == 3, "the hit is the needle, not the grown span");
+    w.find_opts_.search_selection_only = false;
+    w.find_opts_.extend_selection = false;
+
+    // 5. One middle-click gesture pastes once: single, double, and triple,
+    // including a triple whose third press is outside the first interval.
+    w.buffer()->set_text("hello world");
+    w.last_middle_paste_time_ = 0;
+    w.text_view_.grab_focus();
+    auto primary = Gtk::Clipboard::get(GDK_SELECTION_PRIMARY);
+    primary->set_text("hello");
+    flush_ui();
+    GdkWindow* text_window = gtk_text_view_get_window(
+        GTK_TEXT_VIEW(w.text_view_.gobj()), GTK_TEXT_WINDOW_TEXT);
+    auto click = [&](GdkEventType type, guint32 when) {
+      GdkEventButton event {};
+      event.type = type;
+      event.button = 2;
+      event.time = when;
+      event.x = 10000;
+      event.y = 8;
+      event.window = text_window;
+      if (type == GDK_BUTTON_RELEASE) {
+        expect(w.on_text_button_release(&event), "middle release is swallowed");
+      } else {
+        expect(w.on_text_button_press(&event), "middle press is handled");
+      }
+    };
+    click(GDK_BUTTON_PRESS, 5000);
+    click(GDK_BUTTON_RELEASE, 5010);
+    expect(w.buffer()->get_text() == "hello worldhello",
+           "a single middle-click pastes once");
+    click(GDK_BUTTON_PRESS, 6000);
+    click(GDK_BUTTON_RELEASE, 6010);
+    click(GDK_BUTTON_PRESS, 6200);
+    click(GDK_2BUTTON_PRESS, 6200);
+    click(GDK_BUTTON_RELEASE, 6210);
+    expect(w.buffer()->get_text() == "hello worldhellohello",
+           "a middle-button double-click pastes once");
+    click(GDK_BUTTON_PRESS, 8000);
+    click(GDK_BUTTON_RELEASE, 8010);
+    click(GDK_BUTTON_PRESS, 8390);
+    click(GDK_2BUTTON_PRESS, 8390);
+    click(GDK_BUTTON_RELEASE, 8400);
+    click(GDK_BUTTON_PRESS, 8780);
+    click(GDK_3BUTTON_PRESS, 8780);
+    click(GDK_BUTTON_RELEASE, 8790);
+    expect(w.buffer()->get_text() == "hello worldhellohellohello",
+           "a middle-button triple-click pastes once");
+    click(GDK_BUTTON_PRESS, 10000);
+    click(GDK_BUTTON_RELEASE, 10010);
+    expect(w.buffer()->get_text() == "hello worldhellohellohellohello",
+           "a later single middle-click pastes again");
+    click(GDK_2BUTTON_PRESS, 12000);
+    click(GDK_BUTTON_RELEASE, 12010);
+    expect(w.buffer()->get_text() == "hello worldhellohellohellohello",
+           "a double-press or a release on its own does not paste");
+    w.last_middle_paste_time_ = 0;
+    GdkEventButton zero {};
+    zero.type = GDK_BUTTON_PRESS;
+    zero.button = 2;
+    zero.time = 0;
+    zero.x = 10000;
+    zero.y = 8;
+    zero.window = text_window;
+    expect(w.on_text_button_press(&zero), "time 0 press is handled");
+    expect(w.on_text_button_press(&zero), "another time 0 press is handled");
+    expect(w.buffer()->get_text() == "hello worldhellohellohellohellohellohello",
+           "presses with no timestamp each paste once");
+
+    // 7. Ordinary lines stay inside the page. Three short lines stay one page.
+    const Pango::FontDescription previous_font = w.font_desc_;
+    const bool previous_chosen = w.font_user_chosen_;
+    w.apply_font(Pango::FontDescription("Sans 18"), false);
+    std::string lines;
+    for (int i = 0; i < 80; ++i) {
+      lines += "hello world\n";
+    }
+    w.buffer()->set_text(lines);
+    double page_height = 0.0;
+    const std::string pdf = dir + "/round4-lines.pdf";
+    ::unlink(pdf.c_str());
+    auto op = Gtk::PrintOperation::create();
+    op->set_export_filename(pdf);
+    op->signal_begin_print().connect(
+        [&](const Glib::RefPtr<Gtk::PrintContext>& context) {
+          page_height = context->get_height();
+          w.on_begin_print(context);
+          op->set_n_pages(static_cast<int>(w.print_page_breaks_.size()) + 1);
+        });
+    op->signal_draw_page().connect(
+        [&](const Glib::RefPtr<Gtk::PrintContext>& context, int page) {
+          w.on_draw_page(context, page);
+        });
+    bool printed = false;
+    try {
+      printed = op->run(Gtk::PRINT_OPERATION_ACTION_EXPORT, w) ==
+                Gtk::PRINT_OPERATION_RESULT_APPLY;
+    } catch (const Gtk::PrintError&) {
+      printed = false;
+    }
+    expect(printed, "ordinary-line print exports");
+    expect(w.print_pages_.size() > 1, "ordinary lines fill more than one page");
+    std::string fit_why;
+    expect(page_inside(w, page_height, fit_why), fit_why.c_str());
+    double tallest = 0.0;
+    for (std::size_t i = 0; i < w.print_pages_.size(); ++i) {
+      tallest = std::max(tallest, printed_page_height(w, i));
+    }
+    std::cout << "print-pages=" << w.print_pages_.size()
+              << " page-height=" << page_height
+              << " tallest=" << tallest << "\n";
+    if (!w.print_pages_.empty() && w.print_pages_[0].slices.empty() == false &&
+        w.print_pages_[0].slices[0].layout) {
+      const auto printed_font =
+          w.print_pages_[0].slices[0].layout->get_font_description();
+      expect(printed_font.get_family() == "Sans", "print uses the Sans face");
+    }
+
+    w.buffer()->set_text("one\ntwo\nthree\n");
+    page_height = 0.0;
+    const std::string short_pdf = dir + "/round4-short.pdf";
+    ::unlink(short_pdf.c_str());
+    auto short_op = Gtk::PrintOperation::create();
+    short_op->set_export_filename(short_pdf);
+    short_op->signal_begin_print().connect(
+        [&](const Glib::RefPtr<Gtk::PrintContext>& context) {
+          page_height = context->get_height();
+          w.on_begin_print(context);
+          short_op->set_n_pages(static_cast<int>(w.print_page_breaks_.size()) + 1);
+        });
+    short_op->signal_draw_page().connect(
+        [&](const Glib::RefPtr<Gtk::PrintContext>& context, int page) {
+          w.on_draw_page(context, page);
+        });
+    try {
+      short_op->run(Gtk::PRINT_OPERATION_ACTION_EXPORT, w);
+    } catch (const Gtk::PrintError&) {
+    }
+    expect(w.print_pages_.size() == 1, "three short lines stay on one page");
+    std::string short_why;
+    expect(page_inside(w, page_height, short_why), short_why.c_str());
+
+    // 2. The face and size on screen, for the startup default and Sans 24.
+    expect(startup_face.height >= 14 && startup_face.height <= 24,
+           "default line height is about 11 pt");
+    expect(startup_face.family.find("ono") != std::string::npos,
+           "default family is monospace");
+    expect(startup_face.i_width > 0 && startup_face.i_width == startup_face.w_width,
+           "default i and W have the same width");
+    std::cout << "font-yrange default=" << startup_face.height
+              << " family=" << startup_face.family
+              << " i=" << startup_face.i_width << " W=" << startup_face.w_width
+              << "\n";
+
+    w.apply_font(Pango::FontDescription("Sans 24"), true);
+    flush_ui();
+    const LaidOutFace sans = measure_face(w);
+    std::cout << "font-yrange sans24=" << sans.height
+              << " family=" << sans.family
+              << " i=" << sans.i_width << " W=" << sans.w_width << "\n";
+    expect(sans.height >= startup_face.height * 2, "Sans 24 lines are taller");
+    expect(sans.height >= 36, "Sans 24 line height grew");
+    expect(sans.family.find("Sans") != std::string::npos ||
+               sans.family.find("sans") != std::string::npos,
+           "Sans stays the editing family");
+    expect(sans.w_width > sans.i_width, "Sans makes W wider than i");
+    expect(!w.text_view_.get_monospace(),
+           "a chosen proportional face is not forced monospace");
+    const std::string font_path = font_config_path();
+    expect(!font_path.empty() && read_bytes(font_path).find("Sans") != std::string::npos,
+           "the chosen face is saved");
+
+    auto* font_window = app.create_window();
+    font_window->present();
+    flush_ui();
+    const LaidOutFace second_face = measure_face(*font_window);
+    expect(second_face.height == sans.height, "a new window uses the same line height");
+    expect(second_face.family == sans.family, "a new window uses the same family");
+    app.destroy_window_now(font_window);
+
+    {
+      // A second Application is a new launch: it reads the saved face
+      // before any window exists. Creating that window needs startup,
+      // which this unregistered app cannot run beside the test app.
+      // The new window above already laid the saved face out; this checks
+      // that the next launch loads the same description.
+      auto relaunch = Application::create();
+      expect(relaunch->font_chosen(), "a saved face counts as chosen");
+      expect(relaunch->font().find("Sans") != std::string::npos,
+             "a new launch loads the Sans face");
+      expect(relaunch->font().find("24") != std::string::npos,
+             "a new launch loads the 24 pt size");
+    }
+
+    w.buffer()->set_text("Ag");
+    flush_ui();
+    const std::string font_pdf = dir + "/round4-font.pdf";
+    ::unlink(font_pdf.c_str());
+    auto font_op = Gtk::PrintOperation::create();
+    font_op->set_export_filename(font_pdf);
+    font_op->signal_begin_print().connect(
+        [&](const Glib::RefPtr<Gtk::PrintContext>& context) {
+          w.on_begin_print(context);
+          font_op->set_n_pages(1);
+        });
+    font_op->signal_draw_page().connect(
+        [&](const Glib::RefPtr<Gtk::PrintContext>& context, int page) {
+          w.on_draw_page(context, page);
+        });
+    try {
+      font_op->run(Gtk::PRINT_OPERATION_ACTION_EXPORT, w);
+    } catch (const Gtk::PrintError&) {
+    }
+    expect(!w.print_pages_.empty() && !w.print_pages_[0].slices.empty() &&
+               w.print_pages_[0].slices[0].layout &&
+               w.print_pages_[0].slices[0].layout->get_font_description()
+                       .get_family()
+                       .find("Sans") != std::string::npos,
+           "print uses the face chosen in Text → Font");
+    expect(w.font_desc_.to_string().find("Sans") != std::string::npos &&
+               w.font_desc_.get_size() >= 24 * Pango::SCALE,
+           "the print description is Sans 24");
+
+    w.apply_font(previous_font, previous_chosen);
+    if (!font_path.empty()) {
+      ::unlink(font_path.c_str());
+    }
+
+    w.find_opts_.search_selection_only = false;
+    w.find_opts_.extend_selection = false;
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+  }
+
   static int run() {
     failures = 0;
     g_setenv("LUNDUKE_EDIT_TEST", "1", TRUE);
@@ -1792,11 +2396,22 @@ struct EditChecks {
     const std::string dir = "/tmp/lunduke-edit-tests";
     g_mkdir_with_parents(dir.c_str(), 0700);
 
+    // A face left by an earlier run must not become this process's default.
+    const std::string font_path = font_config_path();
+    std::string saved_font;
+    if (!font_path.empty()) {
+      saved_font = read_bytes(font_path);
+      ::unlink(font_path.c_str());
+    }
+
     auto app = Application::create();
     expect(app->register_application(), "register application");
     auto* w = app->create_window();
     w->present();
     flush_ui();
+    const LaidOutFace startup_face = measure_face(*w);
+    expect(w->text_view_.get_monospace(),
+           "the default face keeps the monospace style");
 
     test_columns_and_gutter(*w);
     test_save_open_undo(*w, dir);
@@ -1805,6 +2420,15 @@ struct EditChecks {
     test_review_fixes(*app.get(), *w, dir);
     test_hostile_review(*app.get(), *w, dir);
     test_round3(*app.get(), *w, dir);
+    test_round4(*app.get(), *w, dir, startup_face);
+
+    if (!font_path.empty()) {
+      if (saved_font.empty()) {
+        ::unlink(font_path.c_str());
+      } else {
+        write_bytes(font_path, saved_font);
+      }
+    }
 
     g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
