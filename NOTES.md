@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9-7_amd64.deb
+# → packaging/debs/lunduke-edit_0.9-8_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,12 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9-8
+
+- **Tests**: `LUNDUKE_EDIT_TEST_*` hooks compile only into the behaviour-test executable, behind `-DLUNDUKE_EDIT_TEST_HOOKS` (PR #12). The shipped binary does not include them.
+- **Build**: the production-binary check fails the build if those strings or `/workspace` appear in the shipped binary.
+- App / Meson / About stay **0.9**. Debian package **0.9-8**.
 
 ## 0.9-7
 

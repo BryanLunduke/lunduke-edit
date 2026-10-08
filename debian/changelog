@@ -1,3 +1,13 @@
+lunduke-edit (0.9-8) unstable; urgency=medium
+
+  * All LUNDUKE_EDIT_TEST_* test hooks are behind
+    -DLUNDUKE_EDIT_TEST_HOOKS, so they compile only into the
+    behaviour-test executable (PR #12).
+  * A production-binary check fails the build if those strings or
+    /workspace appear in the shipped binary.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 19:30:00 +0000
+
 lunduke-edit (0.9-7) unstable; urgency=medium
 
   * After a stat failure, Enter runs Save As. The question no longer
