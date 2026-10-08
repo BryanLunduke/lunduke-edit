@@ -91,8 +91,7 @@ void LineGutter::update_width() {
   }
 
   auto layout = create_pango_layout("0");
-  auto desc = text_view_.get_style_context()->get_font(
-      text_view_.get_style_context()->get_state());
+  auto desc = editor_font();
   layout->set_font_description(desc);
   int tw = 0, th = 0;
   layout->get_pixel_size(tw, th);
@@ -131,8 +130,7 @@ bool LineGutter::on_draw(const Cairo::RefPtr<Cairo::Context>& cr) {
                                   visible_rect.get_y());
   start.set_line_offset(0);
 
-  auto font_desc = text_view_.get_style_context()->get_font(
-      text_view_.get_style_context()->get_state());
+  auto font_desc = editor_font();
 
   cr->set_source_rgb(0.35, 0.35, 0.40);
 
@@ -183,6 +181,23 @@ bool LineGutter::on_draw(const Cairo::RefPtr<Cairo::Context>& cr) {
 
   (void)scroll_y;
   return true;
+}
+
+Pango::FontDescription LineGutter::editor_font() const {
+  // The editing face is a tag on the buffer. The style context stays on
+  // the theme size after the view has been realized, so line numbers would
+  // otherwise keep the startup font.
+  auto buf = text_view_.get_buffer();
+  if (buf) {
+    if (auto tag = buf->get_tag_table()->lookup("lunduke-editor-font")) {
+      const auto desc = tag->property_font_desc().get_value();
+      if (!desc.get_family().empty() && desc.get_size() > 0) {
+        return desc;
+      }
+    }
+  }
+  auto ctx = text_view_.get_style_context();
+  return ctx->get_font(ctx->get_state());
 }
 
 }  // namespace lundukeedit

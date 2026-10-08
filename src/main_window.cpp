@@ -21,6 +21,7 @@
 #include <gtkmm/printoperation.h>
 #include <gtkmm/printsettings.h>
 #include <gtkmm/radiobutton.h>
+#include <gtkmm/settings.h>
 #include <gtkmm/stock.h>
 #include <gtkmm/stylecontext.h>
 
@@ -822,23 +823,82 @@ std::string apply_line_endings(const std::string& encoded_lf,
   return out;
 }
 
-bool file_identity_changed(const std::string& path, const std::string& loaded,
-                           bool have_id, std::uint64_t dev, std::uint64_t ino,
-                           std::int64_t sec, std::int64_t nsec) {
+enum class DiskIdentity { Unchanged, Changed, Missing, Error };
+
+struct DiskCheck {
+  DiskIdentity kind{DiskIdentity::Unchanged};
+  std::string message;
+};
+
+// Compares the path this window loaded with the file that is there now.
+// ENOENT is Missing (the buffer may be the only copy). Any other stat
+// failure is Error. Both used to look like "unchanged", so a clean close
+// dropped the text and a clean save reported success without writing.
+DiskCheck file_on_disk(const std::string& path, const std::string& loaded,
+                       bool have_id, std::uint64_t dev, std::uint64_t ino,
+                       std::int64_t sec, std::int64_t nsec) {
+  DiskCheck out;
   if (!have_id || loaded.empty()) {
-    return false;
+    return out;
   }
   if (canonical_path(path) != canonical_path(loaded)) {
-    return false;
+    return out;
   }
   struct stat st {};
   if (::stat(path.c_str(), &st) != 0) {
-    return false;
+    if (errno == ENOENT) {
+      out.kind = DiskIdentity::Missing;
+      out.message = "This file was deleted.";
+      return out;
+    }
+    out.kind = DiskIdentity::Error;
+    out.message =
+        std::string("Could not read file information: ") + std::strerror(errno);
+    return out;
   }
-  return static_cast<std::uint64_t>(st.st_dev) != dev ||
-         static_cast<std::uint64_t>(st.st_ino) != ino ||
-         static_cast<std::int64_t>(st.st_mtim.tv_sec) != sec ||
-         static_cast<std::int64_t>(st.st_mtim.tv_nsec) != nsec;
+  if (static_cast<std::uint64_t>(st.st_dev) != dev ||
+      static_cast<std::uint64_t>(st.st_ino) != ino ||
+      static_cast<std::int64_t>(st.st_mtim.tv_sec) != sec ||
+      static_cast<std::int64_t>(st.st_mtim.tv_nsec) != nsec) {
+    out.kind = DiskIdentity::Changed;
+  }
+  return out;
+}
+
+std::string css_font_family(const std::string& family) {
+  std::string out;
+  out.reserve(family.size());
+  for (const char c : family) {
+    if (c == '\\' || c == '"') {
+      out.push_back('\\');
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+
+// GtkTextView reads its layout font from the textview style node. The
+// text child is the node that paints the glyphs. Both have to carry the
+// face, or a theme rule on one of them wins.
+std::string editor_font_css(const Pango::FontDescription& desc) {
+  std::string family = desc.get_family();
+  if (family.empty()) {
+    family = "Monospace";
+  }
+  double points = 11.0;
+  if (desc.get_size() > 0) {
+    points = static_cast<double>(desc.get_size()) / Pango::SCALE;
+    if (desc.get_size_is_absolute()) {
+      points = points * 72.0 / 96.0;
+    }
+  }
+  if (points < 1.0) {
+    points = 11.0;
+  }
+  const int whole = static_cast<int>(std::lround(points));
+  return "textview, textview text {\n  font-family: \"" +
+         css_font_family(family) + "\";\n  font-size: " +
+         std::to_string(whole) + "pt;\n}\n";
 }
 
 template <typename Dialog>
@@ -940,17 +1000,21 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   // text we need to measure. Run these before the default handlers.
   buf->signal_insert().connect(
       sigc::mem_fun(*this, &MainWindow::on_text_inserted), false);
+  buf->signal_insert().connect(
+      sigc::mem_fun(*this, &MainWindow::on_font_tag_inserted), true);
   buf->signal_erase().connect(
       sigc::mem_fun(*this, &MainWindow::on_text_erased), false);
 
   build_ui();
   build_menus();
-  apply_font(font_desc_);
+  // Before the window is shown the CSS font is what the first layout uses.
+  // apply_font also tags the buffer so a later Text → Font still changes
+  // the line height after realize, which CSS alone does not.
+  apply_font(font_desc_, app_.font_chosen());
   apply_tab_width(tab_width_);
 
   text_view_.set_wrap_mode(app_.wrap_text() ? Gtk::WRAP_WORD_CHAR
                                             : Gtk::WRAP_NONE);
-  text_view_.set_monospace(true);
   text_view_.set_accepts_tab(true);
   text_view_.set_left_margin(4);
   text_view_.set_right_margin(4);
@@ -1447,6 +1511,8 @@ void MainWindow::load_seed_sample() {
   loaded_text_.clear();
   loaded_bytes_valid_ = false;
   have_file_id_ = false;
+  file_missing_ = false;
+  file_unreadable_ = false;
   note_loaded_text("");
   set_dirty(false);
   seeding_ = false;
@@ -1498,7 +1564,10 @@ bool MainWindow::open_file(const std::string& path,
   if (MainWindow* other = app_.find_window_editing(path)) {
     if (other != this) {
       other->present();
-      return false;
+      // The discard prompt File → Open already showed was for this window.
+      // The window that has the path still has to ask if its own buffer
+      // is dirty, then re-read when the inode or mtime changed.
+      return other->open_file(path, false);
     }
     present();
     opening_ = true;
@@ -1518,9 +1587,24 @@ bool MainWindow::open_file(const std::string& path,
 
 bool MainWindow::reopen_same_path(const std::string& path,
                                   bool discard_already_confirmed) {
-  const bool changed = file_identity_changed(
-      path, file_path_, have_file_id_, file_dev_, file_ino_, file_mtime_sec_,
-      file_mtime_nsec_);
+  const DiskCheck disk = file_on_disk(path, file_path_, have_file_id_, file_dev_,
+                                      file_ino_, file_mtime_sec_,
+                                      file_mtime_nsec_);
+  if (disk.kind == DiskIdentity::Error) {
+    last_open_error_ = disk.message;
+    report_error("Could not check the file on disk.", disk.message);
+    return false;
+  }
+  if (disk.kind == DiskIdentity::Missing) {
+    // Re-reading cannot succeed. Keep the buffer and mark it so Close asks.
+    file_missing_ = true;
+    file_unreadable_ = false;
+    set_dirty(true);
+    last_open_error_ = disk.message;
+    report_error("This file was deleted.", path);
+    return false;
+  }
+  const bool changed = disk.kind == DiskIdentity::Changed;
   // Unchanged on disk and the buffer is the loaded text: just show it.
   if (!changed && !dirty_) {
     return true;
@@ -1536,9 +1620,10 @@ bool MainWindow::reopen_same_path(const std::string& path,
     }
     // Save wrote this buffer. If that brought the file back in sync, stop.
     // A failed save returns false from confirm_discard_or_save.
-    if (!dirty_ && !file_identity_changed(path, file_path_, have_file_id_,
-                                          file_dev_, file_ino_,
-                                          file_mtime_sec_, file_mtime_nsec_)) {
+    const DiskCheck again =
+        file_on_disk(path, file_path_, have_file_id_, file_dev_, file_ino_,
+                     file_mtime_sec_, file_mtime_nsec_);
+    if (!dirty_ && again.kind == DiskIdentity::Unchanged) {
       return true;
     }
   }
@@ -1697,8 +1782,11 @@ bool MainWindow::open_file_body(const std::string& path) {
   // document; a save rebuilds the lines without clearing undo.
   clear_ending_history();
   remember_file_identity(path);
+  file_missing_ = false;
+  file_unreadable_ = false;
   set_dirty(false);
   seeding_ = false;
+  apply_editor_font_tag();
   sync_encoding_radios();
   if (long_line) {
     force_wrap_off();
@@ -1739,6 +1827,7 @@ void MainWindow::restore_buffer_after_failed_load(
   newline_style_ = previous_newlines;
   note_loaded_text(previous_text);
   seeding_ = false;
+  apply_editor_font_tag();
 }
 
 Glib::ustring MainWindow::current_basename() const {
@@ -1926,7 +2015,28 @@ void MainWindow::refresh_dirty_from_buffer() {
   }
   auto buf = buffer();
   const bool text_dirty = buf && buf->get_modified();
-  set_dirty(text_dirty || encoding_dirty_);
+  set_dirty(text_dirty || encoding_dirty_ || file_missing_ || file_unreadable_);
+}
+
+void MainWindow::refresh_disk_flags() {
+  file_missing_ = false;
+  file_unreadable_ = false;
+  if (file_path_.empty() || !have_file_id_) {
+    refresh_dirty_from_buffer();
+    return;
+  }
+  const DiskCheck disk =
+      file_on_disk(file_path_, file_path_, have_file_id_, file_dev_, file_ino_,
+                   file_mtime_sec_, file_mtime_nsec_);
+  if (disk.kind == DiskIdentity::Missing) {
+    file_missing_ = true;
+    last_notice_ = disk.message;
+  } else if (disk.kind == DiskIdentity::Error) {
+    file_unreadable_ = true;
+    last_notice_ = disk.message;
+    report_error("Could not check the file on disk.", disk.message);
+  }
+  refresh_dirty_from_buffer();
 }
 
 int MainWindow::display_column_at(const Gtk::TextIter& iter) const {
@@ -1969,10 +2079,52 @@ void MainWindow::on_cursor_moved(
   }
 }
 
-bool MainWindow::confirm_discard_or_save() {
-  if (!dirty_) {
+bool MainWindow::confirm_discard_or_save(DiscardKind kind) {
+  if (kind == DiscardKind::Continue) {
+    refresh_disk_flags();
+  }
+  const bool ask = dirty_ || file_missing_ || file_unreadable_;
+  if (kind == DiscardKind::ReloadDisk) {
+    if (!dirty_) {
+      return true;
+    }
+  } else if (!ask) {
     return true;
   }
+
+  Glib::ustring primary;
+  Glib::ustring secondary;
+  int default_response = Gtk::RESPONSE_ACCEPT;
+  if (kind == DiscardKind::ReloadDisk) {
+    // Don't Save is the focused button. Enter must load the disk copy.
+    // Save is still available, and the text says it replaces the file
+    // and cancels the reload.
+    primary = "Save changes before reloading?";
+    secondary =
+        "Saving will replace the file on disk and cancel the reload. "
+        "Don't Save drops the edits in this window and loads the copy "
+        "on disk.";
+    default_response = Gtk::RESPONSE_REJECT;
+  } else if (file_missing_) {
+    primary = "This file was deleted.";
+    secondary = "\"" + current_basename() +
+                "\" is no longer on disk. Save it again?";
+    default_response = Gtk::RESPONSE_ACCEPT;
+  } else if (file_unreadable_) {
+    primary = "Could not check the file on disk.";
+    secondary = last_notice_.empty()
+                    ? Glib::ustring("Save the text in this window before continuing?")
+                    : Glib::ustring(last_notice_ + "\nSave the text in this window before continuing?");
+    default_response = Gtk::RESPONSE_ACCEPT;
+  } else {
+    primary = "Save changes before continuing?";
+    secondary = "\"" + current_basename() + "\" has unsaved changes.";
+    default_response = Gtk::RESPONSE_ACCEPT;
+  }
+  last_prompt_primary_ = primary;
+  last_prompt_secondary_ = secondary;
+  last_prompt_default_ = default_response;
+
   // Tests set this so a modal dialog does not block. Unset in normal use.
   const char* choice = nullptr;
   if (test_discard_choice_) {
@@ -1992,14 +2144,13 @@ bool MainWindow::confirm_discard_or_save() {
       return save_document();
     }
   }
-  Gtk::MessageDialog dlg(*this, "Save changes before continuing?", false,
-                         Gtk::MESSAGE_QUESTION, Gtk::BUTTONS_NONE, true);
-  dlg.set_secondary_text("\"" + current_basename() +
-                         "\" has unsaved changes.");
+  Gtk::MessageDialog dlg(*this, primary, false, Gtk::MESSAGE_QUESTION,
+                         Gtk::BUTTONS_NONE, true);
+  dlg.set_secondary_text(secondary);
   dlg.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
   dlg.add_button("_Don't Save", Gtk::RESPONSE_REJECT);
   dlg.add_button("_Save", Gtk::RESPONSE_ACCEPT);
-  dlg.set_default_response(Gtk::RESPONSE_ACCEPT);
+  dlg.set_default_response(default_response);
   const int resp = run_modal(app_, dlg);
   if (resp == Gtk::RESPONSE_CANCEL || resp == Gtk::RESPONSE_DELETE_EVENT) {
     return false;
@@ -2034,9 +2185,12 @@ void MainWindow::on_new() {
   loaded_text_.clear();
   loaded_bytes_valid_ = false;
   have_file_id_ = false;
+  file_missing_ = false;
+  file_unreadable_ = false;
   note_loaded_text("");
   set_dirty(false);
   seeding_ = false;
+  apply_editor_font_tag();
   sync_encoding_radios();
   maybe_restore_wrap();
   update_title();
@@ -2081,25 +2235,43 @@ void MainWindow::on_open_recent(const std::string& path) {
 bool MainWindow::save_to_path(const std::string& path) {
   const bool same_loaded =
       !file_path_.empty() && canonical_path(path) == canonical_path(file_path_);
-  const bool disk_changed = file_identity_changed(
-      path, file_path_, have_file_id_, file_dev_, file_ino_, file_mtime_sec_,
-      file_mtime_nsec_);
-  if (disk_changed && !force_replace_) {
+  DiskCheck disk;
+  if (same_loaded) {
+    disk = file_on_disk(path, file_path_, have_file_id_, file_dev_, file_ino_,
+                        file_mtime_sec_, file_mtime_nsec_);
+  }
+  if (same_loaded && disk.kind == DiskIdentity::Error && !force_replace_) {
+    last_save_error_ = disk.message;
+    file_unreadable_ = true;
+    set_dirty(true);
+    report_error("Could not check the file on disk.", disk.message);
+    return false;
+  }
+  if (same_loaded && disk.kind == DiskIdentity::Missing) {
+    file_missing_ = true;
+    set_dirty(true);
+  }
+  if (disk.kind == DiskIdentity::Changed && !force_replace_) {
     const DiskChangeChoice choice = confirm_file_changed(path);
     if (choice == DiskChangeChoice::Cancel) {
       return false;
     }
     if (choice == DiskChangeChoice::Reload) {
-      // Save on the unsaved-changes prompt writes this buffer anyway
-      // (force_replace_ skips the dialog). Don't Save re-reads the file.
+      // Don't Save is the default and re-reads the file. Save writes this
+      // buffer (force_replace_ skips a second disk dialog) and does not
+      // load the copy the user asked to reload. The question says so.
       if (dirty_) {
         force_replace_ = true;
-        const bool proceed = confirm_discard_or_save();
+        const bool proceed =
+            confirm_discard_or_save(DiscardKind::ReloadDisk);
         force_replace_ = false;
         if (!proceed) {
           return false;
         }
         if (!dirty_) {
+          last_notice_ =
+              "Reload cancelled. The file on disk was replaced with the "
+              "text in this window.";
           return true;
         }
       }
@@ -2109,7 +2281,10 @@ bool MainWindow::save_to_path(const std::string& path) {
   }
   // A clean buffer whose encoding and newline style still match the load
   // is already the file. Rewriting would drop xattrs and bump mtime.
-  if (!dirty_ && same_loaded && !disk_changed && encoding_ == saved_encoding_ &&
+  // A deleted file is not "already the file": the buffer has to be written
+  // back even when the text was not edited.
+  if (!dirty_ && !file_missing_ && same_loaded &&
+      disk.kind == DiskIdentity::Unchanged && encoding_ == saved_encoding_ &&
       newline_style_ == saved_newline_style_) {
     remember_recent(path);
     return true;
@@ -2169,6 +2344,8 @@ bool MainWindow::save_to_path(const std::string& path) {
     remember_source_lines(text, kinds);
   }
   remember_file_identity(path);
+  file_missing_ = false;
+  file_unreadable_ = false;
   // Records an undo save point so undo/redo back to this text clears
   // the buffer's modified flag.
   buffer()->set_modified(false);
@@ -2432,6 +2609,31 @@ void MainWindow::handle_paste_clipboard(GtkTextView* view) {
 bool MainWindow::on_text_button_press(GdkEventButton* event) {
   if (event == nullptr || event->button != 2) {
     return false;
+  }
+  // A double-click is press, release, press, 2BUTTON_PRESS, release.
+  // A triple-click adds another press and 3BUTTON_PRESS. Only the first
+  // press inserts. Later presses in the same gesture do not, including a
+  // third press that is still within the double-click time of the second.
+  if (event->type != GDK_BUTTON_PRESS) {
+    return true;
+  }
+  guint double_time = 400;
+  if (auto settings = Gtk::Settings::get_default()) {
+    const int configured = settings->property_gtk_double_click_time();
+    if (configured > 0) {
+      double_time = static_cast<guint>(configured);
+    }
+  }
+  const bool same_gesture = last_middle_paste_time_ != 0 && event->time != 0 &&
+                            event->time - last_middle_paste_time_ <= double_time;
+  // Remember this press even when it does not insert, so the next press
+  // in a triple-click is measured from it. Time 0 is the test seam that
+  // pastes on every press.
+  if (event->time != 0) {
+    last_middle_paste_time_ = event->time;
+  }
+  if (same_gesture) {
+    return true;
   }
   // GTK pastes the primary selection on middle-button press, at the click.
   // Consume the press so that gesture does not run, then insert once at the
@@ -3152,8 +3354,13 @@ void MainWindow::on_find_dialog_hidden() {
   set_find_count(-1, false);
   // The selection-only range and the extend anchor belong to the dialog
   // that just closed. Find Next must not keep searching that hidden range.
+  // Extend is a dialog mode. It does not stay latched after the dialog
+  // is gone. Search Selection Only stays so F3 can still say when nothing
+  // is selected; a selection that is only the match just found is not
+  // reused as the range.
   clear_selection_only_range();
   clear_extend_anchor();
+  find_opts_.extend_selection = false;
 }
 
 bool MainWindow::confirm_huge_undo(std::size_t bytes) {
@@ -3816,6 +4023,9 @@ void MainWindow::on_find() {
   find_opts_ = dlg.options();
   // After first successful find, clear start_at_top for Find Next.
   find_opts_.start_at_top = false;
+  // options() copies the checkbox, which would turn Extend back on after
+  // the hide handler cleared it.
+  find_opts_.extend_selection = false;
 }
 
 void MainWindow::on_find_next() {
@@ -3825,9 +4035,11 @@ void MainWindow::on_find_next() {
   }
   FindOptions o = find_opts_;
   o.start_at_top = false;
+  o.extend_selection = find_opts_.extend_selection;
   if (o.search_selection_only) {
     // Pin whatever is selected now. A range remembered from the last Find
-    // dialog is not still on screen.
+    // dialog is not still on screen. The match Find just selected is not
+    // a range either: searching only that span finds the same hit again.
     clear_selection_only_range();
     auto buf = text_view_.get_buffer();
     Gtk::TextIter sel_a, sel_b;
@@ -3841,7 +4053,18 @@ void MainWindow::on_find_next() {
       }
       return;
     }
-    pin_selection_only_range();
+    bool last_match_selected = false;
+    if (last_match_valid_ && last_match_start_ && last_match_end_) {
+      const auto match_start = buf->get_iter_at_mark(last_match_start_);
+      const auto match_end = buf->get_iter_at_mark(last_match_end_);
+      last_match_selected = sel_a.compare(match_start) == 0 &&
+                            sel_b.compare(match_end) == 0;
+    }
+    if (last_match_selected) {
+      o.search_selection_only = false;
+    } else {
+      pin_selection_only_range();
+    }
   }
   if (!find_match(o, true)) {
     last_notice_ = "Text not found.";
@@ -3985,10 +4208,82 @@ void MainWindow::on_tab_width() {
   }
 }
 
-void MainWindow::apply_font(const Pango::FontDescription& desc) {
+void MainWindow::install_editor_font(const Pango::FontDescription& desc) {
+  if (!font_css_) {
+    font_css_ = Gtk::CssProvider::create();
+    text_view_.get_style_context()->add_provider(
+        font_css_, GTK_STYLE_PROVIDER_PRIORITY_USER);
+  }
+  font_css_->load_from_data(editor_font_css(desc));
+
+  auto buf = buffer();
+  if (!buf) {
+    return;
+  }
+  if (!font_tag_) {
+    font_tag_ = buf->create_tag("lunduke-editor-font");
+  }
+  font_tag_->property_font_desc() = desc;
+  apply_editor_font_tag();
+}
+
+void MainWindow::apply_editor_font_tag() {
+  if (!font_tag_) {
+    return;
+  }
+  auto buf = buffer();
+  if (!buf || buf->begin() == buf->end()) {
+    return;
+  }
+  const bool modified = buf->get_modified();
+  buf->apply_tag(font_tag_, buf->begin(), buf->end());
+  if (buf->get_modified() != modified) {
+    buf->set_modified(modified);
+  }
+}
+
+void MainWindow::on_font_tag_inserted(const Gtk::TextBuffer::iterator& pos,
+                                     const Glib::ustring& text,
+                                     int /*bytes*/) {
+  if (!font_tag_ || text.empty() || seeding_ || ending_restore_) {
+    return;
+  }
+  auto buf = buffer();
+  if (!buf) {
+    return;
+  }
+  const bool modified = buf->get_modified();
+  const int n = static_cast<int>(text.length());
+  Gtk::TextIter start = pos;
+  Gtk::TextIter end = pos;
+  bool tagged = false;
+  if (end.forward_chars(n) && start.get_text(end) == text) {
+    buf->apply_tag(font_tag_, start, end);
+    tagged = true;
+  }
+  if (!tagged) {
+    start = pos;
+    end = pos;
+    if (start.backward_chars(n)) {
+      buf->apply_tag(font_tag_, start, end);
+    }
+  }
+  if (buf->get_modified() != modified) {
+    buf->set_modified(modified);
+  }
+}
+
+void MainWindow::apply_font(const Pango::FontDescription& desc,
+                            bool user_chosen) {
   font_desc_ = desc;
-  app_.set_font(desc.to_string());
-  text_view_.override_font(desc);
+  font_user_chosen_ = user_chosen;
+  app_.set_font(desc.to_string(), user_chosen);
+  // The monospace style class forces the theme's monospace family. Use it
+  // only when the user has not picked a face. The CSS provider and the
+  // buffer tag carry the actual family and size. override_font does not
+  // change GtkSourceView's layout on GTK 3.24.
+  text_view_.set_monospace(!user_chosen);
+  install_editor_font(desc);
   apply_tab_width(tab_width_);
   if (gutter_) {
     gutter_->refresh();
@@ -3999,7 +4294,7 @@ void MainWindow::on_font() {
   Gtk::FontChooserDialog dlg("Font", *this);
   dlg.set_font_desc(font_desc_);
   if (run_modal(app_, dlg) == Gtk::RESPONSE_OK) {
-    apply_font(dlg.get_font_desc());
+    apply_font(dlg.get_font_desc(), true);
   }
 }
 
@@ -4182,6 +4477,33 @@ void MainWindow::on_begin_print(
     pending.clear();
   };
 
+  // Sum of the line boxes in one layout. That is what draw adds up.
+  // A row measured on its own is a little shorter, and a page of those
+  // rows runs past the bottom.
+  auto block_height = [&](const Glib::ustring& block) -> double {
+    if (block.empty()) {
+      return 0.0;
+    }
+    auto layout = context->create_pango_layout();
+    configure_print_layout(layout, context, width);
+    layout->set_text(block);
+    double height = 0.0;
+    const int n = layout->get_line_count();
+    for (int i = 0; i < n; ++i) {
+      auto line = layout->get_line(i);
+      if (!line) {
+        continue;
+      }
+      Pango::Rectangle line_ink;
+      Pango::Rectangle line_logical;
+      line->get_extents(line_ink, line_logical);
+      const double h =
+          static_cast<double>(line_logical.get_height()) / Pango::SCALE;
+      height += h > 0.0 ? h : line_height;
+    }
+    return height;
+  };
+
   // push the page that just filled. The break is where the next page starts.
   auto close_page = [&](int break_at) {
     flush_pending();
@@ -4237,11 +4559,30 @@ void MainWindow::on_begin_print(
     const bool complex = has_tab || chars >= kLongLineChars || visual_rows > 1;
 
     if (!complex) {
-      if (!page_empty && used + row_height > page_height) {
-        close_page(offset);
+      // Leave a few points, then compare the combined layout before the
+      // page is closed. The per-line probe above still rejects a wrapped
+      // run of wide glyphs.
+      const double kPrintSlack = 4.0;
+      const bool near_end =
+          !page_empty && (used + row_height + kPrintSlack > page_height ||
+                          used > page_height * 0.85);
+      if (near_end) {
+        const double combined = block_height(pending + text);
+        if (combined > page_height) {
+          close_page(offset);
+          pending.append(text);
+          used = row_height;
+        } else {
+          pending.append(text);
+          used = combined;
+        }
+      } else {
+        if (!page_empty && used + row_height > page_height) {
+          close_page(offset);
+        }
+        pending.append(text);
+        used += row_height;
       }
-      pending.append(text);
-      used += row_height;
       page_empty = false;
       offset = chunk_end;
       continue;

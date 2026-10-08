@@ -1,3 +1,23 @@
+lunduke-edit (0.9-5) unstable; urgency=medium
+
+  * A clean file that was deleted on disk is marked unsaved. Close and
+    quit ask before dropping the text, and Save writes the buffer back.
+    A stat failure other than a missing file is reported, and is not
+    treated as an unchanged file.
+  * Text → Font changes the face and the size of the text being edited.
+    The choice is saved and used for printing. With no choice, the
+    editor stays monospace at 11 pt.
+  * Opening a path from another window, or from a second launch, reloads
+    that file when it changed on disk.
+  * Find Next does not stay inside the match Find just selected. Extend
+    Selection turns off when the Find dialog closes.
+  * A middle-button double-click or triple-click pastes once.
+  * After Reload, Don't Save is the default and loads the file on disk.
+    Save says that it replaces the file and cancels the reload.
+  * Ordinary printed lines stay inside the page.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 13:00:00 +0000
+
 lunduke-edit (0.9-4) unstable; urgency=medium
 
   * A file that contains a null byte is refused, and the buffer that was

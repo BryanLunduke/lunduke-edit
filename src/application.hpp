@@ -46,8 +46,11 @@ public:
 
   // Preferences new windows inherit. The open charset is how the next file
   // is decoded; a new document itself always starts as UTF-8.
-  void set_font(const std::string& desc);
+  // persist writes the face so the next launch uses it. The default face
+  // is not persisted.
+  void set_font(const std::string& desc, bool persist = false);
   const std::string& font() const { return font_; }
+  bool font_chosen() const { return font_chosen_; }
   void set_wrap_text(bool on);
   bool wrap_text() const { return wrap_text_; }
   void set_tab_width(int spaces);
@@ -73,6 +76,7 @@ private:
   void open_files(const std::vector<std::string>& paths);
   void drain_deferred_opens();
   void ensure_recents_loaded();
+  void load_font_setting();
   void report_non_native(const std::vector<Glib::ustring>& uris);
   static void install_css();
 
@@ -88,6 +92,8 @@ private:
   static constexpr int kMaxRecents = 8;
 
   std::string font_{"Monospace 11"};
+  // True after Text → Font, including a choice reloaded from disk.
+  bool font_chosen_{false};
   bool wrap_text_{false};
   int tab_width_{4};
   std::string open_charset_{"UTF-8"};

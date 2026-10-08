@@ -5,6 +5,7 @@
 #include <gtkmm/adjustment.h>
 #include <gtkmm/drawingarea.h>
 #include <gtkmm/textview.h>
+#include <pangomm/fontdescription.h>
 
 namespace lundukeedit {
 
@@ -30,6 +31,7 @@ private:
   void on_buffer_changed();
   void on_vadj_changed();
   void update_width();
+  Pango::FontDescription editor_font() const;
 
   Gtk::TextView& text_view_;
   bool visible_{true};
