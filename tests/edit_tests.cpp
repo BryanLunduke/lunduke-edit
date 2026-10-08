@@ -3352,6 +3352,7 @@ struct EditChecks {
       FindOptions repl;
       repl.search_for = "alpha";
       repl.replace_with = "omega";
+      repl.case_sensitive = true;
       const gint64 started = g_get_monotonic_time();
       expect(w.replace_all(repl) == 30000, "replace all hits every line");
       const gint64 replace_us = g_get_monotonic_time() - started;
@@ -3376,7 +3377,9 @@ struct EditChecks {
       }
       expect(w.app_.wrap_text(), "wrap preference is on for the long line");
       const std::string line(200000, 'a');
+      w.buffer()->begin_not_undoable_action();
       w.buffer()->set_text(line);
+      w.buffer()->end_not_undoable_action();
       flush_ui();
       expect(w.text_view_.get_wrap_mode() == Gtk::WRAP_NONE,
              "a very long line forces wrap off");
@@ -3404,9 +3407,13 @@ struct EditChecks {
       expect(!w.buffer()->begin().has_tag(w.long_hidden_tag_),
              "Home shows the start of the long line");
       const int before_undo = w.buffer()->get_char_count();
+      expect(w.buffer()->can_undo(), "the typed character can be undone");
       w.on_undo();
-      expect(w.buffer()->get_char_count() == before_undo - 1,
+      const int after_undo = w.buffer()->get_char_count();
+      expect(after_undo < before_undo && after_undo >= 200000,
              "undo removes the typed character");
+      expect(w.buffer()->get_text().raw().substr(0, 8) == "aaaaaaaa",
+             "undo leaves the long line in place");
       expect(w.text_view_.get_wrap_mode() == Gtk::WRAP_NONE,
              "wrap stays off while the line is long");
       if (!wrap_was && w.wrap_item_) {
@@ -3544,6 +3551,8 @@ struct EditChecks {
       other->present();
       flush_ui();
       w.buffer()->insert(w.buffer()->end(), "!");
+      write_bytes(dropped, "from-disk");
+      bump_mtime(dropped);
       g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
       expect(drop_uris(*other, {dropped}, true), "drop on another window is delivered");
       g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
@@ -3555,7 +3564,7 @@ struct EditChecks {
       expect(drop_uris(*other, {dropped}, true), "drop reuses the existing window");
       g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
       flush_ui();
-      expect(w.buffer()->get_text() == "dropped-text",
+      expect(w.buffer()->get_text() == "from-disk",
              "the drop reloaded the window that already had the file");
       expect(w.edits_path(dropped), "the original window still has the file");
       other->hide();

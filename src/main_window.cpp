@@ -633,8 +633,6 @@ bool replace_file_contents(const std::string& path, const std::string& bytes,
   return replace_following(path, bytes, error, true);
 }
 
-enum class ReadStatus { Ok, Failed, TooLarge };
-
 // Secondary text for an open failure: the reason, then the path on its own
 // line. errno is captured at the failing call; a later close must not replace it.
 std::string open_failure_text(const std::string& path, int err, bool non_regular,
@@ -664,80 +662,6 @@ bool bytes_contain_nul(const std::string& bytes) {
 bool text_contains_nul(const Glib::ustring& text) {
   return text.bytes() != std::strlen(text.c_str()) ||
          text.find('\0') != Glib::ustring::npos;
-}
-
-// open + fstat + read until EOF. st_size is only a reserve hint. A reported
-// size of 0 (/proc, /sys, some FUSE) is not treated as an empty file.
-// Reading always stops at max_bytes, so a sparse st_size cannot force a
-// huge allocation and there is no unlimited read.
-ReadStatus read_file_fully(const std::string& path, std::string& raw,
-                           std::string& error, std::size_t max_bytes) {
-  raw.clear();
-  // O_NONBLOCK so a fifo (or a symlink to one) cannot stall the main loop.
-  // The type is checked before any blocking read, then the flag is cleared.
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-  if (fd < 0) {
-    error = open_failure_text(path, errno, false, false);
-    return ReadStatus::Failed;
-  }
-  struct stat st {};
-  if (fstat(fd, &st) != 0) {
-    const int err = errno;
-    ::close(fd);
-    error = open_failure_text(path, err, false, false);
-    return ReadStatus::Failed;
-  }
-  if (!S_ISREG(st.st_mode)) {
-    const bool directory = S_ISDIR(st.st_mode);
-    ::close(fd);
-    error = open_failure_text(path, directory ? EISDIR : 0, true, directory);
-    return ReadStatus::Failed;
-  }
-  const int flags = ::fcntl(fd, F_GETFL);
-  if (flags >= 0) {
-    ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-  }
-  try {
-    if (st.st_size > 0) {
-      auto hint = static_cast<std::size_t>(st.st_size);
-      if (hint > max_bytes) {
-        hint = max_bytes;
-      }
-      raw.reserve(hint);
-    }
-    char buf[65536];
-    while (true) {
-      const ssize_t n = ::read(fd, buf, sizeof buf);
-      if (n == 0) {
-        break;
-      }
-      if (n < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        const int err = errno;
-        raw.clear();
-        ::close(fd);
-        error = open_failure_text(path, err, false, false);
-        return ReadStatus::Failed;
-      }
-      const auto got = static_cast<std::size_t>(n);
-      if (got > max_bytes || raw.size() > max_bytes - got) {
-        raw.clear();
-        ::close(fd);
-        error = path;
-        return ReadStatus::TooLarge;
-      }
-      raw.append(buf, got);
-    }
-  } catch (const std::bad_alloc&) {
-    raw.clear();
-    ::close(fd);
-    error = "Not enough memory to open this file.";
-    return ReadStatus::Failed;
-  }
-  ::close(fd);
-  return ReadStatus::Ok;
 }
 
 std::string canonical_path(const std::string& path) {
@@ -4727,6 +4651,74 @@ int MainWindow::replace_all(const FindOptions& opts) {
   }
 
   // One pass builds the replacement. One buffer edit is one undo step.
+  // Walking GtkTextIter for every hit is itself a long stall, so a literal
+  // search scans the bytes once. Entire-word and non-ASCII case folding
+  // still use the iterator search, which knows those rules.
+  const int start = range_begin.get_offset();
+  const int end = range_end.get_offset();
+  const Glib::ustring whole = buf->get_text();
+  auto is_ascii = [](const Glib::ustring& text) {
+    const char* data = text.data();
+    const std::size_t n = text.bytes();
+    for (std::size_t i = 0; i < n; ++i) {
+      if (static_cast<unsigned char>(data[i]) >= 128) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!opts.entire_word && (opts.case_sensitive ||
+                            (is_ascii(opts.search_for) && is_ascii(opts.replace_with) &&
+                             is_ascii(whole)))) {
+    const Glib::ustring slice =
+        (start == 0 && end == static_cast<int>(whole.length()))
+            ? whole
+            : whole.substr(static_cast<Glib::ustring::size_type>(start),
+                           static_cast<Glib::ustring::size_type>(end - start));
+    const std::string hay(slice.data(), slice.bytes());
+    const std::string needle(opts.search_for.data(), opts.search_for.bytes());
+    const std::string repl(opts.replace_with.data(), opts.replace_with.bytes());
+    const std::string* scan_hay = &hay;
+    const std::string* scan_needle = &needle;
+    std::string folded_hay;
+    std::string folded_needle;
+    if (!opts.case_sensitive) {
+      folded_hay.resize(hay.size());
+      for (std::size_t i = 0; i < hay.size(); ++i) {
+        folded_hay[i] = static_cast<char>(g_ascii_tolower(hay[i]));
+      }
+      folded_needle.resize(needle.size());
+      for (std::size_t i = 0; i < needle.size(); ++i) {
+        folded_needle[i] = static_cast<char>(g_ascii_tolower(needle[i]));
+      }
+      scan_hay = &folded_hay;
+      scan_needle = &folded_needle;
+    }
+    std::string out;
+    out.reserve(hay.size() + repl.size());
+    int count = 0;
+    std::size_t pos = 0;
+    while (pos <= hay.size()) {
+      const std::size_t found = scan_hay->find(*scan_needle, pos);
+      if (found == std::string::npos) {
+        out.append(hay, pos, std::string::npos);
+        break;
+      }
+      out.append(hay, pos, found - pos);
+      out.append(repl);
+      pos = found + needle.size();
+      ++count;
+      if (needle.empty()) {
+        break;
+      }
+    }
+    if (count == 0) {
+      return 0;
+    }
+    apply_bulk_replace(start, end, Glib::ustring(out));
+    return count;
+  }
+
   struct Hit {
     int start_off;
     int end_off;
@@ -4750,9 +4742,6 @@ int MainWindow::replace_all(const FindOptions& opts) {
     return 0;
   }
 
-  const int start = range_begin.get_offset();
-  const int end = range_end.get_offset();
-  const Glib::ustring whole = buf->get_text();
   Glib::ustring neu;
   neu.reserve(static_cast<std::size_t>(std::max(0, end - start)) +
               hits.size() * opts.replace_with.length());
