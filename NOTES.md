@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9-6_amd64.deb
+# → packaging/debs/lunduke-edit_0.9-7_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,17 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9-7
+
+- **Save**: a stat failure's question defaults to Save As. Enter writes a new file. The old path is not offered as a Save that cannot succeed.
+- **Open**: a large file is read with GIO and inserted in idle slices. The window shows a busy cursor and an Opening status line, and keeps handling events. Escape cancels. Closing during the load closes after the read stops. The loaded text is not an undo step.
+- **Replace All**: one erase and one insert, so undo of that step is one step and stays fast.
+- **Long lines**: characters outside a window around the caret are not shaped. Wrap stays off. The default face is still Monospace 11.
+- **Menus**: File, Edit, Search, Text, Help. Encoding and Open Next File As are titles. Next-file items use their own mnemonics.
+- **Find**: Don't Find is removed. Cancel closes the dialog and keeps the fields.
+- **Drag and drop**: a file dropped on the window opens through the same path as File → Open, including a window that already has that file.
+- App / Meson / About stay **0.9**. Debian package **0.9-7**.
 
 ## 0.9-6
 

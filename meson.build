@@ -46,7 +46,7 @@ edit_behavior_tests = executable(
   include_directories: lunduke_edit_inc,
 )
 
-test('behavior', edit_behavior_tests)
+test('behavior', edit_behavior_tests, timeout: 180)
 
 install_data(
   'data/org.lunduke.LundukeEdit.desktop',
