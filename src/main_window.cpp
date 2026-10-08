@@ -1103,8 +1103,10 @@ MainWindow::MainWindow(Application& app) : app_(app) {
     signal_map().connect([this]() {
       unsigned long xid = 0;
       int watch = 0;
+      int viewable = 0;
       if (auto win = get_window()) {
         xid = static_cast<unsigned long>(gdk_x11_window_get_xid(win->gobj()));
+        viewable = gdk_window_is_viewable(win->gobj()) ? 1 : 0;
         auto cursor = win->get_cursor();
         if (cursor && cursor->get_cursor_type() == Gdk::WATCH) {
           watch = 1;
@@ -1118,9 +1120,9 @@ MainWindow::MainWindow(Application& app) : app_(app) {
           }
         }
       }
-      // watch before status: the status text contains spaces.
-      g_print("ARGV_MAPPED xid=%lu watch=%d status=%s\n", xid, watch,
-              status_find_.get_text().c_str());
+      // watch and viewable before status: the status text contains spaces.
+      g_print("ARGV_MAPPED xid=%lu watch=%d viewable=%d status=%s\n", xid,
+              watch, viewable, status_find_.get_text().c_str());
       fflush(stdout);
     });
   }
@@ -1197,7 +1199,10 @@ void MainWindow::park_document_view() {
     return;
   }
   if (!scratch_buffer_) {
-    scratch_buffer_ = Gtk::TextBuffer::create();
+    // A plain TextBuffer makes GtkSourceView assert on the style scheme
+    // for every paint while the document is parked.
+    scratch_buffer_ = Gsv::Buffer::create();
+    scratch_buffer_->set_max_undo_levels(0);
   } else if (scratch_buffer_->get_char_count() != 0) {
     scratch_buffer_->set_text("");
   }
@@ -2345,6 +2350,13 @@ std::size_t MainWindow::cached_save_bytes() const {
   std::size_t n = 0;
   if (encoding_ == "UTF-8") {
     n = utf8_bytes_;
+  } else if (doc_buffer_) {
+    // The view shows an empty scratch buffer while a load is parked.
+    // The save size is the document's character count.
+    const int chars = doc_buffer_->get_char_count();
+    if (chars > 0) {
+      n = static_cast<std::size_t>(chars);
+    }
   } else if (auto buf = text_view_.get_buffer()) {
     const int chars = buf->get_char_count();
     if (chars > 0) {
@@ -2964,6 +2976,14 @@ bool MainWindow::on_key_press_event(GdkEventKey* event) {
     if (load_->cancellable) {
       load_->cancellable->cancel();
     }
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+    // The argv-open child can exit as soon as this window is destroyed,
+    // which is before its poll of the window list. Say so here.
+    if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_ESCAPE") != nullptr) {
+      g_print("ARGV_CANCELLED\n");
+      fflush(stdout);
+    }
+#endif
     return true;
   }
   if (unmodified_insert_key(event)) {

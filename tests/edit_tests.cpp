@@ -3685,19 +3685,45 @@ struct EditChecks {
 
   static gboolean argv_child_escape_idle(gpointer data) {
     auto* state = static_cast<ArgvChildState*>(data);
-    if (!state->escape || state->sent_escape || !state->app) {
+    if (!state->escape || !state->app) {
       return G_SOURCE_REMOVE;
     }
     for (auto* window : state->app->get_windows()) {
       auto* main = dynamic_cast<MainWindow*>(window);
-      if (!main || !main->get_mapped() || !main->loading_) {
+      // present() maps synchronously, before the GdkWindow can take a
+      // key. Wait until that window exists and the load is still running.
+      if (!main || !main->get_mapped() || !main->loading_ || !main->get_window()) {
         continue;
       }
       state->saw_window = true;
-      state->sent_escape = true;
-      gtk_test_widget_send_key(GTK_WIDGET(main->gobj()), GDK_KEY_Escape,
-                               static_cast<GdkModifierType>(0));
-      return G_SOURCE_REMOVE;
+      if (!state->sent_escape) {
+        state->sent_escape = true;
+        g_print("ARGV_ESCAPE\n");
+        fflush(stdout);
+      }
+      // gtk_test_widget_send_key uses XSendEvent, which this display drops.
+      // gtk_widget_event is the call gtk_propagate_event makes for a key:
+      // the toplevel's key-press-event runs, and that is where Escape
+      // cancels a load, before the key is handed to the focus child.
+      GdkEvent* event = gdk_event_new(GDK_KEY_PRESS);
+      event->key.window =
+          GDK_WINDOW(g_object_ref(main->get_window()->gobj()));
+      event->key.keyval = GDK_KEY_Escape;
+      event->key.time = GDK_CURRENT_TIME;
+      event->key.send_event = TRUE;
+      if (GdkDisplay* display = gdk_window_get_display(event->key.window)) {
+        if (GdkSeat* seat = gdk_display_get_default_seat(display)) {
+          if (GdkDevice* keyboard = gdk_seat_get_keyboard(seat)) {
+            gdk_event_set_device(event, keyboard);
+          }
+        }
+      }
+      gtk_widget_event(GTK_WIDGET(main->gobj()), event);
+      gdk_event_free(event);
+      if (!main->loading_) {
+        return G_SOURCE_REMOVE;
+      }
+      return G_SOURCE_CONTINUE;
     }
     return G_SOURCE_CONTINUE;
   }
@@ -3752,7 +3778,9 @@ struct EditChecks {
     state->path = argv[1];
     state->escape = g_getenv("LUNDUKE_EDIT_TEST_ARGV_ESCAPE") != nullptr;
     if (state->escape) {
-      g_idle_add_full(G_PRIORITY_HIGH, argv_child_escape_idle, state, nullptr);
+      // A high-priority idle runs inside present(), before the window can
+      // accept a key, and one dropped Escape used to count as sent.
+      g_timeout_add(50, argv_child_escape_idle, state);
     }
     g_timeout_add(20, argv_child_watch, state);
     // Give up rather than hang the suite if the load never finishes.
@@ -3902,21 +3930,31 @@ struct EditChecks {
         if (line.compare(0, 12, "ARGV_MAPPED ") == 0 && result.map_ms < 0) {
           unsigned long xid = 0;
           int watch = 0;
+          int viewable = 0;
           char status_text[512];
           status_text[0] = '\0';
           if (std::sscanf(line.c_str(),
-                          "ARGV_MAPPED xid=%lu watch=%d status=%511[^\n]",
-                          &xid, &watch, status_text) >= 2) {
+                          "ARGV_MAPPED xid=%lu watch=%d viewable=%d status=%511[^\n]",
+                          &xid, &watch, &viewable, status_text) >= 3) {
             result.map_ms = static_cast<double>(g_get_monotonic_time() - start) /
                             1000.0;
             result.watch = watch != 0;
+            result.viewable = viewable != 0;
             result.opening = std::string(status_text).find("Opening") !=
                              std::string::npos;
-            for (int attempt = 0; attempt < 10 && !result.viewable; ++attempt) {
-              result.viewable = xid_is_viewable(xid);
-              if (!result.viewable) {
-                g_usleep(20 * 1000);
+            // Escape can unmap the window before a later xwininfo. The
+            // child's viewable flag is from the map. Confirm with the X
+            // server while the window is still up.
+            if (!result.viewable) {
+              for (int attempt = 0; attempt < 10 && !result.viewable;
+                   ++attempt) {
+                result.viewable = xid_is_viewable(xid);
+                if (!result.viewable) {
+                  g_usleep(20 * 1000);
+                }
               }
+            } else {
+              result.viewable = result.viewable || xid_is_viewable(xid);
             }
           }
         } else if (line.compare(0, 12, "ARGV_LOADED ") == 0) {
@@ -3940,6 +3978,45 @@ struct EditChecks {
         waitpid(pid, &st, 0);
         status = st;
         child_done = true;
+      }
+      if (child_done) {
+        // The child can exit between poll and waitpid. Read what it wrote.
+        const int flags = fcntl(fds[0], F_GETFL, 0);
+        if (flags >= 0) {
+          fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
+        }
+        while (true) {
+          char buf[1024];
+          const ssize_t n = read(fds[0], buf, sizeof buf);
+          if (n > 0) {
+            pending.append(buf, static_cast<std::size_t>(n));
+            continue;
+          }
+          break;
+        }
+      }
+    }
+    std::size_t nl = 0;
+    while ((nl = pending.find('\n')) != std::string::npos) {
+      const std::string line = pending.substr(0, nl);
+      pending.erase(0, nl + 1);
+      result.output += line;
+      result.output += '\n';
+      if (line == "ARGV_CANCELLED") {
+        result.cancelled = true;
+        if (result.load_ms < 0) {
+          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
+                           1000.0;
+        }
+      } else if (line.compare(0, 12, "ARGV_LOADED ") == 0) {
+        result.loaded = true;
+        if (result.load_ms < 0) {
+          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
+                           1000.0;
+        }
+        std::sscanf(line.c_str(), "ARGV_LOADED chars=%d", &result.chars);
+      } else if (line.compare(0, 11, "ARGV_ESCAPE") == 0) {
+        // Recorded in the log via result.output.
       }
     }
     close(fds[0]);

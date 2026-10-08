@@ -33,7 +33,7 @@ import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
 
 - **Open**: a large file from the command line maps the window and shows Opening, with the busy cursor, before the text is inserted. File → Open, Open Recent, drag-and-drop, and a file-manager open use that same path.
 - **Open**: the document is replaced in one step while the view shows an empty buffer, so Pango does not shape the whole file before the first paint. Layout continues after the text is in the buffer. A very long line is tagged once, before the view shows it.
-- **Open**: Escape still cancels. The main loop keeps running during the read.
+- **Open**: Escape still cancels. The main loop keeps running during the read. The line-number gutter draws the rows on screen, so a large file's first paint does not shape every line.
 - App / Meson / About stay **0.9**. Debian package **0.9-9**.
 
 ## 0.9-8

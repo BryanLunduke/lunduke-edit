@@ -8,7 +8,8 @@ lunduke-edit (0.9-9) unstable; urgency=medium
     whole file before the window appears. Very long lines are still hidden
     outside a window around the caret.
   * Escape during that open still cancels, and the UI keeps handling
-    events while the file is read.
+    events while the file is read. The line-number gutter paints the
+    visible rows, so the first expose does not shape the whole file.
 
  -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 22:00:00 +0000
 

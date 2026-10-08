@@ -328,7 +328,7 @@ private:
   Gsv::View text_view_;
   // The document. The view shows this except while a load parks it.
   Glib::RefPtr<Gsv::Buffer> doc_buffer_;
-  Glib::RefPtr<Gtk::TextBuffer> scratch_buffer_;
+  Glib::RefPtr<Gsv::Buffer> scratch_buffer_;
   bool view_parked_{false};
   LineGutter* gutter_{nullptr};
 
