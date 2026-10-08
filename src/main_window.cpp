@@ -623,6 +623,37 @@ bool replace_file_contents(const std::string& path, const std::string& bytes,
 
 enum class ReadStatus { Ok, Failed, TooLarge };
 
+// Secondary text for an open failure: the reason, then the path on its own
+// line. errno is captured at the failing call; a later close must not replace it.
+std::string open_failure_text(const std::string& path, int err, bool non_regular,
+                              bool is_directory) {
+  const char* reason = nullptr;
+  if (is_directory || err == EISDIR) {
+    reason = "That path is a directory";
+  } else if (non_regular) {
+    reason = "That path is not a regular file";
+  } else if (err == EACCES) {
+    reason = "Permission denied";
+  } else if (err == ENOENT) {
+    reason = "No such file";
+  } else if (err != 0) {
+    reason = std::strerror(err);
+  }
+  if (reason == nullptr || reason[0] == '\0') {
+    return path;
+  }
+  return std::string(reason) + "\n" + path;
+}
+
+bool bytes_contain_nul(const std::string& bytes) {
+  return bytes.find('\0') != std::string::npos;
+}
+
+bool text_contains_nul(const Glib::ustring& text) {
+  return text.bytes() != std::strlen(text.c_str()) ||
+         text.find('\0') != Glib::ustring::npos;
+}
+
 // open + fstat + read until EOF. st_size is only a reserve hint. A reported
 // size of 0 (/proc, /sys, some FUSE) is not treated as an empty file.
 // Reading always stops at max_bytes, so a sparse st_size cannot force a
@@ -634,13 +665,20 @@ ReadStatus read_file_fully(const std::string& path, std::string& raw,
   // The type is checked before any blocking read, then the flag is cleared.
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) {
-    error = path;
+    error = open_failure_text(path, errno, false, false);
     return ReadStatus::Failed;
   }
   struct stat st {};
-  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+  if (fstat(fd, &st) != 0) {
+    const int err = errno;
     ::close(fd);
-    error = path;
+    error = open_failure_text(path, err, false, false);
+    return ReadStatus::Failed;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    const bool directory = S_ISDIR(st.st_mode);
+    ::close(fd);
+    error = open_failure_text(path, directory ? EISDIR : 0, true, directory);
     return ReadStatus::Failed;
   }
   const int flags = ::fcntl(fd, F_GETFL);
@@ -665,9 +703,10 @@ ReadStatus read_file_fully(const std::string& path, std::string& raw,
         if (errno == EINTR) {
           continue;
         }
+        const int err = errno;
         raw.clear();
         ::close(fd);
-        error = path;
+        error = open_failure_text(path, err, false, false);
         return ReadStatus::Failed;
       }
       const auto got = static_cast<std::size_t>(n);
@@ -960,8 +999,88 @@ MainWindow::MainWindow(Application& app) : app_(app) {
       };
   g_signal_connect(text_view_.gobj(), "paste-clipboard", G_CALLBACK(paste_cb),
                    this);
+  text_view_.signal_button_press_event().connect(
+      sigc::mem_fun(*this, &MainWindow::on_text_button_press), false);
   text_view_.signal_button_release_event().connect(
       sigc::mem_fun(*this, &MainWindow::on_text_button_release), false);
+  buf->signal_begin_user_action().connect([this]() {
+    in_user_action_ = true;
+    ending_snapshotted_ = false;
+  });
+  buf->signal_end_user_action().connect([this]() {
+    in_user_action_ = false;
+    ending_snapshotted_ = false;
+  });
+  // Before the default handler mutates the buffer, remember which ending
+  // snapshot undo/redo should restore. After it, install that snapshot.
+  // Live insert/erase tracking is skipped while ending_restore_ is set.
+  buf->signal_undo().connect(
+      [this]() {
+        // No snapshot: let insert/erase tracking follow the undo. Setting
+        // ending_restore_ without a snapshot would skip that tracking and
+        // then discard the per-line endings.
+        if (!buffer() || !buffer()->can_undo() || source_lines_.empty() ||
+            ending_undo_.empty()) {
+          return;
+        }
+        ending_restore_ = true;
+        ending_redo_.push_back(ending_kinds());
+        pending_kinds_ = ending_undo_.back();
+        ending_undo_.pop_back();
+        have_pending_kinds_ = true;
+      },
+      false);
+  buf->signal_undo().connect(
+      [this]() {
+        if (!ending_restore_) {
+          return;
+        }
+        if (have_pending_kinds_) {
+          apply_ending_kinds(pending_kinds_);
+          have_pending_kinds_ = false;
+        }
+        ending_restore_ = false;
+        if (auto live = text_view_.get_buffer()) {
+          if (!source_lines_.empty() &&
+              static_cast<int>(source_lines_.size()) != live->get_line_count()) {
+            source_lines_.clear();
+            clear_ending_history();
+          }
+        }
+      },
+      true);
+  buf->signal_redo().connect(
+      [this]() {
+        if (!buffer() || !buffer()->can_redo() || source_lines_.empty() ||
+            ending_redo_.empty()) {
+          return;
+        }
+        ending_restore_ = true;
+        ending_undo_.push_back(ending_kinds());
+        pending_kinds_ = ending_redo_.back();
+        ending_redo_.pop_back();
+        have_pending_kinds_ = true;
+      },
+      false);
+  buf->signal_redo().connect(
+      [this]() {
+        if (!ending_restore_) {
+          return;
+        }
+        if (have_pending_kinds_) {
+          apply_ending_kinds(pending_kinds_);
+          have_pending_kinds_ = false;
+        }
+        ending_restore_ = false;
+        if (auto live = text_view_.get_buffer()) {
+          if (!source_lines_.empty() &&
+              static_cast<int>(source_lines_.size()) != live->get_line_count()) {
+            source_lines_.clear();
+            clear_ending_history();
+          }
+        }
+      },
+      true);
   text_view_.signal_drag_data_received().connect(
       sigc::mem_fun(*this, &MainWindow::on_drag_data_received), false);
   text_view_.property_overwrite().signal_changed().connect(
@@ -1223,7 +1342,7 @@ void MainWindow::build_menus() {
   text_menu->append(*wrap_item_);
 
   line_numbers_item_ =
-      Gtk::manage(new Gtk::CheckMenuItem("Show _Line Numbers", true));
+      Gtk::manage(new Gtk::CheckMenuItem("Show Line _Numbers", true));
   line_numbers_item_->set_active(true);
   line_numbers_item_->signal_toggled().connect(
       sigc::mem_fun(*this, &MainWindow::on_toggle_line_numbers));
@@ -1323,6 +1442,7 @@ void MainWindow::load_seed_sample() {
   newline_style_ = NewlineStyle::Lf;
   saved_newline_style_ = NewlineStyle::Lf;
   source_lines_.clear();
+  clear_ending_history();
   loaded_bytes_.clear();
   loaded_text_.clear();
   loaded_bytes_valid_ = false;
@@ -1369,7 +1489,8 @@ bool MainWindow::edits_path(const std::string& path) const {
   return canonical_path(file_path_) == canonical_path(path);
 }
 
-bool MainWindow::open_file(const std::string& path) {
+bool MainWindow::open_file(const std::string& path,
+                           bool discard_already_confirmed) {
   if (opening_) {
     app_.defer_open(path);
     return false;
@@ -1380,7 +1501,12 @@ bool MainWindow::open_file(const std::string& path) {
       return false;
     }
     present();
-    return true;
+    opening_ = true;
+    app_.push_reentry();
+    const bool ok = reopen_same_path(path, discard_already_confirmed);
+    opening_ = false;
+    app_.pop_reentry();
+    return ok;
   }
   opening_ = true;
   app_.push_reentry();
@@ -1390,11 +1516,41 @@ bool MainWindow::open_file(const std::string& path) {
   return ok;
 }
 
+bool MainWindow::reopen_same_path(const std::string& path,
+                                  bool discard_already_confirmed) {
+  const bool changed = file_identity_changed(
+      path, file_path_, have_file_id_, file_dev_, file_ino_, file_mtime_sec_,
+      file_mtime_nsec_);
+  // Unchanged on disk and the buffer is the loaded text: just show it.
+  if (!changed && !dirty_) {
+    return true;
+  }
+  // A dirty buffer is replaced only after the unsaved-changes prompt.
+  // File → Open already asked; don't ask a second time.
+  if (dirty_ && !discard_already_confirmed) {
+    if (!changed) {
+      return true;
+    }
+    if (!confirm_discard_or_save()) {
+      return false;
+    }
+    // Save wrote this buffer. If that brought the file back in sync, stop.
+    // A failed save returns false from confirm_discard_or_save.
+    if (!dirty_ && !file_identity_changed(path, file_path_, have_file_id_,
+                                          file_dev_, file_ino_,
+                                          file_mtime_sec_, file_mtime_nsec_)) {
+      return true;
+    }
+  }
+  if (!changed && !dirty_) {
+    return true;
+  }
+  return open_file_body(path);
+}
+
 bool MainWindow::open_file_body(const std::string& path) {
-  // Drop Search Selection Only / Extend Selection pins before the buffer is
-  // replaced. set_text would otherwise stretch a right-gravity end mark
-  // across the new document.
-  clear_document_search_pins();
+  // Search pins stay until the new text is about to replace the buffer.
+  // A failed open must leave the previous document, including its pins, alone.
   std::string raw;
   std::string read_error;
   const std::size_t cap = max_open_bytes();
@@ -1421,9 +1577,9 @@ bool MainWindow::open_file_body(const std::string& path) {
         refuse_over_hard();
         return false;
       }
+      // Cancel is the default. It is not an error, so do not follow it
+      // with "File not opened." The hard-cap refusal above still reports.
       if (!confirm_large_open(path)) {
-        report_error("File not opened.",
-                     "The file is larger than 32 MiB.");
         return false;
       }
       // The confirm only covers files that still fit under the hard cap.
@@ -1438,8 +1594,8 @@ bool MainWindow::open_file_body(const std::string& path) {
     return false;
   }
   if (status != ReadStatus::Ok) {
-    report_error("Could not open file.",
-                 read_error.empty() ? path : read_error);
+    last_open_error_ = read_error.empty() ? path : read_error;
+    report_error("Could not open file.", last_open_error_);
     return false;
   }
 
@@ -1479,12 +1635,31 @@ bool MainWindow::open_file_body(const std::string& path) {
   const bool long_line =
       has_long_line(text.data(), text.bytes(), kLongLineChars);
 
+  // GtkTextBuffer rejects an embedded NUL after set_text has already cleared
+  // the buffer, and that failure does not throw. Refuse before touching the
+  // document so a later save cannot replace the file with an empty view.
+  if (bytes_contain_nul(original_bytes) || text_contains_nul(text)) {
+    last_open_error_ =
+        "This file contains a null byte and cannot be opened as text.";
+    report_error(last_open_error_, path);
+    return false;
+  }
+
+  auto buf = buffer();
+  const Glib::ustring previous_text = buf->get_text();
+  const bool previous_modified = buf->get_modified();
+  const std::string previous_encoding = encoding_;
+  const NewlineStyle previous_newlines = newline_style_;
+  const int expected_chars = static_cast<int>(text.length());
+
   seeding_ = true;
   // Document encoding follows the file. The Text menu stays on the open
   // charset so the next file is not forced to this detection.
   encoding_ = loaded_encoding;
   newline_style_ = newlines;
-  auto buf = buffer();
+  // Drop pins now, immediately before the buffer is replaced. set_text would
+  // otherwise stretch a right-gravity end mark across the new document.
+  clear_document_search_pins();
   try {
     buf->begin_not_undoable_action();
     clear_find_highlights();
@@ -1495,8 +1670,17 @@ bool MainWindow::open_file_body(const std::string& path) {
       buf->end_not_undoable_action();
     } catch (...) {
     }
-    seeding_ = false;
+    restore_buffer_after_failed_load(previous_text, previous_modified,
+                                     previous_encoding, previous_newlines);
     report_error("Not enough memory to open this file.", path);
+    return false;
+  }
+  if (buf->get_char_count() != expected_chars) {
+    restore_buffer_after_failed_load(previous_text, previous_modified,
+                                     previous_encoding, previous_newlines);
+    last_open_error_ =
+        "This file contains a null byte and cannot be opened as text.";
+    report_error(last_open_error_, path);
     return false;
   }
   note_loaded_text(text);
@@ -1509,6 +1693,9 @@ bool MainWindow::open_file_body(const std::string& path) {
   loaded_text_ = text;
   loaded_bytes_valid_ = true;
   remember_source_lines(text, kinds);
+  // The buffer was replaced. Drop ending snapshots from the previous
+  // document; a save rebuilds the lines without clearing undo.
+  clear_ending_history();
   remember_file_identity(path);
   set_dirty(false);
   seeding_ = false;
@@ -1526,6 +1713,32 @@ bool MainWindow::open_file_body(const std::string& path) {
   }
   remember_recent(path);
   return true;
+}
+
+void MainWindow::restore_buffer_after_failed_load(
+    const Glib::ustring& previous_text, bool previous_modified,
+    const std::string& previous_encoding, NewlineStyle previous_newlines) {
+  auto buf = buffer();
+  seeding_ = true;
+  try {
+    if (buf) {
+      buf->begin_not_undoable_action();
+      buf->set_text(previous_text);
+      buf->end_not_undoable_action();
+      buf->set_modified(previous_modified);
+    }
+  } catch (...) {
+    try {
+      if (buf) {
+        buf->end_not_undoable_action();
+      }
+    } catch (...) {
+    }
+  }
+  encoding_ = previous_encoding;
+  newline_style_ = previous_newlines;
+  note_loaded_text(previous_text);
+  seeding_ = false;
 }
 
 Glib::ustring MainWindow::current_basename() const {
@@ -1591,6 +1804,17 @@ std::size_t MainWindow::cached_save_bytes() const {
       n = static_cast<std::size_t>(chars);
     }
   }
+  // Each CRLF line adds a CR that the buffer's LF does not store. Mixed
+  // files only add that byte for lines that actually use CRLF. A document
+  // with no per-line record still follows the single dominant style.
+  if (!source_lines_.empty()) {
+    for (const auto& line : source_lines_) {
+      if (line.kind == 'c') {
+        ++n;
+      }
+    }
+    return n;
+  }
   if (newline_style_ == NewlineStyle::Crlf) {
     n += newline_count_;
   }
@@ -1613,6 +1837,7 @@ void MainWindow::on_text_inserted(const Gtk::TextBuffer::iterator& pos,
     accepting_cr_ = false;
     return;
   }
+  track_inserted_endings(pos, text);
   utf8_bytes_ += text.bytes();
   newline_count_ += count_newlines(text.data(), text.bytes());
   if (text_view_.get_wrap_mode() != Gtk::WRAP_NONE &&
@@ -1624,6 +1849,7 @@ void MainWindow::on_text_inserted(const Gtk::TextBuffer::iterator& pos,
 
 void MainWindow::on_text_erased(const Gtk::TextBuffer::iterator& start,
                                 const Gtk::TextBuffer::iterator& end) {
+  track_erased_endings(start, end);
   const Glib::ustring gone = start.get_text(end);
   const std::size_t bytes = gone.bytes();
   const std::size_t newlines = count_newlines(gone.data(), bytes);
@@ -1803,6 +2029,7 @@ void MainWindow::on_new() {
   newline_style_ = NewlineStyle::Lf;
   saved_newline_style_ = NewlineStyle::Lf;
   source_lines_.clear();
+  clear_ending_history();
   loaded_bytes_.clear();
   loaded_text_.clear();
   loaded_bytes_valid_ = false;
@@ -1841,14 +2068,14 @@ void MainWindow::on_open() {
                  "Only local files can be opened.");
     return;
   }
-  open_file(file->get_path());
+  open_file(file->get_path(), true);
 }
 
 void MainWindow::on_open_recent(const std::string& path) {
   if (!confirm_discard_or_save()) {
     return;
   }
-  open_file(path);
+  open_file(path, true);
 }
 
 bool MainWindow::save_to_path(const std::string& path) {
@@ -1857,8 +2084,28 @@ bool MainWindow::save_to_path(const std::string& path) {
   const bool disk_changed = file_identity_changed(
       path, file_path_, have_file_id_, file_dev_, file_ino_, file_mtime_sec_,
       file_mtime_nsec_);
-  if (disk_changed && !confirm_file_changed(path)) {
-    return false;
+  if (disk_changed && !force_replace_) {
+    const DiskChangeChoice choice = confirm_file_changed(path);
+    if (choice == DiskChangeChoice::Cancel) {
+      return false;
+    }
+    if (choice == DiskChangeChoice::Reload) {
+      // Save on the unsaved-changes prompt writes this buffer anyway
+      // (force_replace_ skips the dialog). Don't Save re-reads the file.
+      if (dirty_) {
+        force_replace_ = true;
+        const bool proceed = confirm_discard_or_save();
+        force_replace_ = false;
+        if (!proceed) {
+          return false;
+        }
+        if (!dirty_) {
+          return true;
+        }
+      }
+      open_file_body(path);
+      return false;
+    }
   }
   // A clean buffer whose encoding and newline style still match the load
   // is already the file. Rewriting would drop xattrs and bump mtime.
@@ -2108,6 +2355,67 @@ void MainWindow::insert_pasted_text(const Glib::ustring& text) {
   update_undo_redo_sensitivity();
 }
 
+void MainWindow::insert_primary_paste(const Glib::ustring& text,
+                                     GdkEventButton* event) {
+  if (text.empty() || event == nullptr) {
+    return;
+  }
+  auto buf = buffer();
+  if (!buf) {
+    return;
+  }
+  int x = static_cast<int>(event->x);
+  int y = static_cast<int>(event->y);
+  int bx = x;
+  int by = y;
+  GdkWindow* text_win = gtk_text_view_get_window(GTK_TEXT_VIEW(text_view_.gobj()),
+                                                 GTK_TEXT_WINDOW_TEXT);
+  if (text_win != nullptr && event->window == text_win) {
+    text_view_.window_to_buffer_coords(Gtk::TEXT_WINDOW_TEXT, x, y, bx, by);
+  } else if (event->window != nullptr) {
+    text_view_.window_to_buffer_coords(Gtk::TEXT_WINDOW_WIDGET, x, y, bx, by);
+  }
+  Gtk::TextIter where;
+  text_view_.get_iter_at_location(where, bx, by);
+
+  bool inside = false;
+  Gtk::TextIter sel_a, sel_b;
+  const bool have_sel =
+      buf->get_selection_bounds(sel_a, sel_b) && sel_a != sel_b;
+  int sel_start = 0;
+  int sel_end = 0;
+  if (have_sel) {
+    sel_start = sel_a.get_offset();
+    sel_end = sel_b.get_offset();
+    inside = where.compare(sel_a) > 0 && where.compare(sel_b) < 0;
+  }
+  const int insert_at = where.get_offset();
+  const int added = static_cast<int>(text.length());
+
+  buf->begin_user_action();
+  if (inside) {
+    // A click inside the selection replaces it. A click outside leaves the
+    // selection in place and inserts at the pointer.
+    buf->erase_selection(true, text_view_.get_editable());
+    buf->insert_at_cursor(text);
+  } else {
+    buf->insert(where, text);
+    // insert() moves the cursor to the pasted text and drops the highlight.
+    // Put the selection back on the original span.
+    if (have_sel) {
+      int a = sel_start;
+      int b = sel_end;
+      if (insert_at <= sel_start) {
+        a += added;
+        b += added;
+      }
+      buf->select_range(buf->get_iter_at_offset(a), buf->get_iter_at_offset(b));
+    }
+  }
+  buf->end_user_action();
+  update_undo_redo_sensitivity();
+}
+
 void MainWindow::handle_paste_clipboard(GtkTextView* view) {
   // Stop the default handler. It would fetch the clipboard again, so a
   // clipboard owner could swap in a larger payload after the size check.
@@ -2121,18 +2429,30 @@ void MainWindow::handle_paste_clipboard(GtkTextView* view) {
   app_.pop_reentry();
 }
 
-bool MainWindow::on_text_button_release(GdkEventButton* event) {
+bool MainWindow::on_text_button_press(GdkEventButton* event) {
   if (event == nullptr || event->button != 2) {
     return false;
   }
+  // GTK pastes the primary selection on middle-button press, at the click.
+  // Consume the press so that gesture does not run, then insert once at the
+  // pointer after the size check.
   app_.push_reentry();
   Glib::ustring text;
   const bool ok = read_clipboard_text(
       Gtk::Clipboard::get(GDK_SELECTION_PRIMARY), text);
   if (ok) {
-    insert_pasted_text(text);
+    insert_primary_paste(text, event);
   }
   app_.pop_reentry();
+  return true;
+}
+
+bool MainWindow::on_text_button_release(GdkEventButton* event) {
+  // The paste already happened on press. Swallow the release so a second
+  // handler cannot insert again.
+  if (event == nullptr || event->button != 2) {
+    return false;
+  }
   return true;
 }
 
@@ -2251,7 +2571,7 @@ void MainWindow::remember_source_lines(const Glib::ustring& text,
                                        const std::vector<char>& kinds) {
   source_lines_.clear();
   const auto parts = split_lf_lines(std::string(text.data(), text.bytes()));
-  source_lines_.reserve(parts.size());
+  source_lines_.reserve(parts.size() + 1);
   for (std::size_t i = 0; i < parts.size(); ++i) {
     SourceLine line;
     line.text = parts[i].text;
@@ -2262,6 +2582,117 @@ void MainWindow::remember_source_lines(const Glib::ustring& text,
     }
     source_lines_.push_back(std::move(line));
   }
+  // GtkTextBuffer counts a trailing newline as an extra empty line. Keep a
+  // kind-0 entry for it so later inserts land on the same index.
+  if (!source_lines_.empty() && source_lines_.back().kind != 0) {
+    SourceLine phantom;
+    phantom.kind = 0;
+    source_lines_.push_back(std::move(phantom));
+  }
+}
+
+void MainWindow::clear_ending_history() {
+  ending_undo_.clear();
+  ending_redo_.clear();
+  pending_kinds_.clear();
+  have_pending_kinds_ = false;
+  ending_snapshotted_ = false;
+}
+
+std::vector<char> MainWindow::ending_kinds() const {
+  std::vector<char> kinds;
+  kinds.reserve(source_lines_.size());
+  for (const auto& line : source_lines_) {
+    kinds.push_back(line.kind);
+  }
+  return kinds;
+}
+
+void MainWindow::apply_ending_kinds(const std::vector<char>& kinds) {
+  source_lines_.resize(kinds.size());
+  for (std::size_t i = 0; i < kinds.size(); ++i) {
+    source_lines_[i].kind = kinds[i];
+  }
+}
+
+void MainWindow::snapshot_endings() {
+  if (ending_restore_ || seeding_ || source_lines_.empty()) {
+    return;
+  }
+  if (in_user_action_ && ending_snapshotted_) {
+    return;
+  }
+  ending_undo_.push_back(ending_kinds());
+  if (ending_undo_.size() > 100) {
+    ending_undo_.erase(ending_undo_.begin());
+  }
+  ending_redo_.clear();
+  if (in_user_action_) {
+    ending_snapshotted_ = true;
+  }
+}
+
+void MainWindow::track_inserted_endings(const Gtk::TextIter& pos,
+                                       const Glib::ustring& text) {
+  if (seeding_ || ending_restore_ || source_lines_.empty()) {
+    return;
+  }
+  auto buf = text_view_.get_buffer();
+  if (!buf ||
+      static_cast<int>(source_lines_.size()) != buf->get_line_count()) {
+    source_lines_.clear();
+    clear_ending_history();
+    return;
+  }
+  snapshot_endings();
+  const int newlines =
+      static_cast<int>(count_newlines(text.data(), text.bytes()));
+  if (newlines <= 0) {
+    return;
+  }
+  const int line = pos.get_line();
+  if (line < 0 || line > static_cast<int>(source_lines_.size())) {
+    source_lines_.clear();
+    clear_ending_history();
+    return;
+  }
+  // The inserted breaks are new, so they take the document's dominant
+  // style. The line that was split keeps the ending that was already there,
+  // which shifts right with the text after the insertion point.
+  SourceLine added;
+  added.kind = style_kind(newline_style_);
+  source_lines_.insert(source_lines_.begin() + line,
+                       static_cast<std::size_t>(newlines), added);
+}
+
+void MainWindow::track_erased_endings(const Gtk::TextIter& start,
+                                     const Gtk::TextIter& end) {
+  if (seeding_ || ending_restore_ || source_lines_.empty()) {
+    return;
+  }
+  auto buf = text_view_.get_buffer();
+  if (!buf ||
+      static_cast<int>(source_lines_.size()) != buf->get_line_count()) {
+    source_lines_.clear();
+    clear_ending_history();
+    return;
+  }
+  snapshot_endings();
+  const int start_line = start.get_line();
+  const int end_line = end.get_line();
+  if (start_line == end_line) {
+    return;
+  }
+  if (start_line < 0 || end_line < start_line ||
+      end_line > static_cast<int>(source_lines_.size())) {
+    source_lines_.clear();
+    clear_ending_history();
+    return;
+  }
+  // Each deleted newline drops that line's ending. The line the deletion
+  // ends on keeps its own ending and receives the surviving text.
+  source_lines_.erase(source_lines_.begin() + start_line,
+                      source_lines_.begin() + end_line);
 }
 
 void MainWindow::remember_file_identity(const std::string& path) {
@@ -2277,22 +2708,38 @@ void MainWindow::remember_file_identity(const std::string& path) {
   file_mtime_nsec_ = static_cast<std::int64_t>(st.st_mtim.tv_nsec);
 }
 
-bool MainWindow::confirm_file_changed(const std::string& /*path*/) {
+MainWindow::DiskChangeChoice MainWindow::confirm_file_changed(
+    const std::string& /*path*/) {
   if (const char* choice = g_getenv("LUNDUKE_EDIT_TEST_REPLACE")) {
-    return std::strcmp(choice, "allow") == 0;
+    if (std::strcmp(choice, "reload") == 0) {
+      return DiskChangeChoice::Reload;
+    }
+    if (std::strcmp(choice, "allow") == 0) {
+      return DiskChangeChoice::Replace;
+    }
+    return DiskChangeChoice::Cancel;
   }
   if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
-    return true;
+    return DiskChangeChoice::Replace;
   }
   Gtk::MessageDialog dlg(*this, "This file changed on disk.", false,
                          Gtk::MESSAGE_QUESTION, Gtk::BUTTONS_NONE, true);
   dlg.set_secondary_text(
       "\"" + current_basename() +
-      "\" was modified after it was opened. Replace it with the text in this window?");
+      "\" was modified after it was opened. Replace it with the text in "
+      "this window, or reload the copy on disk?");
   dlg.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
+  dlg.add_button("_Reload", Gtk::RESPONSE_APPLY);
   dlg.add_button("_Replace", Gtk::RESPONSE_ACCEPT);
   dlg.set_default_response(Gtk::RESPONSE_CANCEL);
-  return run_modal(app_, dlg) == Gtk::RESPONSE_ACCEPT;
+  const int resp = run_modal(app_, dlg);
+  if (resp == Gtk::RESPONSE_ACCEPT) {
+    return DiskChangeChoice::Replace;
+  }
+  if (resp == Gtk::RESPONSE_APPLY) {
+    return DiskChangeChoice::Reload;
+  }
+  return DiskChangeChoice::Cancel;
 }
 
 bool MainWindow::buffer_has_long_line() {
@@ -2703,6 +3150,10 @@ void MainWindow::on_find_dialog_hidden() {
   clear_find_highlights();
   find_highlights_on_ = false;
   set_find_count(-1, false);
+  // The selection-only range and the extend anchor belong to the dialog
+  // that just closed. Find Next must not keep searching that hidden range.
+  clear_selection_only_range();
+  clear_extend_anchor();
 }
 
 bool MainWindow::confirm_huge_undo(std::size_t bytes) {
@@ -3374,7 +3825,26 @@ void MainWindow::on_find_next() {
   }
   FindOptions o = find_opts_;
   o.start_at_top = false;
+  if (o.search_selection_only) {
+    // Pin whatever is selected now. A range remembered from the last Find
+    // dialog is not still on screen.
+    clear_selection_only_range();
+    auto buf = text_view_.get_buffer();
+    Gtk::TextIter sel_a, sel_b;
+    if (!buf || !buf->get_selection_bounds(sel_a, sel_b) || sel_a == sel_b) {
+      last_notice_ = "No text is selected.";
+      if (g_getenv("LUNDUKE_EDIT_TEST") == nullptr) {
+        Gtk::MessageDialog miss(*this, "No text is selected.", false,
+                                Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
+        miss.set_secondary_text("Search Selection Only needs a selection.");
+        run_modal(app_, miss);
+      }
+      return;
+    }
+    pin_selection_only_range();
+  }
   if (!find_match(o, true)) {
+    last_notice_ = "Text not found.";
     if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
       return;
     }
@@ -3680,7 +4150,6 @@ void MainWindow::on_begin_print(
       static_cast<int>(std::floor(page_width * Pango::SCALE));
 
   double line_height = 12.0;
-  double space_px = 1.0;
   {
     auto sample = context->create_pango_layout();
     configure_print_layout(sample, context, width);
@@ -3691,12 +4160,6 @@ void MainWindow::on_begin_print(
     if (h > 1.0) {
       line_height = h;
     }
-    sample->set_text(" ");
-    int sw = 0;
-    int sh = 0;
-    sample->get_size(sw, sh);
-    (void)sh;
-    space_px = std::max(1.0, static_cast<double>(sw) / Pango::SCALE);
   }
 
   PrintPage page;
@@ -3744,16 +4207,41 @@ void MainWindow::on_begin_print(
         buf->get_iter_at_offset(chunk_end));
     const int chars = chunk_end - offset;
     const bool has_tab = text.find('\t') != Glib::ustring::npos;
-    const bool complex =
-        has_tab || chars >= kLongLineChars ||
-        static_cast<double>(std::max(chars, 1)) * space_px > page_width;
+    // Measure the line with the print layout. A space-width guess calls a
+    // run of W or fullwidth glyphs "simple" and reserves one row, then the
+    // wrapped rows paint off the bottom of the page.
+    int visual_rows = 1;
+    double row_height = line_height;
+    if (!has_tab && chars < kLongLineChars) {
+      Glib::ustring probe = text;
+      if (!probe.empty() && probe[probe.length() - 1] == '\n') {
+        probe.erase(probe.length() - 1, 1);
+      }
+      if (!probe.empty() && probe[probe.length() - 1] == '\r') {
+        probe.erase(probe.length() - 1, 1);
+      }
+      auto measured = context->create_pango_layout();
+      configure_print_layout(measured, context, width);
+      measured->set_text(probe);
+      visual_rows = std::max(1, measured->get_line_count());
+      if (visual_rows == 1) {
+        Pango::Rectangle ink, logical;
+        measured->get_extents(ink, logical);
+        const double h =
+            static_cast<double>(logical.get_height()) / Pango::SCALE;
+        if (h > 0.0) {
+          row_height = h;
+        }
+      }
+    }
+    const bool complex = has_tab || chars >= kLongLineChars || visual_rows > 1;
 
     if (!complex) {
-      if (!page_empty && used + line_height > page_height) {
+      if (!page_empty && used + row_height > page_height) {
         close_page(offset);
       }
       pending.append(text);
-      used += line_height;
+      used += row_height;
       page_empty = false;
       offset = chunk_end;
       continue;

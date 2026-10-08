@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9-3_amd64.deb
+# → packaging/debs/lunduke-edit_0.9-4_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,17 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9-4
+
+- **Open**: a file with a null byte is refused and the previous buffer is kept. Permission errors, a missing path, and a directory each name the reason. Cancelling the large-file question is not reported as an error.
+- **Edit**: middle-click inserts the primary selection once, at the pointer. A click outside the selection leaves that selection in place.
+- **Newlines**: inserting or deleting a line keeps the other lines' endings. The status byte count includes a CR only for lines that will be saved as CRLF.
+- **Find**: closing Find drops the selection-only pin and the extend anchor. Find Next pins the selection that is visible now, or says that nothing is selected.
+- **Print**: a line that wraps visually is paginated by measured rows.
+- **Reload**: the disk-changed dialog can reload. Opening the path this window already has re-reads it when the inode or mtime changed, after asking when the buffer is dirty.
+- **Text menu**: Show Line Numbers uses N, so it does not share Alt+L with Latin-1.
+- App / Meson / About stay **0.9**. Debian package **0.9-4**.
 
 ## 0.9-2
 
