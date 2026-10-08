@@ -1,3 +1,20 @@
+lunduke-edit (0.9-10) unstable; urgency=medium
+
+  * Replace All builds the new text off the buffer in short main-loop
+    slices, with a Replacing progress line. Cancel and Escape leave the
+    buffer unchanged. The commit is one undo step.
+  * Opening a large file measures one screen before the first paint, so
+    the window stays responsive and the Opening percentage advances.
+    Escape during that paint still restores the previous text.
+  * The line and column in the status bar follow typing, undo, paste,
+    and Replace.
+  * Ctrl+End keeps scrolling until the caret is on screen, including
+    while line heights are still being measured.
+  * The throttled open test requires cpulimit -l 25 and fails if the
+    limit cannot be applied.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 23:40:00 +0000
+
 lunduke-edit (0.9-9) unstable; urgency=medium
 
   * Opening a large file from the command line maps the window and shows

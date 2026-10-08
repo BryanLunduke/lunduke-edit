@@ -4,6 +4,18 @@ Priority: optional
 Maintainer: LCOS <lcos@lunduke.com>
 Homepage: https://lunduke.com
 Standards-Version: 4.6.2
+Build-Depends: debhelper-compat (= 13),
+ meson,
+ g++,
+ pkg-config,
+ libgtkmm-3.0-dev,
+ libgtksourceviewmm-3.0-dev,
+ libx11-dev,
+ xvfb,
+ xauth,
+ cpulimit,
+ xdotool,
+ xfwm4
 
 Package: lunduke-edit
 Architecture: amd64
