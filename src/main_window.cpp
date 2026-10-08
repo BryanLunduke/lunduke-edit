@@ -3,8 +3,11 @@
 #include "main_window.hpp"
 #include "application.hpp"
 
+#include <giomm/cancellable.h>
 #include <giomm/file.h>
+#include <giomm/fileinputstream.h>
 #include <glib.h>
+#include <glibmm/bytes.h>
 #include <glibmm/convert.h>
 #include <glibmm/fileutils.h>
 #include <glibmm/main.h>
@@ -36,6 +39,7 @@
 #include <cstdio>
 #include <exception>
 #include <fstream>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -89,6 +93,13 @@ constexpr std::size_t kDefaultMaxPasteBytes = 32u * 1024u * 1024u;
 constexpr std::size_t kDefaultMaxOpenHardBytes = 64u * 1024u * 1024u;
 constexpr int kMaxColumnWalk = 4096;
 constexpr int kLongLineChars = 4000;
+// Characters of a long line that stay visible around the caret. The rest is
+// tagged invisible so a keystroke does not shape the whole line. 4096 is
+// about the width GDK can scroll (windows stop at 32767 pixels).
+constexpr int kLongLineWindow = 4096;
+constexpr int kLoadInsertChars = 64 * 1024;
+constexpr gsize kLoadReadBytes = 256u * 1024u;
+constexpr int kFindSliceChars = 64 * 1024;
 constexpr int kDefaultMaxFindHits = 10000;
 constexpr int kDefaultFindChunk = 200;
 constexpr std::size_t kDefaultHugeUndoBytes = 8u * 1024u * 1024u;
@@ -993,6 +1004,8 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   text_view_.set_buffer(buf);
   find_tag_ = buf->create_tag("lunduke-find-hit");
   find_tag_->property_background() = "#c4d8f0";
+  long_hidden_tag_ = buf->create_tag("lunduke-long-line-hide");
+  long_hidden_tag_->property_invisible() = true;
 
   // gtkmm's connect() defaults to after=true. insert-text and delete-range
   // run their default handlers first in that case, so "changed" updates the
@@ -1147,6 +1160,17 @@ MainWindow::MainWindow(Application& app) : app_(app) {
       true);
   text_view_.signal_drag_data_received().connect(
       sigc::mem_fun(*this, &MainWindow::on_drag_data_received), false);
+  // File drops reuse File → Open. Text drags keep the view's own targets.
+  // Realize can replace the view's target list, so add the URI target again
+  // once the widget is mapped.
+  text_view_.drag_dest_add_uri_targets();
+  text_view_.signal_map().connect([this]() {
+    text_view_.drag_dest_add_uri_targets();
+  });
+  drag_dest_set(Gtk::DEST_DEFAULT_ALL, Gdk::ACTION_COPY);
+  drag_dest_add_uri_targets();
+  signal_drag_data_received().connect(
+      sigc::mem_fun(*this, &MainWindow::on_window_drag_data_received), false);
   text_view_.property_overwrite().signal_changed().connect(
       sigc::mem_fun(*this, &MainWindow::sync_overwrite_status));
 
@@ -1157,7 +1181,53 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   rebuild_recents_menu();
 }
 
+struct MainWindow::LoadState {
+  MainWindow* window{nullptr};
+  Glib::RefPtr<Gio::Cancellable> cancellable;
+  Glib::RefPtr<Gio::File> file;
+  Glib::RefPtr<Gio::FileInputStream> stream;
+  std::string path;
+  std::string raw;
+  std::size_t max_bytes{0};
+  std::size_t hard_bytes{0};
+  bool allow_grow{false};
+  bool cancel{false};
+  bool close_after{false};
+  bool success{false};
+  bool active{false};
+  bool mutated{false};
+  bool undo_open{false};
+  enum class Phase { Read, Insert };
+  Phase phase{Phase::Read};
+  bool decoded{false};
+  Glib::ustring text;
+  std::vector<char> kinds;
+  NewlineStyle newlines{NewlineStyle::Lf};
+  std::string encoding{"UTF-8"};
+  std::string original;
+  bool long_line{false};
+  int insert_at{0};
+  int expected_chars{0};
+  Glib::ustring previous_text;
+  bool previous_modified{false};
+  std::string previous_encoding;
+  NewlineStyle previous_newlines{NewlineStyle::Lf};
+  sigc::connection idle;
+  std::string base_name;
+  int generation{0};
+};
+
 MainWindow::~MainWindow() {
+  if (load_) {
+    load_->window = nullptr;
+    load_->cancel = true;
+    load_->active = false;
+    if (load_->cancellable) {
+      load_->cancellable->cancel();
+    }
+    load_->idle.disconnect();
+  }
+  loading_ = false;
   find_idle_.disconnect();
   end_find_user_action();
 }
@@ -1424,9 +1494,24 @@ void MainWindow::build_menus() {
 
   text_menu->append(*Gtk::manage(new Gtk::SeparatorMenuItem()));
 
-  auto* enc_label = Gtk::manage(new Gtk::MenuItem("Encoding"));
-  enc_label->set_sensitive(false);
-  text_menu->append(*enc_label);
+  // Section titles are bold labels, not greyed commands. They do not activate.
+  auto add_section = [](Gtk::Menu* menu, const char* title) {
+    auto* item = Gtk::manage(new Gtk::MenuItem());
+    auto* label = Gtk::manage(new Gtk::Label());
+    label->set_markup(std::string("<b>") + title + "</b>");
+    label->set_halign(Gtk::ALIGN_START);
+    label->set_margin_start(8);
+    label->set_margin_end(8);
+    label->set_margin_top(2);
+    item->add(*label);
+    item->signal_select().connect([item]() { item->deselect(); });
+    item->signal_button_press_event().connect(
+        [](GdkEventButton*) { return true; });
+    item->signal_activate().connect([]() {});
+    menu->append(*item);
+  };
+
+  add_section(text_menu, "Encoding");
 
   Gtk::RadioMenuItem::Group enc_group;
   enc_utf8_item_ =
@@ -1443,33 +1528,22 @@ void MainWindow::build_menus() {
   text_menu->append(*enc_latin1_item_);
 
   text_menu->append(*Gtk::manage(new Gtk::SeparatorMenuItem()));
-  auto* open_label = Gtk::manage(new Gtk::MenuItem("Open Next File As"));
-  open_label->set_sensitive(false);
-  text_menu->append(*open_label);
+  add_section(text_menu, "Open Next File As");
 
   Gtk::RadioMenuItem::Group open_group;
+  // Distinct from the encoding radios, which already use U and L.
   open_utf8_item_ =
-      Gtk::manage(new Gtk::RadioMenuItem(open_group, "UTF-8", true));
+      Gtk::manage(new Gtk::RadioMenuItem(open_group, "Next file: UTF-_8", true));
   open_utf8_item_->set_active(true);
   open_utf8_item_->signal_activate().connect(
       sigc::mem_fun(*this, &MainWindow::on_open_pref_utf8));
   text_menu->append(*open_utf8_item_);
 
-  open_latin1_item_ = Gtk::manage(
-      new Gtk::RadioMenuItem(open_group, "Latin-1 (ISO-8859-1)", true));
+  open_latin1_item_ = Gtk::manage(new Gtk::RadioMenuItem(
+      open_group, "Next file: Latin-_1", true));
   open_latin1_item_->signal_activate().connect(
       sigc::mem_fun(*this, &MainWindow::on_open_pref_latin1));
   text_menu->append(*open_latin1_item_);
-
-  // ---- Font (top-level) ----
-  auto* font_menu = Gtk::manage(new Gtk::Menu());
-  auto* font_top = Gtk::manage(new Gtk::MenuItem("F_ont", true));
-  font_top->set_submenu(*font_menu);
-  menubar_.append(*font_top);
-
-  auto* font_i = Gtk::manage(new Gtk::MenuItem("_Font…", true));
-  font_i->signal_activate().connect(sigc::mem_fun(*this, &MainWindow::on_font));
-  font_menu->append(*font_i);
 
   // ---- Help ----
   auto* help_menu = Gtk::manage(new Gtk::Menu());
@@ -1517,6 +1591,8 @@ void MainWindow::load_seed_sample() {
   note_loaded_text("");
   set_dirty(false);
   seeding_ = false;
+  long_line_present_ = false;
+  long_window_line_ = -1;
   sync_encoding_radios();
   update_title();
   update_status();
@@ -1643,175 +1719,563 @@ bool MainWindow::reopen_same_path(const std::string& path,
 }
 
 bool MainWindow::open_file_body(const std::string& path) {
-  // Search pins stay until the new text is about to replace the buffer.
-  // A failed open must leave the previous document, including its pins, alone.
-  std::string raw;
-  std::string read_error;
+  if (!start_async_load(path)) {
+    return false;
+  }
+  pump_async_load();
+  const bool ok = load_ && load_->success;
+  const bool close_after = load_ && load_->close_after;
+  end_load_chrome();
+  loading_ = false;
+  if (load_) {
+    load_->active = false;
+    load_->window = nullptr;
+    if (load_->cancellable) {
+      load_->cancellable->cancel();
+    }
+  }
+  load_.reset();
+  if (close_after) {
+    on_delete_event(nullptr);
+  }
+  return ok;
+}
+
+void MainWindow::begin_load_chrome(const std::string& path) {
+  load_saved_editable_ = text_view_.get_editable();
+  text_view_.set_editable(false);
+  auto display = get_display();
+  if (!display) {
+    display = Gdk::Display::get_default();
+  }
+  if (display && !load_watch_) {
+    load_watch_ = Gdk::Cursor::create(display, Gdk::WATCH);
+  }
+  if (load_watch_) {
+    if (auto win = get_window()) {
+      win->set_cursor(load_watch_);
+    }
+    if (auto twin = text_view_.get_window(Gtk::TEXT_WINDOW_TEXT)) {
+      twin->set_cursor(load_watch_);
+    }
+  }
+  const std::string base = Glib::path_get_basename(path);
+  status_find_.set_text(Glib::ustring("Opening ") + base + "…");
+  status_find_frame_.show();
+}
+
+void MainWindow::end_load_chrome() {
+  text_view_.set_editable(load_saved_editable_);
+  if (auto win = get_window()) {
+    win->set_cursor(Glib::RefPtr<Gdk::Cursor>());
+  }
+  if (auto twin = text_view_.get_window(Gtk::TEXT_WINDOW_TEXT)) {
+    twin->set_cursor(Glib::RefPtr<Gdk::Cursor>());
+  }
+  if (status_find_.get_text().find("Opening") == 0) {
+    set_find_count(-1, false);
+  }
+}
+
+void MainWindow::update_load_status() {
+  if (!load_) {
+    return;
+  }
+  Glib::ustring text = "Opening " + load_->base_name + "…";
+  if (load_->phase == LoadState::Phase::Read && !load_->raw.empty()) {
+    text += " " + format_bytes(load_->raw.size());
+  } else if (load_->phase == LoadState::Phase::Insert &&
+             load_->expected_chars > 0) {
+    const int pct =
+        (load_->insert_at * 100) / std::max(1, load_->expected_chars);
+    text += " " + std::to_string(pct) + "%";
+  }
+  status_find_.set_text(text);
+  status_find_frame_.show();
+}
+
+void MainWindow::pump_async_load() {
+  while (load_ && load_->active) {
+    g_main_context_iteration(nullptr, TRUE);
+  }
+}
+
+void MainWindow::fail_async_load(const std::shared_ptr<LoadState>& state,
+                                 const std::string& primary,
+                                 const std::string& secondary) {
+  if (!state || state->window != this) {
+    return;
+  }
+  state->idle.disconnect();
+  state->active = false;
+  state->success = false;
+  if (state->undo_open) {
+    try {
+      if (auto buf = buffer()) {
+        buf->end_not_undoable_action();
+      }
+    } catch (...) {
+    }
+    state->undo_open = false;
+  }
+  if (state->mutated) {
+    restore_buffer_after_failed_load(state->previous_text,
+                                     state->previous_modified,
+                                     state->previous_encoding,
+                                     state->previous_newlines);
+    state->mutated = false;
+  }
+  seeding_ = false;
+  if (!primary.empty()) {
+    if (primary == "Could not open file." ||
+        primary == "File is too large to open.") {
+      last_open_error_ = secondary.empty() ? state->path : secondary;
+    } else if (primary.find("null byte") != std::string::npos) {
+      last_open_error_ = primary;
+    }
+    report_error(primary, secondary.empty() ? state->path : secondary);
+  }
+}
+
+void MainWindow::abort_async_load(const std::shared_ptr<LoadState>& state) {
+  if (!state || state->window != this) {
+    return;
+  }
+  state->idle.disconnect();
+  state->cancel = true;
+  state->active = false;
+  state->success = false;
+  if (state->undo_open) {
+    try {
+      if (auto buf = buffer()) {
+        buf->end_not_undoable_action();
+      }
+    } catch (...) {
+    }
+    state->undo_open = false;
+  }
+  if (state->mutated) {
+    restore_buffer_after_failed_load(state->previous_text,
+                                     state->previous_modified,
+                                     state->previous_encoding,
+                                     state->previous_newlines);
+    state->mutated = false;
+  }
+  seeding_ = false;
+}
+
+void MainWindow::finish_async_load(const std::shared_ptr<LoadState>& state) {
+  if (!state) {
+    return;
+  }
+  state->idle.disconnect();
+  state->active = false;
+  state->success = true;
+}
+
+void MainWindow::schedule_load_read(const std::shared_ptr<LoadState>& state) {
+  if (!state || !state->stream || state->cancel || state->window != this) {
+    abort_async_load(state);
+    return;
+  }
+  const int gen = state->generation;
+  state->stream->read_bytes_async(
+      kLoadReadBytes,
+      [state, gen](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        if (!state->window || state->generation != gen) {
+          try {
+            if (state->stream) {
+              state->stream->read_bytes_finish(result);
+            }
+          } catch (...) {
+          }
+          return;
+        }
+        state->window->on_load_chunk(state, result);
+      },
+      state->cancellable, Glib::PRIORITY_DEFAULT);
+}
+
+void MainWindow::begin_load_stream(const std::shared_ptr<LoadState>& state) {
+  const int gen = state->generation;
+  state->file->read_async(
+      [state, gen](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        if (!state->window || state->generation != gen) {
+          try {
+            state->file->read_finish(result);
+          } catch (...) {
+          }
+          return;
+        }
+        state->window->on_load_opened(state, result);
+      },
+      state->cancellable, Glib::PRIORITY_DEFAULT);
+}
+
+bool MainWindow::start_async_load(const std::string& path) {
   const std::size_t cap = max_open_bytes();
   const std::size_t hard = max_open_hard_bytes();
-  auto refuse_over_hard = [this, hard]() {
-    last_open_error_ = hard_open_refusal(hard);
-    report_error("File is too large to open.", last_open_error_);
-  };
-  // A known size past the hard ceiling is refused before any confirm and
-  // before the bytes are pulled into the text buffer.
   struct stat size_st {};
   if (::stat(path.c_str(), &size_st) == 0 && S_ISREG(size_st.st_mode) &&
       size_st.st_size > 0 &&
       static_cast<std::size_t>(size_st.st_size) > hard) {
-    refuse_over_hard();
+    last_open_error_ = hard_open_refusal(hard);
+    report_error("File is too large to open.", last_open_error_);
     return false;
   }
-  ReadStatus status = ReadStatus::Failed;
-  try {
-    status = read_file_fully(path, raw, read_error, cap);
-    if (status == ReadStatus::TooLarge) {
-      if (::stat(path.c_str(), &size_st) == 0 && size_st.st_size > 0 &&
-          static_cast<std::size_t>(size_st.st_size) > hard) {
-        refuse_over_hard();
-        return false;
-      }
-      // Cancel is the default. It is not an error, so do not follow it
-      // with "File not opened." The hard-cap refusal above still reports.
-      if (!confirm_large_open(path)) {
-        return false;
-      }
-      // The confirm only covers files that still fit under the hard cap.
-      status = read_file_fully(path, raw, read_error, hard);
-      if (status == ReadStatus::TooLarge) {
-        refuse_over_hard();
-        return false;
-      }
-    }
-  } catch (const std::bad_alloc&) {
-    report_error("Not enough memory to open this file.", path);
-    return false;
-  }
-  if (status != ReadStatus::Ok) {
-    last_open_error_ = read_error.empty() ? path : read_error;
+
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+  if (fd < 0) {
+    last_open_error_ = open_failure_text(path, errno, false, false);
     report_error("Could not open file.", last_open_error_);
     return false;
   }
+  struct stat st {};
+  if (fstat(fd, &st) != 0) {
+    const int err = errno;
+    ::close(fd);
+    last_open_error_ = open_failure_text(path, err, false, false);
+    report_error("Could not open file.", last_open_error_);
+    return false;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    const bool directory = S_ISDIR(st.st_mode);
+    ::close(fd);
+    last_open_error_ =
+        open_failure_text(path, directory ? EISDIR : 0, true, directory);
+    report_error("Could not open file.", last_open_error_);
+    return false;
+  }
+  ::close(fd);
 
-  NewlineStyle newlines = NewlineStyle::Lf;
-  Glib::ustring text;
-  std::string loaded_encoding = "UTF-8";
-  const std::string original_bytes = raw;
-  std::vector<char> kinds;
+  std::size_t limit = cap;
+  bool allow_grow = true;
+  if (st.st_size > 0 && static_cast<std::size_t>(st.st_size) > cap) {
+    if (!confirm_large_open(path)) {
+      return false;
+    }
+    limit = hard;
+    allow_grow = false;
+  }
+
+  auto state = std::make_shared<LoadState>();
+  state->window = this;
+  state->cancellable = Gio::Cancellable::create();
+  state->file = Gio::File::create_for_path(path);
+  state->path = path;
+  state->max_bytes = limit;
+  state->hard_bytes = hard;
+  state->allow_grow = allow_grow;
+  state->active = true;
+  state->base_name = Glib::path_get_basename(path);
   try {
-    newlines = normalize_newlines(raw, kinds);
-    if (prefer_utf8_) {
-      if (g_utf8_validate(raw.data(), static_cast<gssize>(raw.size()),
-                          nullptr)) {
-        text = Glib::ustring(raw);
-        loaded_encoding = "UTF-8";
-      } else {
-        // Bytes are not valid UTF-8. Keep them as Latin-1 so a later save
-        // writes the original bytes back instead of UTF-8 (0xE9 must not
-        // become C3 A9 while the buffer still looks clean).
-        text = Glib::convert(raw, "UTF-8", "ISO-8859-1");
-        loaded_encoding = "ISO-8859-1";
+    if (st.st_size > 0) {
+      auto hint = static_cast<std::size_t>(st.st_size);
+      if (hint > limit) {
+        hint = limit;
       }
-    } else {
-      const std::string charset =
-          open_charset_.empty() ? "ISO-8859-1" : open_charset_;
-      text = Glib::convert(raw, "UTF-8", charset);
-      loaded_encoding = charset;
+      state->raw.reserve(hint);
     }
-  } catch (const Glib::ConvertError& e) {
-    report_error("Encoding error while opening.", e.what());
-    return false;
   } catch (const std::bad_alloc&) {
     report_error("Not enough memory to open this file.", path);
     return false;
   }
 
-  const bool long_line =
-      has_long_line(text.data(), text.bytes(), kLongLineChars);
-
-  // GtkTextBuffer rejects an embedded NUL after set_text has already cleared
-  // the buffer, and that failure does not throw. Refuse before touching the
-  // document so a later save cannot replace the file with an empty view.
-  if (bytes_contain_nul(original_bytes) || text_contains_nul(text)) {
-    last_open_error_ =
-        "This file contains a null byte and cannot be opened as text.";
-    report_error(last_open_error_, path);
-    return false;
-  }
-
-  auto buf = buffer();
-  const Glib::ustring previous_text = buf->get_text();
-  const bool previous_modified = buf->get_modified();
-  const std::string previous_encoding = encoding_;
-  const NewlineStyle previous_newlines = newline_style_;
-  const int expected_chars = static_cast<int>(text.length());
-
-  seeding_ = true;
-  // Document encoding follows the file. The Text menu stays on the open
-  // charset so the next file is not forced to this detection.
-  encoding_ = loaded_encoding;
-  newline_style_ = newlines;
-  // Drop pins now, immediately before the buffer is replaced. set_text would
-  // otherwise stretch a right-gravity end mark across the new document.
-  clear_document_search_pins();
-  try {
-    buf->begin_not_undoable_action();
-    clear_find_highlights();
-    buf->set_text(text);
-    buf->end_not_undoable_action();
-  } catch (const std::bad_alloc&) {
-    try {
-      buf->end_not_undoable_action();
-    } catch (...) {
-    }
-    restore_buffer_after_failed_load(previous_text, previous_modified,
-                                     previous_encoding, previous_newlines);
-    report_error("Not enough memory to open this file.", path);
-    return false;
-  }
-  if (buf->get_char_count() != expected_chars) {
-    restore_buffer_after_failed_load(previous_text, previous_modified,
-                                     previous_encoding, previous_newlines);
-    last_open_error_ =
-        "This file contains a null byte and cannot be opened as text.";
-    report_error(last_open_error_, path);
-    return false;
-  }
-  note_loaded_text(text);
-  buf->set_modified(false);
-  file_path_ = path;
-  saved_encoding_ = encoding_;
-  encoding_dirty_ = false;
-  saved_newline_style_ = newlines;
-  loaded_bytes_ = original_bytes;
-  loaded_text_ = text;
-  loaded_bytes_valid_ = true;
-  remember_source_lines(text, kinds);
-  // The buffer was replaced. Drop ending snapshots from the previous
-  // document; a save rebuilds the lines without clearing undo.
-  clear_ending_history();
-  remember_file_identity(path);
-  file_missing_ = false;
-  file_unreadable_ = false;
-  disk_error_noted_ = false;
-  set_dirty(false);
-  seeding_ = false;
-  apply_editor_font_tag();
-  sync_encoding_radios();
-  if (long_line) {
-    force_wrap_off();
-  } else {
-    maybe_restore_wrap();
-  }
-  update_title();
-  update_status();
-  update_undo_redo_sensitivity();
-  if (gutter_) {
-    gutter_->refresh();
-  }
-  remember_recent(path);
+  load_ = state;
+  loading_ = true;
+  begin_load_chrome(path);
+  begin_load_stream(state);
   return true;
 }
+
+void MainWindow::on_load_opened(const std::shared_ptr<LoadState>& state,
+                                const Glib::RefPtr<Gio::AsyncResult>& result) {
+  if (!state || state->window != this) {
+    return;
+  }
+  try {
+    state->stream = state->file->read_finish(result);
+  } catch (const Gio::Error& err) {
+    if (err.code() == Gio::Error::CANCELLED || state->cancel) {
+      abort_async_load(state);
+      return;
+    }
+    fail_async_load(state, "Could not open file.", err.what());
+    return;
+  } catch (const Glib::Error& err) {
+    if (state->cancel) {
+      abort_async_load(state);
+      return;
+    }
+    fail_async_load(state, "Could not open file.", err.what());
+    return;
+  }
+  if (state->cancel) {
+    abort_async_load(state);
+    return;
+  }
+  schedule_load_read(state);
+}
+
+void MainWindow::on_load_chunk(const std::shared_ptr<LoadState>& state,
+                               const Glib::RefPtr<Gio::AsyncResult>& result) {
+  if (!state || state->window != this) {
+    return;
+  }
+  Glib::RefPtr<Glib::Bytes> bytes;
+  try {
+    bytes = state->stream->read_bytes_finish(result);
+  } catch (const Gio::Error& err) {
+    if (err.code() == Gio::Error::CANCELLED || state->cancel) {
+      abort_async_load(state);
+      return;
+    }
+    fail_async_load(state, "Could not open file.", err.what());
+    return;
+  } catch (const Glib::Error& err) {
+    if (state->cancel) {
+      abort_async_load(state);
+      return;
+    }
+    fail_async_load(state, "Could not open file.", err.what());
+    return;
+  }
+  if (state->cancel) {
+    abort_async_load(state);
+    return;
+  }
+  gsize n = 0;
+  const auto* data =
+      bytes ? static_cast<const char*>(bytes->get_data(n)) : nullptr;
+  if (n == 0 || data == nullptr) {
+    state->phase = LoadState::Phase::Insert;
+    state->idle = Glib::signal_idle().connect([state]() {
+      if (!state->window) {
+        return false;
+      }
+      return state->window->on_load_idle(state);
+    });
+    return;
+  }
+  if (n > state->max_bytes || state->raw.size() > state->max_bytes - n) {
+    if (state->allow_grow) {
+      state->raw.clear();
+      state->raw.shrink_to_fit();
+      if (!confirm_large_open(state->path)) {
+        abort_async_load(state);
+        return;
+      }
+      state->allow_grow = false;
+      state->max_bytes = state->hard_bytes;
+      ++state->generation;
+      if (state->cancellable) {
+        state->cancellable->cancel();
+      }
+      state->cancellable = Gio::Cancellable::create();
+      state->stream.reset();
+      try {
+        state->raw.reserve(std::min(state->hard_bytes, state->max_bytes));
+      } catch (const std::bad_alloc&) {
+        fail_async_load(state, "Not enough memory to open this file.",
+                        state->path);
+        return;
+      }
+      begin_load_stream(state);
+      return;
+    }
+    state->raw.clear();
+    fail_async_load(state, "File is too large to open.",
+                    hard_open_refusal(state->hard_bytes));
+    return;
+  }
+  try {
+    state->raw.append(data, n);
+  } catch (const std::bad_alloc&) {
+    state->raw.clear();
+    fail_async_load(state, "Not enough memory to open this file.", state->path);
+    return;
+  }
+  update_load_status();
+  schedule_load_read(state);
+}
+
+bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
+  if (!state || state->window != this || !state->active) {
+    return false;
+  }
+  if (state->cancel) {
+    abort_async_load(state);
+    return false;
+  }
+  if (!state->decoded) {
+    try {
+      state->original = state->raw;
+      state->newlines = normalize_newlines(state->raw, state->kinds);
+      if (prefer_utf8_) {
+        if (g_utf8_validate(state->raw.data(),
+                            static_cast<gssize>(state->raw.size()), nullptr)) {
+          state->text = Glib::ustring(state->raw);
+          state->encoding = "UTF-8";
+        } else {
+          state->text = Glib::convert(state->raw, "UTF-8", "ISO-8859-1");
+          state->encoding = "ISO-8859-1";
+        }
+      } else {
+        const std::string charset =
+            open_charset_.empty() ? "ISO-8859-1" : open_charset_;
+        state->text = Glib::convert(state->raw, "UTF-8", charset);
+        state->encoding = charset;
+      }
+    } catch (const Glib::ConvertError& err) {
+      fail_async_load(state, "Encoding error while opening.", err.what());
+      return false;
+    } catch (const std::bad_alloc&) {
+      fail_async_load(state, "Not enough memory to open this file.",
+                      state->path);
+      return false;
+    }
+    state->raw.clear();
+    state->raw.shrink_to_fit();
+    state->long_line =
+        has_long_line(state->text.data(), state->text.bytes(), kLongLineChars);
+    if (bytes_contain_nul(state->original) || text_contains_nul(state->text)) {
+      const std::string why =
+          "This file contains a null byte and cannot be opened as text.";
+      fail_async_load(state, why, state->path);
+      return false;
+    }
+    auto buf = buffer();
+    state->previous_text = buf->get_text();
+    state->previous_modified = buf->get_modified();
+    state->previous_encoding = encoding_;
+    state->previous_newlines = newline_style_;
+    state->expected_chars = static_cast<int>(state->text.length());
+    state->decoded = true;
+    seeding_ = true;
+    encoding_ = state->encoding;
+    newline_style_ = state->newlines;
+    long_line_present_ = false;
+    long_window_line_ = -1;
+    long_window_begin_ = 0;
+    long_window_end_ = 0;
+    clear_document_search_pins();
+    state->mutated = true;
+    try {
+      buf->begin_not_undoable_action();
+      state->undo_open = true;
+      clear_find_highlights();
+      buf->set_text("");
+    } catch (const std::bad_alloc&) {
+      fail_async_load(state, "Not enough memory to open this file.",
+                      state->path);
+      return false;
+    }
+    state->insert_at = 0;
+    update_load_status();
+    return true;
+  }
+
+  if (state->insert_at < state->expected_chars) {
+    const int n = std::min(kLoadInsertChars, state->expected_chars - state->insert_at);
+    Glib::ustring slice;
+    try {
+      slice = state->text.substr(static_cast<Glib::ustring::size_type>(state->insert_at),
+                                 static_cast<Glib::ustring::size_type>(n));
+    } catch (const std::bad_alloc&) {
+      fail_async_load(state, "Not enough memory to open this file.",
+                      state->path);
+      return false;
+    }
+    auto buf = buffer();
+    try {
+      buf->insert(buf->end(), slice);
+    } catch (const std::bad_alloc&) {
+      fail_async_load(state, "Not enough memory to open this file.",
+                      state->path);
+      return false;
+    }
+    if (font_tag_) {
+      const bool modified = buf->get_modified();
+      Gtk::TextIter end = buf->end();
+      Gtk::TextIter start = end;
+      if (start.backward_chars(static_cast<int>(slice.length()))) {
+        buf->apply_tag(font_tag_, start, end);
+      }
+      if (buf->get_modified() != modified) {
+        buf->set_modified(modified);
+      }
+    }
+    buf->place_cursor(buf->begin());
+    state->insert_at += static_cast<int>(slice.length());
+    update_load_status();
+    return true;
+  }
+
+  if (buffer() && buffer()->get_char_count() != state->expected_chars) {
+    const std::string why =
+        "This file contains a null byte and cannot be opened as text.";
+    fail_async_load(state, why, state->path);
+    return false;
+  }
+  if (!commit_loaded_text(state)) {
+    fail_async_load(state, "Not enough memory to open this file.", state->path);
+    return false;
+  }
+  finish_async_load(state);
+  return false;
+}
+
+bool MainWindow::commit_loaded_text(const std::shared_ptr<LoadState>& state) {
+  auto buf = buffer();
+  if (!buf || !state) {
+    return false;
+  }
+  try {
+    note_loaded_text(state->text);
+    buf->set_modified(false);
+    file_path_ = state->path;
+    saved_encoding_ = encoding_;
+    encoding_dirty_ = false;
+    saved_newline_style_ = state->newlines;
+    loaded_bytes_ = std::move(state->original);
+    loaded_text_ = state->text;
+    loaded_bytes_valid_ = true;
+    remember_source_lines(state->text, state->kinds);
+    state->text.clear();
+    clear_ending_history();
+    remember_file_identity(state->path);
+    file_missing_ = false;
+    file_unreadable_ = false;
+    disk_error_noted_ = false;
+    set_dirty(false);
+    if (state->undo_open) {
+      buf->end_not_undoable_action();
+      state->undo_open = false;
+    }
+    seeding_ = false;
+    long_line_present_ = state->long_line;
+    apply_editor_font_tag();
+    sync_encoding_radios();
+    buf->place_cursor(buf->begin());
+    if (state->long_line) {
+      force_wrap_off();
+    } else {
+      maybe_restore_wrap();
+    }
+    sync_long_line_window();
+    update_title();
+    update_status();
+    update_undo_redo_sensitivity();
+    if (gutter_) {
+      gutter_->refresh();
+    }
+    remember_recent(state->path);
+  } catch (const std::bad_alloc&) {
+    return false;
+  }
+  return true;
+}
+
 
 void MainWindow::restore_buffer_after_failed_load(
     const Glib::ustring& previous_text, bool previous_modified,
@@ -1837,7 +2301,11 @@ void MainWindow::restore_buffer_after_failed_load(
   newline_style_ = previous_newlines;
   note_loaded_text(previous_text);
   seeding_ = false;
+  long_line_present_ =
+      has_long_line(previous_text.data(), previous_text.bytes(), kLongLineChars);
+  long_window_line_ = -1;
   apply_editor_font_tag();
+  sync_long_line_window();
 }
 
 Glib::ustring MainWindow::current_basename() const {
@@ -1939,10 +2407,12 @@ void MainWindow::on_text_inserted(const Gtk::TextBuffer::iterator& pos,
   track_inserted_endings(pos, text);
   utf8_bytes_ += text.bytes();
   newline_count_ += count_newlines(text.data(), text.bytes());
-  if (text_view_.get_wrap_mode() != Gtk::WRAP_NONE &&
-      (has_long_line(text.data(), text.bytes(), kLongLineChars) ||
-       pos.get_chars_in_line() >= kLongLineChars)) {
-    force_wrap_off();
+  if (has_long_line(text.data(), text.bytes(), kLongLineChars) ||
+      pos.get_chars_in_line() >= kLongLineChars) {
+    note_line_length(kLongLineChars);
+    if (text_view_.get_wrap_mode() != Gtk::WRAP_NONE) {
+      force_wrap_off();
+    }
   }
 }
 
@@ -2002,6 +2472,7 @@ void MainWindow::on_buffer_changed() {
   }
   set_find_count(-1, false);
   update_bytes_status();
+  sync_long_line_window();
   if (text_view_.get_wrap_mode() != Gtk::WRAP_NONE) {
     auto buf = text_view_.get_buffer();
     if (buf) {
@@ -2094,6 +2565,7 @@ void MainWindow::on_cursor_moved(
     const Glib::RefPtr<Gtk::TextBuffer::Mark>& mark) {
   if (mark == text_view_.get_buffer()->get_insert()) {
     update_cursor_status();
+    sync_long_line_window();
   }
 }
 
@@ -2113,6 +2585,7 @@ bool MainWindow::confirm_discard_or_save(DiscardKind kind) {
   Glib::ustring primary;
   Glib::ustring secondary;
   int default_response = Gtk::RESPONSE_ACCEPT;
+  last_prompt_accept_ = "_Save";
   if (kind == DiscardKind::ReloadDisk) {
     // Don't Save is the focused button. Enter must load the disk copy.
     // Save is still available, and the text says it replaces the file
@@ -2132,7 +2605,7 @@ bool MainWindow::confirm_discard_or_save(DiscardKind kind) {
     primary = "Could not check the file on disk.";
     // One dialog for this failure. The strerror is here, and so is the
     // way out: this path cannot be written, so Save As keeps the text.
-    // Save itself does not open another dialog for the same failure.
+    // Enter runs Save As. A plain Save cannot write this path.
     const Glib::ustring why =
         last_notice_.empty() ? Glib::ustring()
                              : Glib::ustring(last_notice_ + "\n");
@@ -2140,7 +2613,8 @@ bool MainWindow::confirm_discard_or_save(DiscardKind kind) {
                 "This path cannot be written. Use Save As to keep the text.\n"
                 "Save the text in this window before continuing?";
     disk_error_noted_ = true;
-    default_response = Gtk::RESPONSE_ACCEPT;
+    default_response = kPromptSaveAs;
+    last_prompt_accept_ = "Save _As";
   } else {
     primary = "Save changes before continuing?";
     secondary = "\"" + current_basename() + "\" has unsaved changes.";
@@ -2168,17 +2642,27 @@ bool MainWindow::confirm_discard_or_save(DiscardKind kind) {
     if (std::strcmp(choice, "save") == 0) {
       return save_document();
     }
+    if (std::strcmp(choice, "save-as") == 0) {
+      return save_as_dialog();
+    }
   }
   Gtk::MessageDialog dlg(*this, primary, false, Gtk::MESSAGE_QUESTION,
                          Gtk::BUTTONS_NONE, true);
   dlg.set_secondary_text(secondary);
   dlg.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
   dlg.add_button("_Don't Save", Gtk::RESPONSE_REJECT);
-  dlg.add_button("_Save", Gtk::RESPONSE_ACCEPT);
+  if (file_unreadable_) {
+    dlg.add_button("Save _As", kPromptSaveAs);
+  } else {
+    dlg.add_button("_Save", Gtk::RESPONSE_ACCEPT);
+  }
   dlg.set_default_response(default_response);
   const int resp = run_modal(app_, dlg);
   if (resp == Gtk::RESPONSE_CANCEL || resp == Gtk::RESPONSE_DELETE_EVENT) {
     return false;
+  }
+  if (resp == kPromptSaveAs) {
+    return save_as_dialog();
   }
   if (resp == Gtk::RESPONSE_ACCEPT) {
     return save_document();
@@ -2216,6 +2700,8 @@ void MainWindow::on_new() {
   note_loaded_text("");
   set_dirty(false);
   seeding_ = false;
+  long_line_present_ = false;
+  long_window_line_ = -1;
   apply_editor_font_tag();
   sync_encoding_radios();
   maybe_restore_wrap();
@@ -2401,6 +2887,14 @@ bool MainWindow::save_document() {
 void MainWindow::on_save() { save_document(); }
 
 bool MainWindow::save_as_dialog() {
+  if (const char* hook = g_getenv("LUNDUKE_EDIT_TEST_SAVE_AS")) {
+    if (std::strcmp(hook, "cancel") == 0) {
+      return false;
+    }
+    if (hook[0] != '\0') {
+      return save_to_path(hook);
+    }
+  }
   Gtk::FileChooserDialog dlg(*this, "Save As",
                              Gtk::FILE_CHOOSER_ACTION_SAVE);
   dlg.set_do_overwrite_confirmation(true);
@@ -2441,6 +2935,16 @@ void MainWindow::on_exit() {
 }
 
 bool MainWindow::on_delete_event(GdkEventAny* /*event*/) {
+  // Closing during a load cancels the read and finishes the close after
+  // the loader returns, so this window is not freed mid-open.
+  if (loading_ && load_) {
+    load_->cancel = true;
+    load_->close_after = true;
+    if (load_->cancellable) {
+      load_->cancellable->cancel();
+    }
+    return true;
+  }
   if (!confirm_discard_or_save()) {
     // Keep the window. GTK must not hide or destroy it.
     return true;
@@ -2451,6 +2955,13 @@ bool MainWindow::on_delete_event(GdkEventAny* /*event*/) {
 }
 
 bool MainWindow::on_key_press_event(GdkEventKey* event) {
+  if (loading_ && load_ && event != nullptr && event->keyval == GDK_KEY_Escape) {
+    load_->cancel = true;
+    if (load_->cancellable) {
+      load_->cancellable->cancel();
+    }
+    return true;
+  }
   if (unmodified_insert_key(event)) {
     // X11 auto-repeat delivers a synthetic release+press with one timestamp.
     // The release handler marks the following press so it does not toggle.
@@ -2694,9 +3205,69 @@ bool MainWindow::on_text_button_release(GdkEventButton* event) {
   return true;
 }
 
+namespace {
+
+bool selection_is_uri_list(const Gtk::SelectionData& data) {
+  if (data.get_length() <= 0) {
+    return false;
+  }
+  if (data.targets_include_uri()) {
+    return true;
+  }
+  const std::string type = data.get_data_type();
+  return type == "text/uri-list";
+}
+
+}  // namespace
+
+void MainWindow::open_dropped_uris(const std::vector<Glib::ustring>& uris) {
+  if (dropping_uris_ || uris.empty()) {
+    return;
+  }
+  dropping_uris_ = true;
+  struct Clear {
+    bool& flag;
+    ~Clear() { flag = false; }
+  } clear{dropping_uris_};
+
+  std::vector<std::string> paths;
+  bool remote = false;
+  for (const auto& uri : uris) {
+    auto file = Gio::File::create_for_uri(uri);
+    if (!file || !file->is_native() || file->get_path().empty()) {
+      remote = true;
+      continue;
+    }
+    paths.push_back(file->get_path());
+  }
+  if (remote) {
+    report_error("Cannot open this location.", "Only local files can be opened.");
+  }
+  if (paths.empty()) {
+    return;
+  }
+  if (!confirm_discard_or_save()) {
+    return;
+  }
+  open_file(paths.front(), true);
+  if (paths.size() > 1) {
+    app_.open_documents(
+        std::vector<std::string>(paths.begin() + 1, paths.end()));
+  }
+}
+
 void MainWindow::on_drag_data_received(
-    const Glib::RefPtr<Gdk::DragContext>& /*context*/, int /*x*/, int /*y*/,
-    const Gtk::SelectionData& data, guint /*info*/, guint /*time*/) {
+    const Glib::RefPtr<Gdk::DragContext>& context, int /*x*/, int /*y*/,
+    const Gtk::SelectionData& data, guint /*info*/, guint time) {
+  if (selection_is_uri_list(data)) {
+    g_signal_stop_emission_by_name(text_view_.gobj(), "drag-data-received");
+    if (context && gdk_drag_context_get_protocol(context->gobj()) !=
+                       GDK_DRAG_PROTO_NONE) {
+      context->drag_finish(true, false, time);
+    }
+    open_dropped_uris(data.get_uris());
+    return;
+  }
   const int len = data.get_length();
   if (len > 0 && static_cast<std::size_t>(len) > max_paste_bytes()) {
     g_signal_stop_emission_by_name(text_view_.gobj(), "drag-data-received");
@@ -2704,6 +3275,38 @@ void MainWindow::on_drag_data_received(
                  "A single paste is limited to " +
                      format_bytes(max_paste_bytes()) + ".");
   }
+}
+
+void MainWindow::on_window_drag_data_received(
+    const Glib::RefPtr<Gdk::DragContext>& context, int /*x*/, int /*y*/,
+    const Gtk::SelectionData& data, guint /*info*/, guint time) {
+  if (!selection_is_uri_list(data)) {
+    return;
+  }
+  g_signal_stop_emission_by_name(gobj(), "drag-data-received");
+  if (context && gdk_drag_context_get_protocol(context->gobj()) !=
+                     GDK_DRAG_PROTO_NONE) {
+    context->drag_finish(true, false, time);
+  }
+  std::vector<Glib::ustring> uris = data.get_uris();
+  if (uris.empty()) {
+    const char* raw = reinterpret_cast<const char*>(data.get_data());
+    if (raw != nullptr && data.get_length() > 0) {
+      std::string text(raw, static_cast<std::size_t>(data.get_length()));
+      std::size_t pos = 0;
+      while (pos < text.size()) {
+        std::size_t end = text.find_first_of("\r\n", pos);
+        if (end == std::string::npos) {
+          end = text.size();
+        }
+        if (end > pos) {
+          uris.emplace_back(text.substr(pos, end - pos));
+        }
+        pos = end + 1;
+      }
+    }
+  }
+  open_dropped_uris(uris);
 }
 
 void MainWindow::on_paste() {
@@ -2981,6 +3584,9 @@ MainWindow::DiskChangeChoice MainWindow::confirm_file_changed(
 }
 
 bool MainWindow::buffer_has_long_line() {
+  if (long_line_present_) {
+    return true;
+  }
   auto buf = text_view_.get_buffer();
   if (!buf) {
     return false;
@@ -2990,10 +3596,129 @@ bool MainWindow::buffer_has_long_line() {
     GtkTextIter iter;
     gtk_text_buffer_get_iter_at_line(buf->gobj(), &iter, i);
     if (gtk_text_iter_get_chars_in_line(&iter) >= kLongLineChars) {
+      long_line_present_ = true;
       return true;
     }
   }
   return false;
+}
+
+void MainWindow::note_line_length(int chars_in_line) {
+  if (chars_in_line >= kLongLineChars) {
+    long_line_present_ = true;
+  }
+}
+
+void MainWindow::sync_long_line_window() {
+  if (syncing_long_line_ || !long_hidden_tag_) {
+    return;
+  }
+  auto buf = buffer();
+  if (!buf) {
+    return;
+  }
+
+  auto preserve_modified = [&](const bool modified) {
+    if (buf->get_modified() != modified) {
+      buf->set_modified(modified);
+    }
+  };
+  auto clear_hide = [&]() {
+    syncing_long_line_ = true;
+    const bool modified = buf->get_modified();
+    buf->remove_tag(long_hidden_tag_, buf->begin(), buf->end());
+    preserve_modified(modified);
+    syncing_long_line_ = false;
+    long_window_line_ = -1;
+    long_window_begin_ = 0;
+    long_window_end_ = 0;
+  };
+
+  if (text_view_.get_wrap_mode() != Gtk::WRAP_NONE) {
+    long_line_present_ = false;
+    if (long_window_line_ >= 0) {
+      clear_hide();
+    }
+    return;
+  }
+
+  auto iter = buf->get_iter_at_mark(buf->get_insert());
+  const int line = iter.get_line();
+  Gtk::TextIter line_start = buf->get_iter_at_line(line);
+  int chars = line_start.get_chars_in_line();
+  const bool has_break = line + 1 < buf->get_line_count();
+  int content = chars;
+  if (has_break && content > 0) {
+    --content;
+  }
+  if (content >= kLongLineChars) {
+    long_line_present_ = true;
+  }
+
+  if (content <= kLongLineWindow) {
+    if (long_window_line_ == line) {
+      clear_hide();
+      if (content < kLongLineChars) {
+        long_line_present_ = false;
+      }
+    }
+    return;
+  }
+
+  long_line_present_ = true;
+  int line_off = iter.get_line_offset();
+  if (line_off > content) {
+    line_off = content;
+  }
+  int vis_begin = line_off - kLongLineWindow / 2;
+  if (vis_begin < 0) {
+    vis_begin = 0;
+  }
+  int vis_end = vis_begin + kLongLineWindow;
+  if (vis_end > content) {
+    vis_end = content;
+    vis_begin = std::max(0, vis_end - kLongLineWindow);
+  }
+
+  const int line_start_off = line_start.get_offset();
+  syncing_long_line_ = true;
+  const bool modified = buf->get_modified();
+  if (long_window_line_ == line && long_window_end_ > long_window_begin_) {
+    if (vis_begin > long_window_begin_) {
+      buf->apply_tag(long_hidden_tag_,
+                     buf->get_iter_at_offset(line_start_off + long_window_begin_),
+                     buf->get_iter_at_offset(line_start_off + vis_begin));
+    } else if (vis_begin < long_window_begin_) {
+      buf->remove_tag(long_hidden_tag_,
+                      buf->get_iter_at_offset(line_start_off + vis_begin),
+                      buf->get_iter_at_offset(line_start_off + long_window_begin_));
+    }
+    if (vis_end < long_window_end_) {
+      buf->apply_tag(long_hidden_tag_,
+                     buf->get_iter_at_offset(line_start_off + vis_end),
+                     buf->get_iter_at_offset(line_start_off + long_window_end_));
+    } else if (vis_end > long_window_end_) {
+      buf->remove_tag(long_hidden_tag_,
+                      buf->get_iter_at_offset(line_start_off + long_window_end_),
+                      buf->get_iter_at_offset(line_start_off + vis_end));
+    }
+  } else {
+    buf->remove_tag(long_hidden_tag_, buf->begin(), buf->end());
+    if (vis_begin > 0) {
+      buf->apply_tag(long_hidden_tag_, line_start,
+                     buf->get_iter_at_offset(line_start_off + vis_begin));
+    }
+    if (vis_end < content) {
+      buf->apply_tag(long_hidden_tag_,
+                     buf->get_iter_at_offset(line_start_off + vis_end),
+                     buf->get_iter_at_offset(line_start_off + content));
+    }
+  }
+  long_window_line_ = line;
+  long_window_begin_ = vis_begin;
+  long_window_end_ = vis_end;
+  preserve_modified(modified);
+  syncing_long_line_ = false;
 }
 
 void MainWindow::maybe_restore_wrap() {
@@ -3216,17 +3941,77 @@ bool MainWindow::find_match(const FindOptions& opts, bool from_next) {
     Gtk::TextIter match_start, match_end;
     Gtk::TextIter cursor = from;
     const int guard = buf->get_char_count() + 2;
+    const int extend =
+        std::max(0, static_cast<int>(opts.search_for.length()) - 1);
+    auto yield_slice = []() {
+      // One turn so a timer can run, then a few already-queued events.
+      g_main_context_iteration(nullptr, FALSE);
+      int spins = 0;
+      while (g_main_context_pending(nullptr) && spins < 8) {
+        g_main_context_iteration(nullptr, FALSE);
+        ++spins;
+      }
+    };
     for (int i = 0; i < guard; ++i) {
       bool found = false;
+      bool limited = false;
+      Gtk::TextIter slice_bound = cursor;
+      Gtk::TextIter search_limit;
       if (opts.search_backwards) {
+        if (slice_bound.backward_chars(kFindSliceChars) &&
+            slice_bound > range_begin) {
+          limited = true;
+        } else if (slice_bound < range_begin) {
+          slice_bound = range_begin;
+        }
+        if (slice_bound < range_begin) {
+          slice_bound = range_begin;
+        }
+        if (!limited) {
+          slice_bound = range_begin;
+        }
+        search_limit = slice_bound;
+        if (limited && extend > 0) {
+          Gtk::TextIter ext = slice_bound;
+          ext.backward_chars(extend);
+          if (ext < range_begin) {
+            ext = range_begin;
+          }
+          search_limit = ext;
+        }
         found = cursor.backward_search(opts.search_for, flags, match_start,
-                                       match_end, range_begin);
+                                       match_end, search_limit);
       } else {
+        if (slice_bound.forward_chars(kFindSliceChars) &&
+            slice_bound < range_end) {
+          limited = true;
+        }
+        if (slice_bound > range_end) {
+          slice_bound = range_end;
+          limited = false;
+        }
+        if (!limited) {
+          slice_bound = range_end;
+        }
+        search_limit = slice_bound;
+        if (limited && extend > 0) {
+          Gtk::TextIter ext = slice_bound;
+          int left = extend;
+          while (left > 0 && ext < range_end && ext.forward_char()) {
+            --left;
+          }
+          search_limit = ext;
+        }
         found = cursor.forward_search(opts.search_for, flags, match_start,
-                                      match_end, range_end);
+                                      match_end, search_limit);
       }
       if (!found) {
-        return false;
+        if (!limited) {
+          return false;
+        }
+        cursor = slice_bound;
+        yield_slice();
+        continue;
       }
       if (!opts.search_selection_only ||
           (match_start >= range_begin && match_end <= range_end)) {
@@ -3742,9 +4527,10 @@ bool MainWindow::pump_replace() {
     return true;
   }
 
-  if (!find_scan_.user_action_open) {
-    buf->begin_user_action();
-    find_scan_.user_action_open = true;
+  // Collect every hit before touching the buffer. The first idle must not
+  // edit, so Cancel after it leaves the text alone. The commit is one
+  // erase and one insert, which is one undo step.
+  if (!find_scan_.collected) {
     if (!find_scan_.started) {
       Gtk::TextIter range_begin, range_end;
       if (!get_search_bounds(find_scan_.opts, range_begin, range_end)) {
@@ -3753,35 +4539,68 @@ bool MainWindow::pump_replace() {
       }
       find_scan_.started = true;
       find_scan_.cursor_off = range_begin.get_offset();
+      find_scan_.replace_start = range_begin.get_offset();
+      find_scan_.replace_end = range_end.get_offset();
       find_scan_.count = 0;
+      find_scan_.hits.clear();
     }
+    const int chunk = find_chunk_size();
+    int cursor_off = find_scan_.cursor_off;
+    for (int n = 0; n < chunk; ++n) {
+      int ms = 0;
+      int me = 0;
+      const SearchStep step = step_search(false, cursor_off, ms, me);
+      if (step == SearchStep::Yield) {
+        find_scan_.cursor_off = cursor_off;
+        return true;
+      }
+      if (step != SearchStep::Hit) {
+        find_scan_.collected = true;
+        find_scan_.cursor_off = cursor_off;
+        return true;
+      }
+      find_scan_.hits.emplace_back(ms, me);
+      ++find_scan_.count;
+      Gtk::TextIter next = buf->get_iter_at_offset(me);
+      if (ms == me && !next.forward_char()) {
+        find_scan_.collected = true;
+        return true;
+      }
+      cursor_off = next.get_offset();
+    }
+    find_scan_.cursor_off = cursor_off;
+    return true;
   }
 
-  const int repl_chars = static_cast<int>(g_utf8_strlen(
-      find_scan_.opts.replace_with.data(),
-      static_cast<gssize>(find_scan_.opts.replace_with.bytes())));
-  const int chunk = find_chunk_size();
-  int cursor_off = find_scan_.cursor_off;
-  for (int n = 0; n < chunk; ++n) {
-    int ms = 0;
-    int me = 0;
-    const SearchStep step = step_search(false, cursor_off, ms, me);
-    if (step == SearchStep::Yield) {
-      find_scan_.cursor_off = cursor_off;
-      return true;
+  const int count = static_cast<int>(find_scan_.hits.size());
+  find_scan_.count = count;
+  if (count > 0) {
+    const Glib::ustring whole = buf->get_text();
+    const Glib::ustring& repl = find_scan_.opts.replace_with;
+    Glib::ustring neu;
+    int cursor = find_scan_.replace_start;
+    const int end = find_scan_.replace_end;
+    neu.reserve(static_cast<std::size_t>(std::max(0, end - cursor)) +
+                static_cast<std::size_t>(count) * repl.length());
+    for (const auto& hit : find_scan_.hits) {
+      if (hit.first > cursor) {
+        neu.append(whole.substr(
+            static_cast<Glib::ustring::size_type>(cursor),
+            static_cast<Glib::ustring::size_type>(hit.first - cursor)));
+      }
+      neu.append(repl);
+      cursor = hit.second;
     }
-    if (step != SearchStep::Hit) {
-      find_scan_.cursor_off = cursor_off;
-      finish_find_scan(true);
-      return false;
+    if (cursor < end) {
+      neu.append(whole.substr(
+          static_cast<Glib::ustring::size_type>(cursor),
+          static_cast<Glib::ustring::size_type>(end - cursor)));
     }
-    buf->erase(buf->get_iter_at_offset(ms), buf->get_iter_at_offset(me));
-    buf->insert(buf->get_iter_at_offset(ms), find_scan_.opts.replace_with);
-    cursor_off = ms + repl_chars;
-    ++find_scan_.count;
+    apply_bulk_replace(find_scan_.replace_start, end, neu);
   }
-  find_scan_.cursor_off = cursor_off;
-  return true;
+  find_scan_.hits.clear();
+  finish_find_scan(true);
+  return false;
 }
 
 bool MainWindow::on_find_idle() {
@@ -3907,7 +4726,7 @@ int MainWindow::replace_all(const FindOptions& opts) {
     return 0;
   }
 
-  // Collect offsets first so indices stay valid while we edit from end.
+  // One pass builds the replacement. One buffer edit is one undo step.
   struct Hit {
     int start_off;
     int end_off;
@@ -3927,20 +4746,69 @@ int MainWindow::replace_all(const FindOptions& opts) {
       }
     }
   }
-
-  buf->begin_user_action();
-  for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
-    auto a = buf->get_iter_at_offset(it->start_off);
-    auto b = buf->get_iter_at_offset(it->end_off);
-    buf->erase(a, b);
-    a = buf->get_iter_at_offset(it->start_off);
-    buf->insert(a, opts.replace_with);
+  if (hits.empty()) {
+    return 0;
   }
+
+  const int start = range_begin.get_offset();
+  const int end = range_end.get_offset();
+  const Glib::ustring whole = buf->get_text();
+  Glib::ustring neu;
+  neu.reserve(static_cast<std::size_t>(std::max(0, end - start)) +
+              hits.size() * opts.replace_with.length());
+  int at = start;
+  for (const auto& hit : hits) {
+    if (hit.start_off > at) {
+      neu.append(whole.substr(
+          static_cast<Glib::ustring::size_type>(at),
+          static_cast<Glib::ustring::size_type>(hit.start_off - at)));
+    }
+    neu.append(opts.replace_with);
+    at = hit.end_off;
+  }
+  if (at < end) {
+    neu.append(whole.substr(static_cast<Glib::ustring::size_type>(at),
+                            static_cast<Glib::ustring::size_type>(end - at)));
+  }
+  apply_bulk_replace(start, end, neu);
+  return static_cast<int>(hits.size());
+}
+
+bool MainWindow::apply_bulk_replace(int start_off, int end_off,
+                                    const Glib::ustring& neu) {
+  auto buf = buffer();
+  if (!buf) {
+    return false;
+  }
+  const Glib::ustring old =
+      buf->get_iter_at_offset(start_off).get_text(buf->get_iter_at_offset(end_off));
+  const int old_nl = static_cast<int>(count_newlines(old.data(), old.bytes()));
+  const int new_nl = static_cast<int>(count_newlines(neu.data(), neu.bytes()));
+  const bool keep = !source_lines_.empty() && old_nl == new_nl;
+  std::vector<char> kinds;
+  if (keep) {
+    snapshot_endings();
+    kinds = ending_kinds();
+  }
+  buf->begin_user_action();
+  const bool saved_restore = ending_restore_;
+  if (keep) {
+    ending_restore_ = true;
+  }
+  buf->erase(buf->get_iter_at_offset(start_off), buf->get_iter_at_offset(end_off));
+  buf->insert(buf->get_iter_at_offset(start_off), neu);
+  ending_restore_ = saved_restore;
   buf->end_user_action();
+  if (keep && static_cast<int>(kinds.size()) == buf->get_line_count()) {
+    remember_source_lines(buf->get_text(), kinds);
+  } else if (!source_lines_.empty()) {
+    source_lines_.clear();
+    clear_ending_history();
+  }
   clear_find_highlights();
   update_undo_redo_sensitivity();
   update_status();
-  return static_cast<int>(hits.size());
+  return true;
 }
 
 void MainWindow::on_find() {
@@ -4163,6 +5031,7 @@ void MainWindow::on_toggle_wrap() {
   if (suppress_wrap_pref_) {
     text_view_.set_wrap_mode(wrap_item_->get_active() ? Gtk::WRAP_WORD_CHAR
                                                       : Gtk::WRAP_NONE);
+    sync_long_line_window();
     return;
   }
   if (wrap_item_->get_active() && buffer_has_long_line()) {
@@ -4170,6 +5039,7 @@ void MainWindow::on_toggle_wrap() {
     wrap_item_->set_active(false);
     suppress_wrap_pref_ = false;
     text_view_.set_wrap_mode(Gtk::WRAP_NONE);
+    sync_long_line_window();
     report_error(
         "Wrap stays off.",
         "A line is still too long to wrap. Wrap turns back on when that line is shorter.");
@@ -4178,6 +5048,7 @@ void MainWindow::on_toggle_wrap() {
   text_view_.set_wrap_mode(wrap_item_->get_active() ? Gtk::WRAP_WORD_CHAR
                                                     : Gtk::WRAP_NONE);
   app_.set_wrap_text(wrap_item_->get_active());
+  sync_long_line_window();
   if (gutter_) {
     gutter_->queue_draw();
   }
@@ -4310,6 +5181,7 @@ void MainWindow::on_font_tag_inserted(const Gtk::TextBuffer::iterator& pos,
   if (buf->get_modified() != modified) {
     buf->set_modified(modified);
   }
+  sync_long_line_window();
 }
 
 void MainWindow::apply_font(const Pango::FontDescription& desc,

@@ -1,10 +1,10 @@
 #!/bin/sh
-# Build lunduke-edit_0.9-6_amd64.deb into packaging/debs/ (overlay apt only).
+# Build lunduke-edit_0.9-7_amd64.deb into packaging/debs/ (overlay apt only).
 # Does NOT seed lcos-live-06/config/packages.chroot.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="0.9-6"
+VERSION="0.9-7"
 PKGNAME="lunduke-edit_${VERSION}_amd64"
 BUILD="$ROOT/build-deb"
 DEST="$ROOT/packaging/src/lunduke-edit"

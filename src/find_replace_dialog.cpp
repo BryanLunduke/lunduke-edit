@@ -14,7 +14,6 @@ enum {
   RESP_FIND_ALL = 2,
   RESP_REPLACE = 3,
   RESP_REPLACE_ALL = 4,
-  RESP_DONT_FIND = 5,
 };
 
 Gtk::Box* make_opt_row(Gtk::Widget& a, Gtk::Widget& b) {
@@ -77,11 +76,10 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
   find_all_btn_ = Gtk::manage(new Gtk::Button("Find _All", true));
   replace_btn_ = Gtk::manage(new Gtk::Button("_Replace", true));
   replace_all_btn_ = Gtk::manage(new Gtk::Button("Replace A_ll", true));
-  dont_find_btn_ = Gtk::manage(new Gtk::Button("_Don't Find", true));
   cancel_btn_ = Gtk::manage(new Gtk::Button("_Cancel", true));
 
   for (auto* b : {find_btn_, find_all_btn_, replace_btn_, replace_all_btn_,
-                  dont_find_btn_, cancel_btn_}) {
+                  cancel_btn_}) {
     b->set_size_request(120, -1);
     b->set_valign(Gtk::ALIGN_CENTER);
     b->set_halign(Gtk::ALIGN_FILL);
@@ -116,8 +114,8 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
   band(search_entry_, *find_btn_, kLabelEntryGap);
 
   // Remaining buttons stay size-grouped (banded) with left rows. Column shift
-  // places Find All on the first checkbox row; Replace / Replace All / Don't
-  // Find keep vertical banding with the rows beside them. Gap from entry to
+  // places Find All on the first checkbox row; Replace / Replace All keep
+  // vertical banding with the rows beside them. Gap from entry to
   // first checkbox is plain kBandSpacing (no stretched search-block slack).
   band(*make_opt_row(start_at_top_, search_selection_only_), *find_all_btn_,
        kBandSpacing);
@@ -127,7 +125,8 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
        kBandSpacing);
 
   case_sensitive_.set_halign(Gtk::ALIGN_START);
-  band(case_sensitive_, *dont_find_btn_, kBandSpacing);
+  auto* case_pad = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, 0));
+  band(case_sensitive_, *case_pad, kBandSpacing);
 
   // Replace With: tight label→entry (same gap as Search For).
   auto* replace_label = Gtk::manage(new Gtk::Label("Replace With:", true));
@@ -167,9 +166,6 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
       on_action(Action::ReplaceAll, collect());
     }
   });
-  dont_find_btn_->signal_clicked().connect([this]() {
-    response(RESP_DONT_FIND);
-  });
   cancel_btn_->signal_clicked().connect([this]() {
     response(Gtk::RESPONSE_CANCEL);
   });
@@ -203,7 +199,7 @@ FindOptions FindReplaceDialog::collect() const {
 }
 
 void FindReplaceDialog::on_response(int response_id) {
-  if (response_id == RESP_DONT_FIND || response_id == Gtk::RESPONSE_CANCEL ||
+  if (response_id == Gtk::RESPONSE_CANCEL ||
       response_id == Gtk::RESPONSE_DELETE_EVENT) {
     hide();
   }

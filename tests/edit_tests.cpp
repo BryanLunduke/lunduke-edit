@@ -4,8 +4,11 @@
 #include "main_window.hpp"
 
 #include <glib.h>
+#include <functional>
+#include <glibmm/convert.h>
 #include <gtkmm/textiter.h>
 #include <gtkmm/clipboard.h>
+#include <gdkmm/cursor.h>
 
 #include <giomm/file.h>
 #include <gtkmm/printoperation.h>
@@ -77,6 +80,22 @@ ssize_t short_inplace_write(int fd, const void* buf, std::size_t n, bool) {
 int fail_dir_fsync(int) {
   errno = EOPNOTSUPP;
   return -1;
+}
+
+struct AccelProbe {
+  guint key;
+  GdkModifierType mods;
+  bool found;
+};
+
+gboolean find_accel(GtkAccelKey* key, GClosure*, gpointer data) {
+  auto* probe = static_cast<AccelProbe*>(data);
+  if (key->accel_key == probe->key &&
+      (key->accel_mods & GDK_MODIFIER_MASK) == probe->mods) {
+    probe->found = true;
+    return TRUE;
+  }
+  return FALSE;
 }
 
 }  // namespace
@@ -3039,6 +3058,564 @@ struct EditChecks {
     g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
   }
 
+  static bool accel_present(MainWindow& w, guint key, GdkModifierType mods) {
+    AccelProbe probe{key, mods, false};
+    if (!w.get_accel_group()) {
+      return false;
+    }
+    gtk_accel_group_find(w.get_accel_group()->gobj(), find_accel, &probe);
+    return probe.found;
+  }
+
+  static void walk_widgets(Gtk::Widget& widget,
+                           const std::function<void(Gtk::Widget&)>& fn) {
+    fn(widget);
+    if (auto* container = dynamic_cast<Gtk::Container*>(&widget)) {
+      for (auto* child : container->get_children()) {
+        if (child) {
+          walk_widgets(*child, fn);
+        }
+      }
+    }
+  }
+
+  static bool drop_uris(MainWindow& w, const std::vector<std::string>& paths,
+                        bool on_window) {
+    std::string payload;
+    for (const auto& path : paths) {
+      payload += Glib::filename_to_uri(path);
+      payload += "\r\n";
+    }
+    struct Store {
+      std::string payload;
+    };
+    auto* store = new Store{payload};
+    GtkTargetEntry entry {};
+    entry.target = const_cast<char*>("text/uri-list");
+    entry.flags = 0;
+    entry.info = 0;
+    auto* clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_with_data(
+        clip, &entry, 1,
+        [](GtkClipboard*, GtkSelectionData* sel, guint, gpointer data) {
+          auto* stored = static_cast<Store*>(data);
+          gtk_selection_data_set(
+              sel, gdk_atom_intern_static_string("text/uri-list"), 8,
+              reinterpret_cast<const guchar*>(stored->payload.data()),
+              static_cast<gint>(stored->payload.size()));
+        },
+        [](GtkClipboard*, gpointer data) { delete static_cast<Store*>(data); },
+        store);
+    flush_ui();
+    Gtk::SelectionData sel =
+        Gtk::Clipboard::get()->wait_for_contents("text/uri-list");
+    if (sel.get_length() <= 0) {
+      return false;
+    }
+    GdkDragContext* ctx =
+        GDK_DRAG_CONTEXT(g_object_new(GDK_TYPE_X11_DRAG_CONTEXT, nullptr));
+    if (ctx == nullptr) {
+      return false;
+    }
+    GtkWidget* target = on_window ? GTK_WIDGET(w.gobj())
+                                  : GTK_WIDGET(w.text_view_.gobj());
+    g_signal_emit_by_name(target, "drag-data-received", ctx, 0, 0, sel.gobj(),
+                          static_cast<guint>(0), static_cast<guint>(0));
+    g_object_unref(ctx);
+    flush_ui();
+    return true;
+  }
+
+  static void test_round6(Application& app, MainWindow& w, const std::string& dir) {
+    std::cout << "round6 begin\n";
+    w.refresh_disk_flags();
+    if (w.dirty_ || w.file_unreadable_) {
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+      w.on_new();
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    }
+
+    // 1. A stat failure defaults to Save As, and that button writes a new file.
+    if (::geteuid() == 0) {
+      expect(false, "stat-failure Save As test needs a non-root user");
+    } else {
+      const std::string locked_dir = dir + "/round6-locked";
+      g_mkdir_with_parents(locked_dir.c_str(), 0700);
+      const std::string locked = locked_dir + "/file.txt";
+      write_bytes(locked, "stat-bytes");
+      expect(w.open_file(locked), "open the file that will be unstatable");
+      expect(::chmod(locked_dir.c_str(), 0000) == 0, "hide the parent directory");
+      w.refresh_disk_flags();
+      expect(w.file_unreadable_, "round6 stat failure is remembered");
+      const int errors = w.error_reports_;
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+      expect(!w.confirm_discard_or_save(), "stat failure still asks");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      expect(w.last_prompt_default_ == MainWindow::kPromptSaveAs,
+             "stat failure defaults to Save As");
+      expect(w.last_prompt_accept_.find("Save") != Glib::ustring::npos &&
+                 w.last_prompt_accept_.find("As") != Glib::ustring::npos,
+             "the default button is Save As");
+      expect(w.error_reports_ == errors, "the question is not an error dialog");
+      const std::string copied = dir + "/round6-saveas.txt";
+      ::unlink(copied.c_str());
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "save-as", TRUE);
+      g_setenv("LUNDUKE_EDIT_TEST_SAVE_AS", copied.c_str(), TRUE);
+      expect(w.confirm_discard_or_save(), "Save As from the question writes");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      g_unsetenv("LUNDUKE_EDIT_TEST_SAVE_AS");
+      expect(w.error_reports_ == errors, "Save As does not add an error dialog");
+      expect(::chmod(locked_dir.c_str(), 0700) == 0, "restore the parent");
+      expect(read_bytes(locked) == "stat-bytes", "Save As leaves the old path");
+      expect(read_bytes(copied) == "stat-bytes", "Save As wrote the new path");
+      expect(w.file_path_ == copied, "the window follows the new path");
+    }
+
+    // 2. A 20 MB open stays on the main loop, byte for byte.
+    {
+      const std::string big = dir + "/round6-20mb.txt";
+      constexpr std::size_t kBytes = 20u * 1024u * 1024u;
+      std::string bytes(kBytes, '\n');
+      const char* piece = "0123456789abcdef0123456789abcdef";
+      for (std::size_t i = 0; i + 32 < bytes.size(); i += 33) {
+        std::memcpy(&bytes[i], piece, 32);
+      }
+      write_bytes(big, bytes);
+      w.buffer()->set_text("before-open");
+      w.buffer()->set_modified(false);
+      w.set_dirty(false);
+
+      struct Tick {
+        MainWindow* window;
+        gint64 last;
+        gint64 max_gap;
+        int count;
+        bool saw_opening;
+        bool saw_watch;
+      } tick{&w, 0, 0, 0, false, false};
+      const guint timer = g_timeout_add(
+          10,
+          [](gpointer data) -> gboolean {
+            auto* t = static_cast<Tick*>(data);
+            const gint64 now = g_get_monotonic_time();
+            if (t->last != 0) {
+              t->max_gap = std::max(t->max_gap, now - t->last);
+            }
+            t->last = now;
+            ++t->count;
+            if (t->window->status_find_.get_text().find("Opening") !=
+                Glib::ustring::npos) {
+              t->saw_opening = true;
+            }
+            auto cursor_is_watch = [](const Glib::RefPtr<Gdk::Window>& win) {
+              if (!win) {
+                return false;
+              }
+              auto cursor = win->get_cursor();
+              return cursor && cursor->get_cursor_type() == Gdk::WATCH;
+            };
+            if (cursor_is_watch(t->window->get_window()) ||
+                cursor_is_watch(
+                    t->window->text_view_.get_window(Gtk::TEXT_WINDOW_TEXT))) {
+              t->saw_watch = true;
+            }
+            return TRUE;
+          },
+          &tick);
+      expect(w.open_file(big), "20 MB file opens");
+      g_source_remove(timer);
+      std::cout << "round6 open ticks " << tick.count << " max_gap_us "
+                << tick.max_gap << "\n";
+      expect(tick.count >= 5, "the main loop ticked during open");
+      expect(tick.max_gap < 500000, "open did not freeze the main loop");
+      expect(tick.saw_opening, "open shows an Opening status line");
+      expect(tick.saw_watch, "open shows a busy cursor");
+      expect(w.buffer()->get_text() == bytes, "opened text is byte-exact");
+      expect(!w.buffer()->get_modified(), "open does not mark the buffer");
+      expect(!w.dirty_, "open does not mark the document dirty");
+      expect(!w.buffer()->can_undo(), "open is not an undo step");
+      expect(font_tag_at(w, 0), "opened text keeps the editor font");
+
+      FindOptions miss;
+      miss.search_for = "NOT-IN-THIS-FILE";
+      miss.start_at_top = true;
+      miss.wrap_around = false;
+      struct Gap {
+        gint64 last;
+        gint64 max_gap;
+        int count;
+      } gap{0, 0, 0};
+      const guint find_timer = g_timeout_add(
+          10,
+          [](gpointer data) -> gboolean {
+            auto* g = static_cast<Gap*>(data);
+            const gint64 now = g_get_monotonic_time();
+            if (g->last != 0) {
+              g->max_gap = std::max(g->max_gap, now - g->last);
+            }
+            g->last = now;
+            ++g->count;
+            return TRUE;
+          },
+          &gap);
+      expect(!w.find_match(miss, false), "a missing search misses");
+      g_source_remove(find_timer);
+      std::cout << "round6 find ticks " << gap.count << " max_gap_us "
+                << gap.max_gap << "\n";
+      expect(gap.count >= 3, "a long miss returns to the main loop");
+      expect(gap.max_gap < 500000, "a long miss does not freeze the main loop");
+      expect(w.buffer()->get_text() == bytes, "a miss leaves the text");
+    }
+
+    // Cancel and close during a load.
+    {
+      const std::string mid = dir + "/round6-cancel.txt";
+      std::string bytes(4u * 1024u * 1024u, 'm');
+      for (std::size_t i = 40; i < bytes.size(); i += 41) {
+        bytes[i] = '\n';
+      }
+      write_bytes(mid, bytes);
+      w.buffer()->set_text("keep-me");
+      struct Esc {
+        MainWindow* window;
+        bool fired;
+      } esc{&w, false};
+      const guint esc_timer = g_timeout_add(
+          1,
+          [](gpointer data) -> gboolean {
+            auto* e = static_cast<Esc*>(data);
+            if (!e->window->loading_) {
+              return TRUE;
+            }
+            e->fired = true;
+            GdkEventKey event {};
+            event.keyval = GDK_KEY_Escape;
+            e->window->on_key_press_event(&event);
+            return FALSE;
+          },
+          &esc);
+      expect(!w.open_file(mid), "escape cancels an open");
+      if (!esc.fired) {
+        g_source_remove(esc_timer);
+      }
+      expect(esc.fired, "escape ran during the load");
+      expect(w.buffer()->get_text() == "keep-me", "cancel keeps the previous text");
+      expect(w.get_visible(), "cancel leaves the window open");
+
+      auto* other = app.create_window();
+      other->present();
+      flush_ui();
+      other->buffer()->set_text("");
+      other->buffer()->set_modified(false);
+      const int windows = main_window_count(app);
+      struct Closer {
+        MainWindow* window;
+        bool fired;
+      } closer{other, false};
+      const guint close_timer = g_timeout_add(
+          1,
+          [](gpointer data) -> gboolean {
+            auto* c = static_cast<Closer*>(data);
+            if (!c->window->loading_) {
+              return TRUE;
+            }
+            c->fired = true;
+            c->window->on_delete_event(nullptr);
+            return FALSE;
+          },
+          &closer);
+      expect(!other->open_file(mid), "close cancels an open");
+      if (!closer.fired) {
+        g_source_remove(close_timer);
+      }
+      expect(closer.fired, "close ran during the load");
+      expect(!other->get_visible(), "close during load hides that window");
+      flush_ui();
+      expect(main_window_count(app) == windows - 1,
+             "close during load deletes that window");
+      expect(w.get_visible(), "close during load leaves the other window");
+      expect(w.buffer()->get_text() == "keep-me", "the other window's text stays");
+    }
+
+    // 3. Replace All is one fast undo step.
+    {
+      std::string body;
+      body.reserve(30'000 * 11);
+      for (int i = 0; i < 30000; ++i) {
+        body += "alpha beta\n";
+      }
+      w.buffer()->begin_not_undoable_action();
+      w.buffer()->set_text(body);
+      w.buffer()->end_not_undoable_action();
+      w.buffer()->set_modified(false);
+      expect(!w.buffer()->can_undo(), "the fixture is not an undo step");
+      FindOptions repl;
+      repl.search_for = "alpha";
+      repl.replace_with = "omega";
+      const gint64 started = g_get_monotonic_time();
+      expect(w.replace_all(repl) == 30000, "replace all hits every line");
+      const gint64 replace_us = g_get_monotonic_time() - started;
+      std::cout << "round6 replace_us " << replace_us << "\n";
+      expect(replace_us < 5000000, "replace all stays within a few seconds");
+      expect(w.buffer()->can_undo(), "replace all can be undone");
+      expect(font_tag_at(w, 0), "replaced text keeps the editor font");
+      const gint64 undo_started = g_get_monotonic_time();
+      w.on_undo();
+      const gint64 undo_us = g_get_monotonic_time() - undo_started;
+      std::cout << "round6 undo_us " << undo_us << "\n";
+      expect(undo_us < 5000000, "undo of replace all stays within a few seconds");
+      expect(w.buffer()->get_text() == body, "one undo restores replace all");
+      expect(!w.buffer()->can_undo(), "replace all was a single undo step");
+    }
+
+    // 4. Typing at the end of a very long line stays responsive.
+    {
+      const bool wrap_was = w.app_.wrap_text();
+      if (w.wrap_item_ && !w.wrap_item_->get_active()) {
+        w.wrap_item_->set_active(true);
+      }
+      expect(w.app_.wrap_text(), "wrap preference is on for the long line");
+      const std::string line(200000, 'a');
+      w.buffer()->set_text(line);
+      flush_ui();
+      expect(w.text_view_.get_wrap_mode() == Gtk::WRAP_NONE,
+             "a very long line forces wrap off");
+      expect(w.app_.wrap_text(), "the wrap preference stays on");
+      const gint64 started = g_get_monotonic_time();
+      constexpr int kKeys = 5;
+      for (int i = 0; i < kKeys; ++i) {
+        w.buffer()->insert(w.buffer()->end(), "z");
+        flush_ui();
+      }
+      const gint64 each =
+          (g_get_monotonic_time() - started) / kKeys;
+      std::cout << "round6 long_line_us " << each << "\n";
+      expect(each < 40000, "typing at the end of a long line stays fast");
+      expect(w.buffer()->get_char_count() == 200000 + kKeys,
+             "the long line kept every character");
+      expect(w.buffer()->begin().has_tag(w.long_hidden_tag_),
+             "the start of a long line is outside the caret window");
+      Gtk::TextIter tail = w.buffer()->end();
+      tail.backward_char();
+      expect(!tail.has_tag(w.long_hidden_tag_),
+             "the character at the caret stays visible");
+      w.buffer()->place_cursor(w.buffer()->begin());
+      flush_ui();
+      expect(!w.buffer()->begin().has_tag(w.long_hidden_tag_),
+             "Home shows the start of the long line");
+      const int before_undo = w.buffer()->get_char_count();
+      w.on_undo();
+      expect(w.buffer()->get_char_count() == before_undo - 1,
+             "undo removes the typed character");
+      expect(w.text_view_.get_wrap_mode() == Gtk::WRAP_NONE,
+             "wrap stays off while the line is long");
+      if (!wrap_was && w.wrap_item_) {
+        w.buffer()->set_text("short\n");
+        flush_ui();
+        w.wrap_item_->set_active(false);
+      }
+    }
+
+    // 5. First-run menus.
+    {
+      std::vector<std::string> top;
+      for (auto* child : w.menubar_.get_children()) {
+        auto* item = dynamic_cast<Gtk::MenuItem*>(child);
+        if (!item) {
+          continue;
+        }
+        top.push_back(item->get_label());
+      }
+      expect(top.size() == 5, "five top-level menus");
+      expect(top.size() == 5 && top[0].find("File") != std::string::npos &&
+                 top[1].find("Edit") != std::string::npos &&
+                 top[2].find("Search") != std::string::npos &&
+                 top[3].find("Text") != std::string::npos &&
+                 top[4].find("Help") != std::string::npos,
+             "menus are File, Edit, Search, Text, Help");
+      bool top_font = false;
+      for (const auto& label : top) {
+        if (label.find("Font") != std::string::npos) {
+          top_font = true;
+        }
+      }
+      expect(!top_font, "Font is not a top-level menu");
+      int font_items = 0;
+      int section_hits = 0;
+      if (auto* text_item = dynamic_cast<Gtk::MenuItem*>(w.menubar_.get_children()[3])) {
+        for (auto* child : text_item->get_submenu()->get_children()) {
+          auto* item = dynamic_cast<Gtk::MenuItem*>(child);
+          if (!item) {
+            continue;
+          }
+          if (item->get_label().find("Font") != std::string::npos) {
+            ++font_items;
+          }
+          if (auto* label = dynamic_cast<Gtk::Label*>(item->get_child())) {
+            const std::string text = label->get_text();
+            if (text == "Encoding" || text == "Open Next File As") {
+              ++section_hits;
+              expect(item->get_sensitive(), "section titles are not greyed out");
+            }
+          }
+        }
+      }
+      expect(font_items == 1, "Text contains one Font command");
+      expect(section_hits == 2, "Encoding and Open Next File As are section titles");
+      expect(w.open_utf8_item_ &&
+                 w.open_utf8_item_->get_label().find("Next file") != std::string::npos &&
+                 w.open_utf8_item_->get_label().find("_8") != std::string::npos,
+             "next-file UTF-8 has its own mnemonic");
+      expect(w.open_latin1_item_ &&
+                 w.open_latin1_item_->get_label().find("Next file") != std::string::npos &&
+                 w.open_latin1_item_->get_label().find("_1") != std::string::npos,
+             "next-file Latin-1 has its own mnemonic");
+      expect(w.enc_utf8_item_->get_label() != w.open_utf8_item_->get_label(),
+             "open-next does not reuse the encoding label");
+      expect(accel_present(w, GDK_KEY_n, GDK_CONTROL_MASK), "Ctrl+N");
+      expect(accel_present(w, GDK_KEY_o, GDK_CONTROL_MASK), "Ctrl+O");
+      expect(accel_present(w, GDK_KEY_s, GDK_CONTROL_MASK), "Ctrl+S");
+      expect(accel_present(w, GDK_KEY_s,
+                           static_cast<GdkModifierType>(GDK_CONTROL_MASK | GDK_SHIFT_MASK)),
+             "Ctrl+Shift+S");
+      expect(accel_present(w, GDK_KEY_p, GDK_CONTROL_MASK), "Ctrl+P");
+      expect(accel_present(w, GDK_KEY_q, GDK_CONTROL_MASK), "Ctrl+Q");
+      expect(accel_present(w, GDK_KEY_z, GDK_CONTROL_MASK), "Ctrl+Z");
+      expect(accel_present(w, GDK_KEY_f, GDK_CONTROL_MASK), "Ctrl+F");
+      expect(accel_present(w, GDK_KEY_F3, static_cast<GdkModifierType>(0)), "F3");
+      expect(accel_present(w, GDK_KEY_g, GDK_CONTROL_MASK), "Ctrl+G");
+    }
+
+    // 6. Don't Find is gone. Cancel remains.
+    {
+      FindReplaceDialog dlg(w, FindOptions{});
+      int dont = 0;
+      int cancel = 0;
+      walk_widgets(*dlg.get_content_area(), [&](Gtk::Widget& widget) {
+        if (auto* button = dynamic_cast<Gtk::Button*>(&widget)) {
+          const auto label = button->get_label();
+          if (label.find("Don't Find") != Glib::ustring::npos ||
+              label.find("Dont Find") != Glib::ustring::npos) {
+            ++dont;
+          }
+          if (label.find("Cancel") != Glib::ustring::npos) {
+            ++cancel;
+          }
+        }
+      });
+      expect(dont == 0, "Don't Find is not in the dialog");
+      expect(cancel == 1, "Cancel is the way out of Find");
+    }
+
+    // 7. File drops open. Text drops still insert.
+    {
+      const std::string dropped = dir + "/round6-drop.txt";
+      write_bytes(dropped, "dropped-text");
+      const std::string second = dir + "/round6-drop-2.txt";
+      write_bytes(second, "second-drop");
+      flush_ui();
+      GtkTargetList* view_targets =
+          gtk_drag_dest_get_target_list(GTK_WIDGET(w.text_view_.gobj()));
+      GtkTargetList* win_targets =
+          gtk_drag_dest_get_target_list(GTK_WIDGET(w.gobj()));
+      const GdkAtom uri_atom = gdk_atom_intern_static_string("text/uri-list");
+      expect(view_targets && gtk_target_list_find(view_targets, uri_atom, nullptr),
+             "the text view accepts file drops");
+      expect(win_targets && gtk_target_list_find(win_targets, uri_atom, nullptr),
+             "the window accepts file drops");
+
+      w.buffer()->set_text("dirty-drop");
+      w.buffer()->set_modified(true);
+      w.refresh_dirty_from_buffer();
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+      expect(drop_uris(w, {dropped}, false), "synthesized file drop is delivered");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      expect(w.buffer()->get_text() == "dirty-drop",
+             "cancelling a file drop keeps the buffer");
+
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+      expect(drop_uris(w, {dropped}, false), "file drop opens after discard");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      expect(w.buffer()->get_text() == "dropped-text", "a file drop opens the file");
+      expect(w.file_path_ == dropped, "a file drop uses the open path");
+      expect(font_tag_at(w, 0), "a dropped file keeps the editor font");
+
+      auto* other = app.create_window();
+      other->present();
+      flush_ui();
+      w.buffer()->insert(w.buffer()->end(), "!");
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+      expect(drop_uris(*other, {dropped}, true), "drop on another window is delivered");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      expect(w.buffer()->get_text() == "dropped-text!",
+             "a dirty window is not reloaded when the drop is cancelled");
+      expect(!other->edits_path(dropped),
+             "the empty window does not take a file another window has");
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+      expect(drop_uris(*other, {dropped}, true), "drop reuses the existing window");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      flush_ui();
+      expect(w.buffer()->get_text() == "dropped-text",
+             "the drop reloaded the window that already had the file");
+      expect(w.edits_path(dropped), "the original window still has the file");
+      other->hide();
+      flush_ui();
+
+      w.buffer()->set_text("xy");
+      expect(drop_text(w, 1, "Z"), "a text drop is still delivered");
+      expect(w.buffer()->get_text() == "xZy", "dragging text inside the view still inserts");
+
+      const int errors = w.error_reports_;
+      const Glib::ustring before = w.buffer()->get_text();
+      std::string remote = "sftp://example.invalid/nope.txt";
+      // A non-native URI is reported and does not replace the buffer.
+      {
+        std::string payload = remote + "\r\n";
+        struct Store {
+          std::string payload;
+        };
+        auto* store = new Store{payload};
+        GtkTargetEntry entry {};
+        entry.target = const_cast<char*>("text/uri-list");
+        gtk_clipboard_set_with_data(
+            gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), &entry, 1,
+            [](GtkClipboard*, GtkSelectionData* sel, guint, gpointer data) {
+              auto* stored = static_cast<Store*>(data);
+              gtk_selection_data_set(
+                  sel, gdk_atom_intern_static_string("text/uri-list"), 8,
+                  reinterpret_cast<const guchar*>(stored->payload.data()),
+                  static_cast<gint>(stored->payload.size()));
+            },
+            [](GtkClipboard*, gpointer data) { delete static_cast<Store*>(data); },
+            store);
+        flush_ui();
+        Gtk::SelectionData sel =
+            Gtk::Clipboard::get()->wait_for_contents("text/uri-list");
+        GdkDragContext* ctx =
+            GDK_DRAG_CONTEXT(g_object_new(GDK_TYPE_X11_DRAG_CONTEXT, nullptr));
+        g_signal_emit_by_name(w.text_view_.gobj(), "drag-data-received", ctx, 0, 0,
+                              sel.gobj(), static_cast<guint>(0),
+                              static_cast<guint>(0));
+        g_object_unref(ctx);
+        flush_ui();
+      }
+      expect(w.error_reports_ == errors + 1, "a remote drop is reported");
+      expect(w.buffer()->get_text() == before, "a remote drop does not change the buffer");
+
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+      expect(drop_uris(w, {dropped, second}, false), "two files can be dropped");
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      flush_ui();
+      expect(w.file_path_ == dropped || w.buffer()->get_text() == "dropped-text",
+             "the first dropped file opens here");
+      expect(window_has_path(app, second), "the second dropped file opens too");
+    }
+
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    g_unsetenv("LUNDUKE_EDIT_TEST_SAVE_AS");
+    std::cout << "round6 end\n";
+  }
+
   static void test_round5(Application& app, MainWindow& w, const std::string& dir) {
     test_round5_font(app, w, dir);
     test_round5_print(w, dir);
@@ -3081,6 +3658,7 @@ struct EditChecks {
     test_round3(*app.get(), *w, dir);
     test_round4(*app.get(), *w, dir, startup_face);
     test_round5(*app.get(), *w, dir);
+    test_round6(*app.get(), *w, dir);
 
     if (!font_path.empty()) {
       if (saved_font.empty()) {

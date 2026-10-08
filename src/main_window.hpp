@@ -5,6 +5,8 @@
 #include "find_replace_dialog.hpp"
 #include "line_gutter.hpp"
 
+#include <giomm/asyncresult.h>
+#include <gdkmm/cursor.h>
 #include <gdkmm/dragcontext.h>
 #include <gtkmm/applicationwindow.h>
 #include <gtkmm/box.h>
@@ -33,7 +35,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 typedef struct _GtkTextView GtkTextView;
@@ -77,6 +81,9 @@ public:
   static int (*test_dir_fsync_hook_)(int fd);
   static std::function<void(MainWindow*)> test_during_large_confirm_;
   static std::function<const char*(MainWindow*)> test_discard_choice_;
+
+  // Affirmative response on the stat-failure question. Enter runs Save As.
+  static constexpr int kPromptSaveAs = 100;
 
   enum class NewlineStyle { Lf, Crlf, Cr };
 
@@ -128,11 +135,18 @@ private:
   void on_drag_data_received(const Glib::RefPtr<Gdk::DragContext>& context,
                              int x, int y, const Gtk::SelectionData& data,
                              guint info, guint time);
+  void on_window_drag_data_received(const Glib::RefPtr<Gdk::DragContext>& context,
+                                    int x, int y, const Gtk::SelectionData& data,
+                                    guint info, guint time);
+  void open_dropped_uris(const std::vector<Glib::ustring>& uris);
   void sync_overwrite_status();
   void clear_document_search_pins();
   void sync_encoding_radios();
   void maybe_restore_wrap();
   bool buffer_has_long_line();
+  void note_line_length(int chars_in_line);
+  void sync_long_line_window();
+  bool apply_bulk_replace(int start_off, int end_off, const Glib::ustring& neu);
   enum class DiskChangeChoice { Cancel, Replace, Reload };
   DiskChangeChoice confirm_file_changed(const std::string& path);
   // Same path opened again. Re-reads when the inode or mtime changed.
@@ -272,7 +286,31 @@ private:
     std::size_t undo_bytes{0};
     int slice_steps{0};
     FindReplaceDialog* dlg{nullptr};
+    // Replace All collects hits, then commits them as one buffer edit.
+    bool collected{false};
+    std::vector<std::pair<int, int>> hits;
+    int replace_start{0};
+    int replace_end{0};
   };
+
+  struct LoadState;
+  void begin_load_chrome(const std::string& path);
+  void end_load_chrome();
+  void update_load_status();
+  bool start_async_load(const std::string& path);
+  void pump_async_load();
+  void fail_async_load(const std::shared_ptr<LoadState>& state,
+                       const std::string& primary, const std::string& secondary);
+  void abort_async_load(const std::shared_ptr<LoadState>& state);
+  void finish_async_load(const std::shared_ptr<LoadState>& state);
+  void schedule_load_read(const std::shared_ptr<LoadState>& state);
+  void begin_load_stream(const std::shared_ptr<LoadState>& state);
+  void on_load_opened(const std::shared_ptr<LoadState>& state,
+                      const Glib::RefPtr<Gio::AsyncResult>& result);
+  void on_load_chunk(const std::shared_ptr<LoadState>& state,
+                     const Glib::RefPtr<Gio::AsyncResult>& result);
+  bool on_load_idle(const std::shared_ptr<LoadState>& state);
+  bool commit_loaded_text(const std::shared_ptr<LoadState>& state);
 
   Application& app_;
 
@@ -375,12 +413,26 @@ private:
   bool font_user_chosen_{false};
   Glib::RefPtr<Gtk::CssProvider> font_css_;
   Glib::RefPtr<Gtk::TextTag> font_tag_;
+  // Hides the part of a very long line that is outside the caret window so
+  // typing does not shape the whole line. Wrap stays off.
+  Glib::RefPtr<Gtk::TextTag> long_hidden_tag_;
+  bool syncing_long_line_{false};
+  bool long_line_present_{false};
+  int long_window_line_{-1};
+  int long_window_begin_{0};
+  int long_window_end_{0};
+  std::shared_ptr<LoadState> load_;
+  bool loading_{false};
+  bool dropping_uris_{false};
+  bool load_saved_editable_{true};
+  Glib::RefPtr<Gdk::Cursor> load_watch_;
   // Timestamp of the last middle-button press. Later presses in the same
   // double- or triple-click do not insert again.
   std::uint32_t last_middle_paste_time_{0};
   // What the last save/close question would have focused, for tests.
   Glib::ustring last_prompt_primary_;
   Glib::ustring last_prompt_secondary_;
+  Glib::ustring last_prompt_accept_;
   int last_prompt_default_{0};
 
   FindOptions find_opts_;

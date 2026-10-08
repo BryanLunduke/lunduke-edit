@@ -1,3 +1,21 @@
+lunduke-edit (0.9-7) unstable; urgency=medium
+
+  * After a stat failure, Enter runs Save As. The question no longer
+    offers a Save that cannot write the path.
+  * Opening a large file reads in the background and fills the buffer in
+    idle slices, with a busy cursor and a status line. Cancel and close
+    during the load leave the previous text in place.
+  * Replace All is one buffer edit and one undo step.
+  * Typing at the end of a very long line stays on a short visible slice.
+    Wrap stays off for that line.
+  * The first-run menus are File, Edit, Search, Text, and Help. Encoding
+    and Open Next File As are section titles. The next-file choices have
+    their own mnemonics.
+  * Don't Find is gone. Cancel closes Find & Replace.
+  * Dropping a file on the window opens it.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 18:30:00 +0000
+
 lunduke-edit (0.9-6) unstable; urgency=medium
 
   * Text inserted at the start of the buffer, or anywhere it matches the

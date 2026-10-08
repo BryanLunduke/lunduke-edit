@@ -33,7 +33,6 @@ public:
     FindAll,
     Replace,
     ReplaceAll,
-    DontFind,
     Cancel,
   };
 
@@ -70,7 +69,6 @@ private:
   Gtk::Button* find_all_btn_{nullptr};
   Gtk::Button* replace_btn_{nullptr};
   Gtk::Button* replace_all_btn_{nullptr};
-  Gtk::Button* dont_find_btn_{nullptr};
   Gtk::Button* cancel_btn_{nullptr};
 
   std::vector<Glib::RefPtr<Gtk::SizeGroup>> size_groups_;

@@ -37,6 +37,10 @@ public:
   // Confirm every open document, then quit the process.
   bool confirm_quit();
 
+  // Open these local paths the same way a second launch does. The first
+  // path reuses a window that already has the file.
+  void open_documents(const std::vector<std::string>& paths);
+
   // Last window that actually received focus. A Gio open reuses it only when
   // it is still an empty untitled buffer.
   void note_window_focus(MainWindow* window);

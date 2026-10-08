@@ -341,6 +341,10 @@ void Application::drain_deferred_opens() {
   }
 }
 
+void Application::open_documents(const std::vector<std::string>& paths) {
+  open_files(paths);
+}
+
 void Application::open_files(const std::vector<std::string>& paths) {
   if (paths.empty()) {
     on_activate();
