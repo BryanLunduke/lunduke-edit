@@ -29,6 +29,10 @@
 #include <gtkmm/stock.h>
 #include <gtkmm/stylecontext.h>
 
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+#include <gdk/gdkx.h>
+#endif
+
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -98,7 +102,6 @@ constexpr int kLongLineChars = 4000;
 // tagged invisible so a keystroke does not shape the whole line. 4096 is
 // about the width GDK can scroll (windows stop at 32767 pixels).
 constexpr int kLongLineWindow = 4096;
-constexpr int kLoadInsertChars = 64 * 1024;
 constexpr gsize kLoadReadBytes = 256u * 1024u;
 constexpr int kFindSliceChars = 64 * 1024;
 constexpr int kDefaultMaxFindHits = 10000;
@@ -911,9 +914,10 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   encoding_ = "UTF-8";
   saved_encoding_ = "UTF-8";
 
-  auto buf = Gsv::Buffer::create();
-  buf->set_max_undo_levels(100);
-  text_view_.set_buffer(buf);
+  doc_buffer_ = Gsv::Buffer::create();
+  doc_buffer_->set_max_undo_levels(100);
+  text_view_.set_buffer(doc_buffer_);
+  auto buf = doc_buffer_;
   find_tag_ = buf->create_tag("lunduke-find-hit");
   find_tag_->property_background() = "#c4d8f0";
   long_hidden_tag_ = buf->create_tag("lunduke-long-line-hide");
@@ -1091,6 +1095,36 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   update_status();
   update_undo_redo_sensitivity();
   rebuild_recents_menu();
+
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  // Command-line open test: report the real map, the status text, and
+  // whether the busy cursor is on the window. Production builds omit this.
+  if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr) {
+    signal_map().connect([this]() {
+      unsigned long xid = 0;
+      int watch = 0;
+      if (auto win = get_window()) {
+        xid = static_cast<unsigned long>(gdk_x11_window_get_xid(win->gobj()));
+        auto cursor = win->get_cursor();
+        if (cursor && cursor->get_cursor_type() == Gdk::WATCH) {
+          watch = 1;
+        }
+      }
+      if (!watch) {
+        if (auto twin = text_view_.get_window(Gtk::TEXT_WINDOW_TEXT)) {
+          auto cursor = twin->get_cursor();
+          if (cursor && cursor->get_cursor_type() == Gdk::WATCH) {
+            watch = 1;
+          }
+        }
+      }
+      // watch before status: the status text contains spaces.
+      g_print("ARGV_MAPPED xid=%lu watch=%d status=%s\n", xid, watch,
+              status_find_.get_text().c_str());
+      fflush(stdout);
+    });
+  }
+#endif
 }
 
 struct MainWindow::LoadState {
@@ -1112,6 +1146,7 @@ struct MainWindow::LoadState {
   enum class Phase { Read, Insert };
   Phase phase{Phase::Read};
   bool decoded{false};
+  bool inserted{false};
   Glib::ustring text;
   std::vector<char> kinds;
   NewlineStyle newlines{NewlineStyle::Lf};
@@ -1130,6 +1165,12 @@ struct MainWindow::LoadState {
 };
 
 MainWindow::~MainWindow() {
+  // Reattach without refreshing the gutter. Child widgets are still
+  // alive here; a layout pass during teardown is not.
+  if (view_parked_ && doc_buffer_) {
+    text_view_.set_buffer(doc_buffer_);
+    view_parked_ = false;
+  }
   if (load_) {
     load_->window = nullptr;
     load_->cancel = true;
@@ -1145,7 +1186,37 @@ MainWindow::~MainWindow() {
 }
 
 Glib::RefPtr<Gsv::Buffer> MainWindow::buffer() {
+  if (doc_buffer_) {
+    return doc_buffer_;
+  }
   return Glib::RefPtr<Gsv::Buffer>::cast_static(text_view_.get_buffer());
+}
+
+void MainWindow::park_document_view() {
+  if (view_parked_ || !doc_buffer_) {
+    return;
+  }
+  if (!scratch_buffer_) {
+    scratch_buffer_ = Gtk::TextBuffer::create();
+  } else if (scratch_buffer_->get_char_count() != 0) {
+    scratch_buffer_->set_text("");
+  }
+  text_view_.set_buffer(scratch_buffer_);
+  view_parked_ = true;
+}
+
+void MainWindow::unpark_document_view() {
+  if (!view_parked_) {
+    return;
+  }
+  if (doc_buffer_) {
+    text_view_.set_buffer(doc_buffer_);
+  }
+  view_parked_ = false;
+  if (gutter_) {
+    gutter_->follow_view_adjustment();
+    gutter_->refresh();
+  }
 }
 
 void MainWindow::build_ui() {
@@ -1658,6 +1729,14 @@ bool MainWindow::open_file_body(const std::string& path) {
 void MainWindow::begin_load_chrome(const std::string& path) {
   load_saved_editable_ = text_view_.get_editable();
   text_view_.set_editable(false);
+  // Status first, then the cursor, then map. present() can map
+  // synchronously, and the map handler must already see Opening.
+  const std::string base = Glib::path_get_basename(path);
+  status_find_.set_text(Glib::ustring("Opening ") + base + "…");
+  status_find_frame_.show();
+  if (!get_realized()) {
+    realize();
+  }
   auto display = get_display();
   if (!display) {
     display = Gdk::Display::get_default();
@@ -1673,12 +1752,14 @@ void MainWindow::begin_load_chrome(const std::string& path) {
       twin->set_cursor(load_watch_);
     }
   }
-  const std::string base = Glib::path_get_basename(path);
-  status_find_.set_text(Glib::ustring("Opening ") + base + "…");
-  status_find_frame_.show();
+  // Every open path (argv, Ctrl+O, Open Recent, drag-and-drop,
+  // GApplication open) comes through here. Map before the read so a
+  // slow CPU shows the window while the file is still loading.
+  present();
 }
 
 void MainWindow::end_load_chrome() {
+  unpark_document_view();
   text_view_.set_editable(load_saved_editable_);
   if (auto win = get_window()) {
     win->set_cursor(Glib::RefPtr<Gdk::Cursor>());
@@ -2065,6 +2146,15 @@ bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
     state->previous_newlines = newline_style_;
     state->expected_chars = static_cast<int>(state->text.length());
     state->decoded = true;
+    state->phase = LoadState::Phase::Insert;
+    update_load_status();
+    // The window is already mapped. Return so expose and Escape run
+    // before the buffer replace.
+    return true;
+  }
+
+  if (!state->inserted) {
+    auto buf = buffer();
     seeding_ = true;
     encoding_ = state->encoding;
     newline_style_ = state->newlines;
@@ -2073,55 +2163,31 @@ bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
     long_window_begin_ = 0;
     long_window_end_ = 0;
     clear_document_search_pins();
+    clear_find_highlights();
+    // Detach before set_text. Chunked insert on an attached view made
+    // gtk_text_layout_validate shape every line on the main thread, so
+    // argv open never mapped a window on a slow CPU.
+    park_document_view();
     state->mutated = true;
     try {
       buf->begin_not_undoable_action();
       state->undo_open = true;
-      clear_find_highlights();
-      buf->set_text("");
+      buf->set_text(state->text);
     } catch (const std::bad_alloc&) {
       fail_async_load(state, "Not enough memory to open this file.",
                       state->path);
       return false;
     }
-    state->insert_at = 0;
+    state->inserted = true;
+    if (buf->get_char_count() != state->expected_chars) {
+      const std::string why =
+          "This file contains a null byte and cannot be opened as text.";
+      fail_async_load(state, why, state->path);
+      return false;
+    }
     update_load_status();
-    return true;
-  }
-
-  if (state->insert_at < state->expected_chars) {
-    const int n = std::min(kLoadInsertChars, state->expected_chars - state->insert_at);
-    Glib::ustring slice;
-    try {
-      slice = state->text.substr(static_cast<Glib::ustring::size_type>(state->insert_at),
-                                 static_cast<Glib::ustring::size_type>(n));
-    } catch (const std::bad_alloc&) {
-      fail_async_load(state, "Not enough memory to open this file.",
-                      state->path);
-      return false;
-    }
-    auto buf = buffer();
-    try {
-      buf->insert(buf->end(), slice);
-    } catch (const std::bad_alloc&) {
-      fail_async_load(state, "Not enough memory to open this file.",
-                      state->path);
-      return false;
-    }
-    if (font_tag_) {
-      const bool modified = buf->get_modified();
-      Gtk::TextIter end = buf->end();
-      Gtk::TextIter start = end;
-      if (start.backward_chars(static_cast<int>(slice.length()))) {
-        buf->apply_tag(font_tag_, start, end);
-      }
-      if (buf->get_modified() != modified) {
-        buf->set_modified(modified);
-      }
-    }
-    buf->place_cursor(buf->begin());
-    state->insert_at += static_cast<int>(slice.length());
-    update_load_status();
+    // Let Escape land before commit. set_text does not return to the
+    // main loop on its own.
     return true;
   }
 
@@ -2248,7 +2314,7 @@ void MainWindow::set_dirty(bool dirty) {
 }
 
 void MainWindow::update_cursor_status() {
-  auto buf = text_view_.get_buffer();
+  auto buf = buffer();
   if (!buf) {
     return;
   }
@@ -2321,6 +2387,12 @@ void MainWindow::on_text_inserted(const Gtk::TextBuffer::iterator& pos,
   track_inserted_endings(pos, text);
   utf8_bytes_ += text.bytes();
   newline_count_ += count_newlines(text.data(), text.bytes());
+  // get_chars_in_line walks the whole line. A bulk load already knows
+  // whether any line is long; walking it here is what made a multi-megabyte
+  // line take minutes.
+  if (seeding_) {
+    return;
+  }
   if (has_long_line(text.data(), text.bytes(), kLongLineChars) ||
       pos.get_chars_in_line() >= kLongLineChars) {
     note_line_length(kLongLineChars);
@@ -2358,6 +2430,11 @@ bool MainWindow::is_empty_untitled() const {
   if (dirty_ || !file_path_.empty()) {
     return false;
   }
+  // The view shows a scratch buffer while a load is parked. Emptiness
+  // follows the document, which is what Open and drag-and-drop reuse.
+  if (doc_buffer_) {
+    return doc_buffer_->get_char_count() == 0;
+  }
   auto buf = text_view_.get_buffer();
   return buf && buf->get_char_count() == 0;
 }
@@ -2378,6 +2455,11 @@ void MainWindow::update_undo_redo_sensitivity() {
 }
 
 void MainWindow::on_buffer_changed() {
+  // A bulk load replaces the buffer in one set_text. Layout, the long-line
+  // tag, and the status line run once after that, from commit_loaded_text.
+  if (seeding_) {
+    return;
+  }
   // Dirty state follows the undo save point (signal_modified_changed),
   // not every change. Undo back to the saved text must clear the marker.
   if (find_highlights_on_) {
@@ -2477,7 +2559,12 @@ void MainWindow::report_error(const Glib::ustring& primary,
 void MainWindow::on_cursor_moved(
     const Gtk::TextBuffer::iterator& /*loc*/,
     const Glib::RefPtr<Gtk::TextBuffer::Mark>& mark) {
-  if (mark == text_view_.get_buffer()->get_insert()) {
+  // set_text moves the cursor to the end of a just-loaded line. Walking
+  // that line for the column, or retagging it, belongs after the load.
+  if (seeding_) {
+    return;
+  }
+  if (mark == buffer()->get_insert()) {
     update_cursor_status();
     sync_long_line_window();
   }
@@ -3504,15 +3591,13 @@ bool MainWindow::buffer_has_long_line() {
   if (long_line_present_) {
     return true;
   }
-  auto buf = text_view_.get_buffer();
+  auto buf = buffer();
   if (!buf) {
     return false;
   }
   const int lines = buf->get_line_count();
   for (int i = 0; i < lines; ++i) {
-    GtkTextIter iter;
-    gtk_text_buffer_get_iter_at_line(buf->gobj(), &iter, i);
-    if (gtk_text_iter_get_chars_in_line(&iter) >= kLongLineChars) {
+    if (buf->get_iter_at_line(i).get_chars_in_line() >= kLongLineChars) {
       long_line_present_ = true;
       return true;
     }
@@ -4032,7 +4117,7 @@ int MainWindow::count_matches(const FindOptions& opts) {
 }
 
 void MainWindow::clear_find_highlights() {
-  auto buf = text_view_.get_buffer();
+  auto buf = buffer();
   if (find_tag_ && buf) {
     buf->remove_tag(find_tag_, buf->begin(), buf->end());
   }

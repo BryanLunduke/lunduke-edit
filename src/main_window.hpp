@@ -299,6 +299,10 @@ private:
   struct LoadState;
   void begin_load_chrome(const std::string& path);
   void end_load_chrome();
+  // Take the document buffer off the view while a large insert runs, so
+  // GtkTextView does not shape every line before the window can paint.
+  void park_document_view();
+  void unpark_document_view();
   void update_load_status();
   bool start_async_load(const std::string& path);
   void pump_async_load();
@@ -322,6 +326,10 @@ private:
   Gtk::Box editor_row_{Gtk::ORIENTATION_HORIZONTAL};
   Gtk::ScrolledWindow scrolled_;
   Gsv::View text_view_;
+  // The document. The view shows this except while a load parks it.
+  Glib::RefPtr<Gsv::Buffer> doc_buffer_;
+  Glib::RefPtr<Gtk::TextBuffer> scratch_buffer_;
+  bool view_parked_{false};
   LineGutter* gutter_{nullptr};
 
   Gtk::Box status_box_{Gtk::ORIENTATION_HORIZONTAL, 0};
