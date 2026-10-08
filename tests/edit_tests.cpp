@@ -5,14 +5,18 @@
 
 #include <glib.h>
 #include <gtkmm/textiter.h>
+#include <gtkmm/clipboard.h>
 
 #include <giomm/file.h>
 #include <gtkmm/printoperation.h>
 
 #include <gdk/gdkkeysyms.h>
+#include <gdk/gdkx.h>
 #include <gtk/gtk.h>
 
+#include <algorithm>
 #include <csetjmp>
+#include <cmath>
 #include <csignal>
 #include <ctime>
 #include <cstdlib>
@@ -2386,6 +2390,661 @@ struct EditChecks {
     g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
   }
 
+  struct SpotFace {
+    int height{0};
+    int width{0};
+    int size{0};
+    std::string family;
+    bool tagged{false};
+  };
+
+  static bool font_tag_at(MainWindow& w, int offset) {
+    auto buf = w.buffer();
+    if (!buf || offset < 0 || offset >= buf->get_char_count()) {
+      return false;
+    }
+    const auto tags = buf->get_iter_at_offset(offset).get_tags();
+    for (const auto& tag : tags) {
+      if (tag && tag->property_name().get_value() == "lunduke-editor-font") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool range_tagged(MainWindow& w, int begin, int end) {
+    if (end <= begin) {
+      return false;
+    }
+    for (int i = begin; i < end; ++i) {
+      if (!font_tag_at(w, i)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Line box plus the family and size the iterator's tags actually carry.
+  // Same measurement as test_round4, at one character instead of after
+  // replacing the buffer.
+  static SpotFace measure_spot(MainWindow& w, int offset) {
+    w.text_view_.queue_resize();
+    flush_ui();
+    SpotFace spot;
+    auto buf = w.buffer();
+    if (!buf || buf->get_char_count() == 0) {
+      return spot;
+    }
+    if (offset < 0) {
+      offset = 0;
+    }
+    if (offset >= buf->get_char_count()) {
+      offset = buf->get_char_count() - 1;
+    }
+    auto iter = buf->get_iter_at_offset(offset);
+    int y = 0;
+    w.text_view_.get_line_yrange(iter, y, spot.height);
+    Gdk::Rectangle rect;
+    w.text_view_.get_iter_location(iter, rect);
+    spot.width = rect.get_width();
+    spot.tagged = font_tag_at(w, offset);
+    GtkTextAttributes* raw = gtk_text_attributes_new();
+    if (gtk_text_iter_get_attributes(iter.gobj(), raw) && raw->font != nullptr) {
+      const char* family = pango_font_description_get_family(raw->font);
+      if (family != nullptr) {
+        spot.family = family;
+      }
+      const int sz = pango_font_description_get_size(raw->font);
+      if (pango_font_description_get_size_is_absolute(raw->font)) {
+        spot.size = static_cast<int>(
+            std::lround(static_cast<double>(sz) / Pango::SCALE * 72.0 / 96.0));
+      } else if (sz > 0) {
+        spot.size = sz / Pango::SCALE;
+      }
+    }
+    gtk_text_attributes_unref(raw);
+    return spot;
+  }
+
+  static void expect_editor_spot(const SpotFace& spot, bool chosen, const char* msg) {
+    expect(spot.tagged, msg);
+    if (chosen) {
+      expect(spot.family.find("Sans") != std::string::npos ||
+                 spot.family.find("sans") != std::string::npos,
+             msg);
+      expect(spot.size >= 24, msg);
+      expect(spot.height >= 36, msg);
+    } else {
+      expect(spot.family.find("ono") != std::string::npos, msg);
+      expect(spot.size >= 10 && spot.size <= 12, msg);
+      expect(spot.height >= 14 && spot.height <= 24, msg);
+    }
+  }
+
+  static void type_at(MainWindow& w, int offset, const Glib::ustring& text) {
+    auto iter = w.buffer()->get_iter_at_offset(offset);
+    w.buffer()->insert(iter, text);
+    flush_ui();
+  }
+
+  static void paste_at(MainWindow& w, int offset, const Glib::ustring& text) {
+    auto clip = Gtk::Clipboard::get();
+    clip->set_text(text);
+    flush_ui();
+    w.buffer()->place_cursor(w.buffer()->get_iter_at_offset(offset));
+    w.on_paste();
+    flush_ui();
+  }
+
+  // The text view inserts a drop at the gtk_drag_target mark. Move that
+  // mark, then emit drag-data-received so the default handler runs.
+  static bool drop_text(MainWindow& w, int offset, const Glib::ustring& payload) {
+    auto buf = w.buffer();
+    auto mark = buf->get_mark("gtk_drag_target");
+    if (!mark) {
+      return false;
+    }
+    buf->move_mark(mark, buf->get_iter_at_offset(offset));
+    auto clip = Gtk::Clipboard::get();
+    clip->set_text(payload);
+    flush_ui();
+    Gtk::SelectionData sel = clip->wait_for_contents("UTF8_STRING");
+    if (sel.get_text() != payload) {
+      return false;
+    }
+    GdkDragContext* ctx =
+        GDK_DRAG_CONTEXT(g_object_new(GDK_TYPE_X11_DRAG_CONTEXT, nullptr));
+    if (ctx == nullptr) {
+      return false;
+    }
+    g_signal_emit_by_name(w.text_view_.gobj(), "drag-data-received", ctx, 0, 0,
+                          sel.gobj(), static_cast<guint>(0),
+                          static_cast<guint>(0));
+    g_object_unref(ctx);
+    flush_ui();
+    return true;
+  }
+
+  static void test_round5_font(Application& app, MainWindow& w,
+                               const std::string& dir) {
+    const Pango::FontDescription previous_font = w.font_desc_;
+    const bool previous_chosen = w.font_user_chosen_;
+    const std::string font_path = font_config_path();
+
+    const struct FaceCase {
+      const char* desc;
+      bool chosen;
+    } faces[] = {
+        {"Monospace 11", false},
+        {"Sans 24", true},
+    };
+
+    for (const auto& face : faces) {
+      w.apply_font(Pango::FontDescription(face.desc), face.chosen);
+      flush_ui();
+      const char* label = face.chosen ? "Sans 24" : "Monospace 11";
+
+      // Typed at offset 0: a matching letter, a matching prefix, a
+      // duplicated first line, and the whole buffer again.
+      w.buffer()->set_text("hello");
+      flush_ui();
+      const SpotFace ref_h = measure_spot(w, 0);
+      expect_editor_spot(ref_h, face.chosen, label);
+      type_at(w, 0, "h");
+      expect(w.buffer()->get_text() == "hhello", label);
+      expect(range_tagged(w, 0, 6), label);
+      const SpotFace new_h = measure_spot(w, 0);
+      const SpotFace old_h = measure_spot(w, 1);
+      expect_editor_spot(new_h, face.chosen, label);
+      expect(std::abs(new_h.width - old_h.width) <= 2, label);
+      expect(std::abs(new_h.height - old_h.height) <= 2, label);
+
+      w.buffer()->set_text("hello");
+      flush_ui();
+      type_at(w, 0, "he");
+      expect(w.buffer()->get_text() == "hehello", label);
+      expect(range_tagged(w, 0, 7), label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+      expect_editor_spot(measure_spot(w, 1), face.chosen, label);
+
+      w.buffer()->set_text("hello\nworld\n");
+      flush_ui();
+      const SpotFace ref_line = measure_spot(w, 6);
+      type_at(w, 0, "hello\n");
+      expect(w.buffer()->get_text() == "hello\nhello\nworld\n", label);
+      expect(range_tagged(w, 0, static_cast<int>(w.buffer()->get_char_count())),
+             label);
+      const SpotFace dup_line = measure_spot(w, 0);
+      const SpotFace kept_line = measure_spot(w, 6);
+      expect_editor_spot(dup_line, face.chosen, label);
+      expect_editor_spot(kept_line, face.chosen, label);
+      expect(std::abs(dup_line.height - ref_line.height) <= 2, label);
+      expect(std::abs(dup_line.height - kept_line.height) <= 2, label);
+
+      w.buffer()->set_text("hello");
+      flush_ui();
+      type_at(w, 0, "hello");
+      expect(w.buffer()->get_text() == "hellohello", label);
+      expect(range_tagged(w, 0, 10), label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+      expect_editor_spot(measure_spot(w, 5), face.chosen, label);
+
+      // Mid-line, including an insert that repeats the following text,
+      // and at the end of the buffer.
+      w.buffer()->set_text("abcabc");
+      flush_ui();
+      type_at(w, 3, "abc");
+      expect(w.buffer()->get_text() == "abcabcabc", label);
+      expect(range_tagged(w, 0, 9), label);
+      expect_editor_spot(measure_spot(w, 3), face.chosen, label);
+
+      w.buffer()->set_text("hello");
+      flush_ui();
+      type_at(w, 5, "!");
+      expect(w.buffer()->get_text() == "hello!", label);
+      expect(range_tagged(w, 0, 6), label);
+      expect_editor_spot(measure_spot(w, 5), face.chosen, label);
+
+      // A multi-byte character that matches the following text.
+      w.buffer()->set_text("字hello");
+      flush_ui();
+      type_at(w, 0, "字");
+      expect(w.buffer()->get_text() == "字字hello", label);
+      expect(range_tagged(w, 0, static_cast<int>(w.buffer()->get_char_count())),
+             label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+
+      // Paste at offset 0, mid-line, and at the end.
+      w.buffer()->set_text("hello\nworld\n");
+      flush_ui();
+      paste_at(w, 0, "hello\n");
+      expect(w.buffer()->get_text() == "hello\nhello\nworld\n", label);
+      expect(range_tagged(w, 0, static_cast<int>(w.buffer()->get_char_count())),
+             label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+
+      w.buffer()->set_text("abcabc");
+      flush_ui();
+      paste_at(w, 3, "abc");
+      expect(w.buffer()->get_text() == "abcabcabc", label);
+      expect(range_tagged(w, 3, 6), label);
+      expect_editor_spot(measure_spot(w, 3), face.chosen, label);
+
+      w.buffer()->set_text("hello");
+      flush_ui();
+      paste_at(w, 5, "XYZ");
+      expect(w.buffer()->get_text() == "helloXYZ", label);
+      expect(range_tagged(w, 5, 8), label);
+      expect_editor_spot(measure_spot(w, 5), face.chosen, label);
+
+      // Undo and redo, including on a loaded file so ending restore is
+      // active while the text comes back.
+      const std::string undo_path = dir + std::string("/round5-undo-") +
+                                    (face.chosen ? "sans" : "mono") + ".txt";
+      write_bytes(undo_path, "hello\nworld\n");
+      expect(w.open_file(undo_path), label);
+      expect(range_tagged(w, 0, static_cast<int>(w.buffer()->get_char_count())),
+             label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+      type_at(w, 0, "h");
+      expect(w.buffer()->get_text() == "hhello\nworld\n", label);
+      expect(font_tag_at(w, 0), label);
+      w.on_undo();
+      flush_ui();
+      expect(w.buffer()->get_text() == "hello\nworld\n", label);
+      expect(range_tagged(w, 0, static_cast<int>(w.buffer()->get_char_count())),
+             label);
+      expect(!w.buffer()->get_modified(), label);
+      w.on_redo();
+      flush_ui();
+      expect(w.buffer()->get_text() == "hhello\nworld\n", label);
+      expect(font_tag_at(w, 0), label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+
+      w.buffer()->erase(w.buffer()->begin(), w.buffer()->get_iter_at_offset(1));
+      flush_ui();
+      expect(w.buffer()->get_text() == "hello\nworld\n", label);
+      w.on_undo();
+      flush_ui();
+      expect(w.buffer()->get_text() == "hhello\nworld\n", label);
+      expect(font_tag_at(w, 0), label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+
+      // Open and reload paint the disk text in the editor face, and the
+      // tag is not part of the bytes.
+      const std::string open_path = dir + std::string("/round5-open-") +
+                                    (face.chosen ? "sans" : "mono") + ".txt";
+      write_bytes(open_path, "hello\nworld\n");
+      expect(w.open_file(open_path), label);
+      expect(w.buffer()->get_text() == "hello\nworld\n", label);
+      expect(range_tagged(w, 0, static_cast<int>(w.buffer()->get_char_count())),
+             label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+      expect_editor_spot(measure_spot(w, 6), face.chosen, label);
+      type_at(w, 0, "hello\n");
+      expect(w.save_document(), label);
+      const std::string saved = read_bytes(open_path);
+      expect(saved == "hello\nhello\nworld\n", label);
+      expect(saved.find("lunduke-editor-font") == std::string::npos, label);
+      expect(saved.find("Sans") == std::string::npos, label);
+      expect(saved.find("Monospace") == std::string::npos, label);
+
+      write_bytes(open_path, "reloaded\nline\n");
+      bump_mtime(open_path);
+      g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+      expect(w.open_file(open_path), label);
+      g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+      expect(w.buffer()->get_text() == "reloaded\nline\n", label);
+      expect(range_tagged(w, 0, static_cast<int>(w.buffer()->get_char_count())),
+             label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+      expect(read_bytes(open_path) == "reloaded\nline\n", label);
+
+      // Replace-all at offset 0 where the replacement equals the following
+      // text, and a mid-buffer replacement that does the same.
+      w.buffer()->set_text("Xhello");
+      flush_ui();
+      FindOptions repl;
+      repl.search_for = "X";
+      repl.replace_with = "hello";
+      expect(w.replace_all(repl) == 1, label);
+      expect(w.buffer()->get_text() == "hellohello", label);
+      expect(range_tagged(w, 0, 10), label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+      w.on_undo();
+      flush_ui();
+      expect(w.buffer()->get_text() == "Xhello", label);
+      expect(range_tagged(w, 0, 6), label);
+      w.on_redo();
+      flush_ui();
+      expect(w.buffer()->get_text() == "hellohello", label);
+      expect(range_tagged(w, 0, 10), label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+
+      w.buffer()->set_text("abcXabc");
+      flush_ui();
+      repl.search_for = "X";
+      repl.replace_with = "abc";
+      expect(w.replace_all(repl) == 1, label);
+      expect(w.buffer()->get_text() == "abcabcabc", label);
+      expect(range_tagged(w, 3, 6), label);
+      expect_editor_spot(measure_spot(w, 3), face.chosen, label);
+
+      // Drag-and-drop at offset 0, mid-line, and at the end.
+      w.buffer()->set_text("hello");
+      flush_ui();
+      expect(drop_text(w, 0, "hello"), label);
+      expect(w.buffer()->get_text() == "hellohello", label);
+      expect(range_tagged(w, 0, 10), label);
+      expect_editor_spot(measure_spot(w, 0), face.chosen, label);
+      w.on_undo();
+      flush_ui();
+      expect(w.buffer()->get_text() == "hello", label);
+      expect(range_tagged(w, 0, 5), label);
+      w.on_redo();
+      flush_ui();
+      expect(w.buffer()->get_text() == "hellohello", label);
+      expect(range_tagged(w, 0, 10), label);
+
+      w.buffer()->set_text("abcabc");
+      flush_ui();
+      expect(drop_text(w, 3, "abc"), label);
+      expect(w.buffer()->get_text() == "abcabcabc", label);
+      expect(range_tagged(w, 3, 6), label);
+      expect_editor_spot(measure_spot(w, 3), face.chosen, label);
+
+      w.buffer()->set_text("hello");
+      flush_ui();
+      expect(drop_text(w, 5, "Z"), label);
+      expect(w.buffer()->get_text() == "helloZ", label);
+      expect(font_tag_at(w, 5), label);
+      expect_editor_spot(measure_spot(w, 5), face.chosen, label);
+    }
+
+    // A second window still inherits the face chosen above.
+    auto* font_window = app.create_window();
+    font_window->present();
+    flush_ui();
+    const LaidOutFace inherited = measure_face(*font_window);
+    expect(inherited.family.find("Sans") != std::string::npos ||
+               inherited.family.find("sans") != std::string::npos,
+           "a new window still inherits Sans");
+    expect(inherited.height >= 36, "a new window still inherits the 24 pt size");
+    app.destroy_window_now(font_window);
+
+    w.apply_font(previous_font, previous_chosen);
+    if (!font_path.empty() && !previous_chosen) {
+      ::unlink(font_path.c_str());
+    }
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+  }
+
+  static std::string printed_layouts_text(const MainWindow& w) {
+    std::string out;
+    std::set<const PangoLayout*> seen;
+    for (const auto& page : w.print_pages_) {
+      for (const auto& slice : page.slices) {
+        if (!slice.layout) {
+          continue;
+        }
+        const PangoLayout* raw = slice.layout->gobj();
+        if (!seen.insert(raw).second) {
+          continue;
+        }
+        out.append(slice.layout->get_text().raw());
+      }
+    }
+    return out;
+  }
+
+  static double export_print(MainWindow& w, const std::string& pdf) {
+    double page_height = 0.0;
+    ::unlink(pdf.c_str());
+    auto op = Gtk::PrintOperation::create();
+    op->set_export_filename(pdf);
+    op->signal_begin_print().connect(
+        [&](const Glib::RefPtr<Gtk::PrintContext>& context) {
+          page_height = context->get_height();
+          w.on_begin_print(context);
+          op->set_n_pages(static_cast<int>(w.print_page_breaks_.size()) + 1);
+        });
+    op->signal_draw_page().connect(
+        [&](const Glib::RefPtr<Gtk::PrintContext>& context, int page) {
+          w.on_draw_page(context, page);
+        });
+    try {
+      op->run(Gtk::PRINT_OPERATION_ACTION_EXPORT, w);
+    } catch (const Gtk::PrintError&) {
+    }
+    return page_height;
+  }
+
+  static void expect_print_doc(MainWindow& w, const std::string& text,
+                               const std::string& pdf, const char* msg) {
+    w.buffer()->set_text(text);
+    const double page_height = export_print(w, pdf);
+    expect(page_height > 100.0, msg);
+    std::string why = "fits";
+    const bool inside = page_inside(w, page_height, why);
+    if (!inside) {
+      std::cerr << msg << ": " << why << "\n";
+    }
+    expect(inside, msg);
+    const std::string painted = printed_layouts_text(w);
+    if (painted != text) {
+      std::cerr << msg << ": painted " << painted.size() << " bytes, buffer "
+                << text.size() << " bytes\n";
+    }
+    expect(painted == text, msg);
+    double tallest = 0.0;
+    for (std::size_t i = 0; i < w.print_pages_.size(); ++i) {
+      tallest = std::max(tallest, printed_page_height(w, i));
+    }
+    std::cout << msg << " pages=" << w.print_pages_.size()
+              << " page-height=" << page_height << " tallest=" << tallest
+              << "\n";
+  }
+
+  static void test_round5_print(MainWindow& w, const std::string& dir) {
+    const Pango::FontDescription previous_font = w.font_desc_;
+    const bool previous_chosen = w.font_user_chosen_;
+    w.apply_font(Pango::FontDescription("Sans 18"), false);
+
+    std::string tabbed;
+    for (int i = 0; i < 8; ++i) {
+      tabbed += "hello world\n";
+    }
+    tabbed += "col\tvalue\n";
+    for (int i = 0; i < 40; ++i) {
+      tabbed += "hello world\n";
+    }
+    expect_print_doc(w, tabbed, dir + "/round5-tab.pdf",
+                     "tab among short lines stays inside the page");
+
+    std::string wrapped;
+    for (int i = 0; i < 8; ++i) {
+      wrapped += "hello world\n";
+    }
+    wrapped += std::string(50, 'W');
+    wrapped += "\n";
+    for (int i = 0; i < 40; ++i) {
+      wrapped += "hello world\n";
+    }
+    expect_print_doc(w, wrapped, dir + "/round5-wrap.pdf",
+                     "wrapped wide line among short lines stays inside the page");
+
+    std::string wrap_top = std::string(50, 'W');
+    wrap_top += "\n";
+    for (int i = 0; i < 40; ++i) {
+      wrap_top += "hello world\n";
+    }
+    expect_print_doc(w, wrap_top, dir + "/round5-wrap-top.pdf",
+                     "wrapped line at the top stays inside the page");
+
+    std::string mixed;
+    for (int i = 0; i < 6; ++i) {
+      mixed += "hello world\n";
+    }
+    mixed += "\n";
+    mixed += "col\tvalue\n";
+    mixed += std::string(50, 'W');
+    mixed += "\n";
+    mixed += "中文中文中文中文中文中文中文中文中文中文\n";
+    mixed += "\n";
+    mixed += "\t\n";
+    for (int i = 0; i < 36; ++i) {
+      mixed += "hello world\n";
+    }
+    expect_print_doc(w, mixed, dir + "/round5-mixed.pdf",
+                     "tabs, blanks, CJK, and wraps stay inside the page");
+
+    expect_print_doc(w, std::string(80, '\n'), dir + "/round5-blanks.pdf",
+                     "blank lines stay inside the page");
+
+    w.apply_font(previous_font, previous_chosen);
+  }
+
+  struct DirMode {
+    std::string path;
+    mode_t mode{0700};
+    DirMode(std::string p, mode_t m) : path(std::move(p)), mode(m) {}
+    ~DirMode() {
+      if (!path.empty()) {
+        ::chmod(path.c_str(), mode);
+      }
+    }
+  };
+
+  static void test_round5_stat(Application& app, MainWindow& w,
+                               const std::string& dir) {
+    if (::geteuid() == 0) {
+      expect(false, "stat-error test needs a non-root user");
+      return;
+    }
+    const std::string locked_dir = dir + "/round5-locked";
+    g_mkdir_with_parents(locked_dir.c_str(), 0700);
+    DirMode restore{locked_dir, 0700};
+    const std::string locked = locked_dir + "/file.txt";
+    write_bytes(locked, "keep-these-bytes");
+    expect(w.open_file(locked), "open the file that will be unstatable");
+    expect(w.buffer()->get_text() == "keep-these-bytes",
+           "stat fixture text is loaded");
+    expect(::chmod(locked_dir.c_str(), 0000) == 0, "hide the parent directory");
+
+    // Check: refresh records the failure and does not open a dialog.
+    const int errors_at_check = w.error_reports_;
+    w.refresh_disk_flags();
+    expect(w.error_reports_ == errors_at_check,
+           "checking a stat failure does not open a dialog");
+    expect(w.file_unreadable_, "a stat failure is remembered");
+    expect(w.last_notice_.find("Could not read file information") !=
+               std::string::npos,
+           "the check remembers the strerror");
+
+    // Close: one save question, still no error dialog.
+    w.last_prompt_primary_.clear();
+    w.last_prompt_secondary_.clear();
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(!w.confirm_discard_or_save(), "close asks when stat fails");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.error_reports_ == errors_at_check,
+           "the save question is not a second error dialog");
+    expect(w.last_prompt_primary_.find("Could not check") != Glib::ustring::npos,
+           "the one dialog names the check");
+    expect(w.last_prompt_secondary_.find("Could not read file information") !=
+               Glib::ustring::npos,
+           "the one dialog includes the strerror");
+    expect(w.last_prompt_secondary_.find("cannot be written") !=
+               Glib::ustring::npos,
+           "the one dialog says the path cannot be written");
+    expect(w.last_prompt_secondary_.find("Save As") != Glib::ustring::npos,
+           "the one dialog leaves Save As as the way to keep the text");
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(w.on_delete_event(nullptr), "close is refused after a stat error");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.get_visible(), "stat error keeps the window");
+    expect(w.error_reports_ == errors_at_check,
+           "closing does not add an error dialog");
+    expect(w.buffer()->get_text() == "keep-these-bytes", "cancel keeps the text");
+
+    // New and quit use the same question and do not add an error dialog.
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    w.on_new();
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.buffer()->get_text() == "keep-these-bytes",
+           "New cancel keeps the text");
+    expect(w.error_reports_ == errors_at_check, "New does not add an error dialog");
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(!app.confirm_quit(), "quit asks when stat fails");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.get_visible(), "quit cancel leaves the window open");
+    expect(w.error_reports_ == errors_at_check, "quit does not add an error dialog");
+
+    // Save from that question does not open another dialog.
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "save", TRUE);
+    expect(!w.confirm_discard_or_save(), "Save from the question does not discard");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.error_reports_ == errors_at_check,
+           "Save does not open another dialog");
+    expect(w.get_visible(), "a failed Save leaves the window open");
+    expect(w.buffer()->get_text() == "keep-these-bytes", "Save keeps the buffer");
+    expect(w.last_save_error_.find("Could not read file information") !=
+               std::string::npos,
+           "Save still records the strerror");
+    expect(w.last_save_error_.find("cannot be written") != std::string::npos,
+           "Save records that the path cannot be written");
+    expect(w.last_save_error_.find("Save As") != std::string::npos,
+           "Save records Save As as the way to keep the text");
+    expect(::chmod(locked_dir.c_str(), 0700) == 0, "restore before reading");
+    expect(read_bytes(locked) == "keep-these-bytes", "Save does not rewrite");
+    expect(::chmod(locked_dir.c_str(), 0000) == 0, "hide the directory again");
+
+    // Reopen after the question: no further dialog, buffer stays.
+    const int errors_before_reopen = w.error_reports_;
+    expect(!w.open_file(locked), "reopen of an unstatable file fails");
+    expect(w.error_reports_ == errors_before_reopen,
+           "reopen does not open another dialog");
+    expect(w.buffer()->get_text() == "keep-these-bytes", "reopen keeps the buffer");
+    expect(w.last_open_error_.find("Could not read file information") !=
+               std::string::npos,
+           "reopen records the strerror");
+    expect(w.get_visible(), "reopen leaves the window open");
+
+    // A direct Save, with no question yet, is the one dialog. A second
+    // Save does not open another. Reopen after that stays quiet too.
+    expect(::chmod(locked_dir.c_str(), 0700) == 0, "restore so the flag clears");
+    w.refresh_disk_flags();
+    expect(!w.file_unreadable_, "a readable file clears the stat failure");
+    expect(::chmod(locked_dir.c_str(), 0000) == 0, "hide the directory for Save");
+    const int before_direct = w.error_reports_;
+    expect(!w.save_to_path(locked), "a direct Save fails when stat fails");
+    expect(w.error_reports_ == before_direct + 1,
+           "a direct Save opens one dialog");
+    expect(w.last_error_primary_.find("cannot be written") != Glib::ustring::npos,
+           "that dialog says the path cannot be written");
+    expect(w.last_error_secondary_.find("Save As") != Glib::ustring::npos,
+           "that dialog leaves Save As as the way to keep the text");
+    expect(!w.save_to_path(locked), "a second Save still fails");
+    expect(w.error_reports_ == before_direct + 1,
+           "a second Save does not open another dialog");
+    expect(!w.open_file(locked), "reopen after Save still fails");
+    expect(w.error_reports_ == before_direct + 1,
+           "reopen after the Save dialog does not open another");
+    expect(w.buffer()->get_text() == "keep-these-bytes",
+           "the direct Save left the buffer in place");
+
+    expect(::chmod(locked_dir.c_str(), 0700) == 0, "restore the directory");
+    expect(read_bytes(locked) == "keep-these-bytes",
+           "the direct Save did not rewrite");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+  }
+
+  static void test_round5(Application& app, MainWindow& w, const std::string& dir) {
+    test_round5_font(app, w, dir);
+    test_round5_print(w, dir);
+    test_round5_stat(app, w, dir);
+  }
+
   static int run() {
     failures = 0;
     g_setenv("LUNDUKE_EDIT_TEST", "1", TRUE);
@@ -2421,6 +3080,7 @@ struct EditChecks {
     test_hostile_review(*app.get(), *w, dir);
     test_round3(*app.get(), *w, dir);
     test_round4(*app.get(), *w, dir, startup_face);
+    test_round5(*app.get(), *w, dir);
 
     if (!font_path.empty()) {
       if (saved_font.empty()) {

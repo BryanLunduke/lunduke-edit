@@ -1,3 +1,18 @@
+lunduke-edit (0.9-6) unstable; urgency=medium
+
+  * Text inserted at the start of the buffer, or anywhere it matches the
+    text already there, keeps the editor font. Typing, paste, undo, redo,
+    open, reload, replace-all, and drag-and-drop all use that face. The
+    font is not written into the file.
+  * A printed page counts the height already laid out, including tabs,
+    wrapped lines, wide glyphs, CJK, and blank lines, and closes before
+    the next line would pass the bottom.
+  * A file that cannot be stat'd opens one save question. Checking the
+    file does not add an error dialog, and Save does not open another.
+    Save As is how to keep the text.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 15:00:00 +0000
+
 lunduke-edit (0.9-5) unstable; urgency=medium
 
   * A clean file that was deleted on disk is marked unsaved. Close and
