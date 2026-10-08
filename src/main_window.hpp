@@ -47,7 +47,10 @@ public:
   ~MainWindow() override;
 
   void load_seed_sample();
-  bool open_file(const std::string& path);
+  // discard_already_confirmed is true after File → Open / Open Recent
+  // already asked about unsaved changes. A second open of this window's
+  // path re-reads the file when it changed on disk.
+  bool open_file(const std::string& path, bool discard_already_confirmed = false);
   bool open_file_body(const std::string& path);
   // Asks before dropping unsaved edits. False means the caller must keep
   // the current buffer (Cancel, or Save that did not succeed).
@@ -114,6 +117,8 @@ private:
   bool read_clipboard_text(const Glib::RefPtr<Gtk::Clipboard>& clip,
                            Glib::ustring& out);
   void insert_pasted_text(const Glib::ustring& text);
+  void insert_primary_paste(const Glib::ustring& text, GdkEventButton* event);
+  bool on_text_button_press(GdkEventButton* event);
   bool on_text_button_release(GdkEventButton* event);
   void on_drag_data_received(const Glib::RefPtr<Gdk::DragContext>& context,
                              int x, int y, const Gtk::SelectionData& data,
@@ -123,8 +128,23 @@ private:
   void sync_encoding_radios();
   void maybe_restore_wrap();
   bool buffer_has_long_line();
-  bool confirm_file_changed(const std::string& path);
+  enum class DiskChangeChoice { Cancel, Replace, Reload };
+  DiskChangeChoice confirm_file_changed(const std::string& path);
+  // Same path opened again. Re-reads when the inode or mtime changed.
+  // A dirty buffer is replaced only after the unsaved-changes prompt,
+  // unless the caller already confirmed that prompt.
+  bool reopen_same_path(const std::string& path, bool discard_already_confirmed);
   void remember_file_identity(const std::string& path);
+  void track_inserted_endings(const Gtk::TextIter& pos, const Glib::ustring& text);
+  void track_erased_endings(const Gtk::TextIter& start, const Gtk::TextIter& end);
+  void snapshot_endings();
+  void apply_ending_kinds(const std::vector<char>& kinds);
+  std::vector<char> ending_kinds() const;
+  void clear_ending_history();
+  void restore_buffer_after_failed_load(const Glib::ustring& previous_text,
+                                        bool previous_modified,
+                                        const std::string& previous_encoding,
+                                        NewlineStyle previous_newlines);
   void remember_source_lines(const Glib::ustring& text,
                              const std::vector<char>& kinds);
   void on_find_dialog_hidden();
@@ -292,6 +312,16 @@ private:
     char kind{0};
   };
   std::vector<SourceLine> source_lines_;
+  // Snapshots of per-line endings, one per undoable edit, so undo/redo
+  // puts each line's ending back. Cleared when the document is replaced.
+  std::vector<std::vector<char>> ending_undo_;
+  std::vector<std::vector<char>> ending_redo_;
+  std::vector<char> pending_kinds_;
+  bool have_pending_kinds_{false};
+  bool ending_restore_{false};
+  bool in_user_action_{false};
+  bool ending_snapshotted_{false};
+  bool force_replace_{false};
   std::string loaded_bytes_;
   Glib::ustring loaded_text_;
   bool loaded_bytes_valid_{false};
@@ -305,6 +335,7 @@ private:
   bool swallow_insert_repeat_{false};
   std::string last_save_error_;
   std::string last_open_error_;
+  std::string last_notice_;
   // UTF-8 bytes and LF count in the buffer. Status "bytes" is the size
   // save_to_path would write, derived from these plus encoding and newlines.
   std::size_t utf8_bytes_{0};

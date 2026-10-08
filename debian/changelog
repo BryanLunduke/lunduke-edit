@@ -1,3 +1,28 @@
+lunduke-edit (0.9-4) unstable; urgency=medium
+
+  * A file that contains a null byte is refused, and the buffer that was
+    already open is left in place. Open failures for a permission error,
+    a missing path, and a directory name the reason as well as the path.
+    Cancelling the question for a file larger than 32 MiB is not followed
+    by an error. The 64 MiB ceiling is still a refusal.
+  * Middle-click inserts the primary selection once, at the pointer. A
+    click outside the selection leaves that selection in place.
+  * Inserting or deleting a line in a mixed-ending file keeps the other
+    lines' endings, including across undo. The status byte count adds a
+    CR only for lines that will be written as CRLF.
+  * Closing Find drops the hidden Search Selection Only range and the
+    extend anchor. Find Next pins the selection that is on screen, and
+    says so when nothing is selected.
+  * Print measures each source line. A line that wraps to more than one
+    visual row is paginated with the tabbed-line path.
+  * The dialog for a file that changed on disk offers Reload. Opening the
+    path this window already has re-reads it when the inode or mtime
+    changed, and asks first when the buffer is dirty.
+  * Text → Show Line Numbers uses Alt+N, so it no longer shares Alt+L
+    with Latin-1.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 07:30:00 +0000
+
 lunduke-edit (0.9-3) unstable; urgency=medium
 
   * Insert toggles overwrite only with no modifiers, including the keypad,

@@ -14,6 +14,7 @@
 
 #include <csetjmp>
 #include <csignal>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -1041,15 +1042,18 @@ struct EditChecks {
     primary->set_text(huge);
     flush_ui();
     GdkEventButton button {};
-    button.type = GDK_BUTTON_RELEASE;
+    button.type = GDK_BUTTON_PRESS;
     button.button = 2;
-    button.window = gtk_widget_get_window(GTK_WIDGET(w.text_view_.gobj()));
+    button.x = 4;
+    button.y = 4;
+    button.window = gtk_text_view_get_window(GTK_TEXT_VIEW(w.text_view_.gobj()),
+                                             GTK_TEXT_WINDOW_TEXT);
     {
       AlarmGuard guard;
       if (!guard.arm(3)) {
         expect(false, "middle-click paste returned");
       } else {
-        expect(w.on_text_button_release(&button), "middle-click is handled");
+        expect(w.on_text_button_press(&button), "middle-click is handled");
         guard.disarm();
       }
     }
@@ -1360,6 +1364,424 @@ struct EditChecks {
     w.find_opts_.entire_word = false;
   }
 
+  static void bump_mtime(const std::string& path) {
+    // Each call sets a distinct absolute mtime. Adding a fixed offset to
+    // the current mtime collides when two writes land in the same second
+    // and the editor already stored the previous bumped stamp.
+    static std::time_t stamp = 1'800'000'000;
+    stamp += 60;
+    struct timespec times[2] = {};
+    times[0].tv_sec = 0;
+    times[0].tv_nsec = UTIME_OMIT;
+    times[1].tv_sec = stamp;
+    times[1].tv_nsec = 0;
+    ::utimensat(AT_FDCWD, path.c_str(), times, 0);
+  }
+
+  static double printed_page_height(const MainWindow& w, std::size_t page) {
+    if (page >= w.print_pages_.size()) {
+      return 0.0;
+    }
+    double total = 0.0;
+    for (const auto& slice : w.print_pages_[page].slices) {
+      if (!slice.layout) {
+        continue;
+      }
+      const int n = slice.layout->get_line_count();
+      const int begin = std::max(0, slice.row_begin);
+      const int end = std::min(n, slice.row_end);
+      for (int i = begin; i < end; ++i) {
+        auto line = slice.layout->get_line(i);
+        if (!line) {
+          continue;
+        }
+        Pango::Rectangle ink;
+        Pango::Rectangle logical;
+        line->get_extents(ink, logical);
+        total += static_cast<double>(logical.get_height()) / Pango::SCALE;
+      }
+    }
+    return total;
+  }
+
+  static bool page_fits(const MainWindow& w, double page_height, std::string& why) {
+    if (w.print_pages_.empty() || page_height < 1.0) {
+      why = "no pages";
+      return false;
+    }
+    double all = 0.0;
+    for (std::size_t i = 0; i < w.print_pages_.size(); ++i) {
+      const double h = printed_page_height(w, i);
+      all += h;
+      if (h > page_height + 1.0) {
+        why = "page " + std::to_string(i) + " is " + std::to_string(h) +
+              " pt on a " + std::to_string(page_height) + " pt page";
+        return false;
+      }
+    }
+    if (all <= page_height + 1.0) {
+      why = "text did not wrap onto more than one page of height";
+      return false;
+    }
+    return true;
+  }
+
+  static void test_round3(Application& app, MainWindow& w, const std::string& dir) {
+    (void)app;
+    // 1. A null byte is refused. The previous buffer stays, and the file
+    // is not replaced by the empty view set_text would have left behind.
+    const std::string nul_mid = dir + "/nul-mid.txt";
+    const std::string nul_lead = dir + "/nul-lead.txt";
+    const std::string nul_tail = dir + "/nul-tail.txt";
+    const std::string nul_mid_bytes("hello\0world", 11);
+    const std::string nul_lead_bytes("\0hello", 6);
+    const std::string nul_tail_bytes("hello\0", 6);
+    write_bytes(nul_mid, nul_mid_bytes);
+    write_bytes(nul_lead, nul_lead_bytes);
+    write_bytes(nul_tail, nul_tail_bytes);
+    const std::string safe = dir + "/nul-safe.txt";
+    write_bytes(safe, "safe");
+    expect(w.open_file(safe), "open a stand-in before the null file");
+    expect(!w.dirty_, "stand-in is clean");
+    for (const auto& sample : {nul_mid, nul_lead, nul_tail}) {
+      const std::string disk = read_bytes(sample);
+      expect(!w.open_file(sample), "null byte is refused");
+      expect(w.buffer()->get_text() == "safe", "null open keeps the buffer");
+      expect(w.file_path_ == safe, "null open does not take the path");
+      expect(!w.dirty_, "null open does not clear or set the dirty flag");
+      expect(w.last_open_error_.find("null byte") != std::string::npos,
+             "null open explains why");
+      expect(read_bytes(sample) == disk, "null file is not replaced");
+    }
+    w.buffer()->insert(w.buffer()->end(), "!");
+    expect(w.save_to_path(safe), "save the stand-in after a refused null open");
+    expect(read_bytes(safe) == "safe!", "save wrote the stand-in");
+    expect(read_bytes(nul_mid) == nul_mid_bytes, "save did not wipe the null file");
+
+    // 2. Middle-click pastes once, at the pointer, and leaves a selection
+    // that the click is outside of.
+    w.encoding_ = "UTF-8";
+    w.newline_style_ = MainWindow::NewlineStyle::Lf;
+    w.buffer()->set_text("hello world");
+    // The view owns PRIMARY. Clipboard::set_text would take that ownership
+    // and clear the highlight before the click, which is not the user path.
+    w.text_view_.grab_focus();
+    w.buffer()->select_range(w.buffer()->begin(),
+                             w.buffer()->get_iter_at_offset(5));
+    flush_ui();
+    expect(selection_text(w) == "hello", "selection is in place before the click");
+    GdkEventButton press {};
+    press.type = GDK_BUTTON_PRESS;
+    press.button = 2;
+    press.x = 10000;
+    press.y = 8;
+    press.window = gtk_text_view_get_window(GTK_TEXT_VIEW(w.text_view_.gobj()),
+                                            GTK_TEXT_WINDOW_TEXT);
+    expect(w.on_text_button_press(&press), "middle-click press is handled");
+    expect(w.buffer()->get_text() == "hello worldhello",
+           "middle-click inserts once at the pointer");
+    expect(selection_text(w) == "hello",
+           "middle-click outside the selection leaves it in place");
+    GdkEventButton release {};
+    release.type = GDK_BUTTON_RELEASE;
+    release.button = 2;
+    release.x = 10000;
+    release.y = 8;
+    release.window = press.window;
+    expect(w.on_text_button_release(&release), "middle-click release is swallowed");
+    expect(w.buffer()->get_text() == "hello worldhello",
+           "release does not paste a second time");
+
+    w.buffer()->set_text("ABCDEFGHIJ");
+    w.buffer()->place_cursor(w.buffer()->begin());
+    flush_ui();
+    auto primary = Gtk::Clipboard::get(GDK_SELECTION_PRIMARY);
+    primary->set_text("ZZ");
+    flush_ui();
+    expect(w.on_text_button_press(&press), "middle-click with no selection");
+    expect(w.buffer()->get_text() == "ABCDEFGHIJZZ",
+           "middle-click with no selection inserts at the pointer");
+
+    // A real button-press through the widget must not also run GTK's paste.
+    w.buffer()->set_text("hello world");
+    w.text_view_.grab_focus();
+    w.buffer()->select_range(w.buffer()->begin(),
+                             w.buffer()->get_iter_at_offset(5));
+    flush_ui();
+    if (press.window != nullptr) {
+      gtk_widget_event(GTK_WIDGET(w.text_view_.gobj()),
+                       reinterpret_cast<GdkEvent*>(&press));
+      flush_ui();
+      expect(w.buffer()->get_text() == "hello worldhello",
+             "widget button-press pastes the primary selection once");
+    }
+
+    // 3 and 8. Mixed endings stay with their lines, and the status bar
+    // counts the bytes a save would write.
+    const std::string mixed = dir + "/round3-mixed.txt";
+    const std::string mixed_bytes("a\nb\r\n", 5);
+    write_bytes(mixed, mixed_bytes);
+    expect(w.open_file(mixed), "open mixed endings");
+    expect(w.status_bytes_.get_text() == "5 bytes",
+           "mixed status matches the file");
+    expect(w.source_lines_.size() >= 2 && w.source_lines_[0].kind == 'n' &&
+               w.source_lines_[1].kind == 'c',
+           "per-line endings are LF then CRLF");
+    w.buffer()->insert(w.buffer()->begin(), "Q");
+    expect(w.status_bytes_.get_text() == "6 bytes",
+           "inline edit counts the original LF");
+    expect(w.save_to_path(mixed), "save inline mixed edit");
+    expect(read_bytes(mixed) == "Qa\nb\r\n", "inline edit keeps each ending");
+    expect(w.status_bytes_.get_text() == "6 bytes",
+           "status matches the saved mixed file");
+
+    write_bytes(mixed, mixed_bytes);
+    bump_mtime(mixed);
+    expect(w.open_file(mixed), "reopen original mixed file");
+    w.buffer()->insert(w.buffer()->begin(), "Z\n");
+    expect(w.save_to_path(mixed), "save inserted line");
+    expect(read_bytes(mixed) == "Z\r\na\nb\r\n",
+           "new line uses the dominant ending and a stays LF");
+    w.on_undo();
+    expect(w.buffer()->get_text() == "a\nb\n", "undo removes the inserted line");
+    expect(w.source_lines_.size() >= 2 && w.source_lines_[0].kind == 'n' &&
+               w.source_lines_[1].kind == 'c',
+           "undo restores the line endings");
+
+    write_bytes(mixed, mixed_bytes);
+    bump_mtime(mixed);
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    expect(w.open_file(mixed), "reopen mixed file before delete");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    w.buffer()->erase(w.buffer()->begin(), w.buffer()->get_iter_at_line(1));
+    expect(w.save_to_path(mixed), "save after deleting the first line");
+    expect(read_bytes(mixed) == "b\r\n", "deleted line drops its ending only");
+
+    // 4. Closing Find drops the hidden selection-only range. Find Next
+    // uses the selection that is visible now.
+    w.buffer()->set_text("one two one two");
+    w.buffer()->select_range(w.buffer()->begin(),
+                             w.buffer()->get_iter_at_offset(7));
+    w.find_opts_.search_for = "one";
+    w.find_opts_.search_selection_only = true;
+    w.find_opts_.extend_selection = true;
+    w.find_opts_.wrap_around = true;
+    w.find_opts_.start_at_top = false;
+    w.find_opts_.search_backwards = false;
+    w.find_opts_.entire_word = false;
+    w.find_opts_.case_sensitive = false;
+    w.pin_selection_only_range();
+    w.extend_anchor_valid_ = true;
+    w.on_find_dialog_hidden();
+    expect(!w.sel_only_range_valid_, "closing Find drops the selection pin");
+    expect(!w.extend_anchor_valid_, "closing Find drops the extend anchor");
+    w.buffer()->place_cursor(w.buffer()->end());
+    w.on_find_next();
+    expect(selection_text(w).empty(),
+           "Find Next does not jump back into the old range");
+    expect(w.last_notice_ == "No text is selected.",
+           "Find Next without a selection says so");
+    // Extend stays available as an option. It is off here so the hit itself
+    // is visible; the anchor that would grow from the old range is already gone.
+    w.find_opts_.extend_selection = false;
+    w.buffer()->select_range(w.buffer()->get_iter_at_offset(8),
+                             w.buffer()->end());
+    w.on_find_next();
+    expect(selection_offset(w) == 8 && selection_text(w) == "one",
+           "Find Next pins the current selection");
+    w.find_opts_.search_selection_only = false;
+    w.find_opts_.extend_selection = false;
+
+    // 5. Open failures name the reason, and the path, and keep the buffer.
+    const std::string denied = dir + "/round3-denied.txt";
+    write_bytes(denied, "secret");
+    expect(::chmod(denied.c_str(), 0000) == 0, "chmod 000");
+    w.buffer()->set_text("kept");
+    expect(!w.open_file(denied), "unreadable file is refused");
+    expect(w.buffer()->get_text() == "kept", "unreadable open keeps the buffer");
+    expect(w.last_open_error_.find("Permission denied") != std::string::npos,
+           "unreadable open says permission denied");
+    expect(w.last_open_error_.find(denied) != std::string::npos,
+           "unreadable open still names the path");
+    expect(::chmod(denied.c_str(), 0644) == 0, "restore mode");
+
+    const std::string missing = dir + "/round3-missing.txt";
+    ::unlink(missing.c_str());
+    expect(!w.open_file(missing), "missing file is refused");
+    expect(w.last_open_error_.find("No such file") != std::string::npos,
+           "missing open says the file is not there");
+    expect(w.last_open_error_.find(missing) != std::string::npos,
+           "missing open names the path");
+    expect(w.buffer()->get_text() == "kept", "missing open keeps the buffer");
+
+    expect(!w.open_file(dir), "directory open is refused");
+    expect(w.last_open_error_.find("That path is a directory") != std::string::npos,
+           "directory open says it is a directory");
+    expect(w.last_open_error_.find(dir) != std::string::npos,
+           "directory open names the path");
+    expect(w.buffer()->get_text() == "kept", "directory open keeps the buffer");
+
+    // 6. Wide glyphs and a proportional font paginate by measured rows.
+    const Pango::FontDescription previous_font = w.font_desc_;
+    w.apply_font(Pango::FontDescription("Sans 18"));
+    std::string wides;
+    for (int i = 0; i < 60; ++i) {
+      wides.append(50, 'W');
+      wides.push_back('\n');
+    }
+    w.buffer()->set_text(wides);
+    double page_height = 0.0;
+    const std::string wide_pdf = dir + "/round3-wide.pdf";
+    ::unlink(wide_pdf.c_str());
+    auto wide_op = Gtk::PrintOperation::create();
+    wide_op->set_export_filename(wide_pdf);
+    wide_op->signal_begin_print().connect(
+        [&w, &page_height, wide_op](const Glib::RefPtr<Gtk::PrintContext>& context) {
+          page_height = context->get_height();
+          w.on_begin_print(context);
+          wide_op->set_n_pages(static_cast<int>(w.print_page_breaks_.size()) + 1);
+        });
+    wide_op->signal_draw_page().connect(
+        [&w](const Glib::RefPtr<Gtk::PrintContext>& context, int page) {
+          w.on_draw_page(context, page);
+        });
+    bool wide_printed = false;
+    try {
+      wide_printed = wide_op->run(Gtk::PRINT_OPERATION_ACTION_EXPORT, w) ==
+                     Gtk::PRINT_OPERATION_RESULT_APPLY;
+    } catch (const Gtk::PrintError&) {
+      wide_printed = false;
+    }
+    expect(wide_printed, "wide-line print exports");
+    std::string wide_why;
+    expect(page_fits(w, page_height, wide_why), wide_why.c_str());
+
+    w.apply_font(Pango::FontDescription("Sans 16"));
+    std::string cjk;
+    const std::string han(reinterpret_cast<const char*>(u8"漢"));
+    for (int i = 0; i < 40; ++i) {
+      for (int c = 0; c < 40; ++c) {
+        cjk += han;
+      }
+      cjk.push_back('\n');
+    }
+    w.buffer()->set_text(cjk);
+    page_height = 0.0;
+    const std::string cjk_pdf = dir + "/round3-cjk.pdf";
+    ::unlink(cjk_pdf.c_str());
+    auto cjk_op = Gtk::PrintOperation::create();
+    cjk_op->set_export_filename(cjk_pdf);
+    cjk_op->signal_begin_print().connect(
+        [&w, &page_height, cjk_op](const Glib::RefPtr<Gtk::PrintContext>& context) {
+          page_height = context->get_height();
+          w.on_begin_print(context);
+          cjk_op->set_n_pages(static_cast<int>(w.print_page_breaks_.size()) + 1);
+        });
+    cjk_op->signal_draw_page().connect(
+        [&w](const Glib::RefPtr<Gtk::PrintContext>& context, int page) {
+          w.on_draw_page(context, page);
+        });
+    try {
+      cjk_op->run(Gtk::PRINT_OPERATION_ACTION_EXPORT, w);
+    } catch (const Gtk::PrintError&) {
+    }
+    std::string cjk_why;
+    expect(page_fits(w, page_height, cjk_why), cjk_why.c_str());
+    w.apply_font(previous_font);
+
+    // 7. Reload reads the copy on disk. Opening the same path again
+    // re-reads a clean buffer when the file changed, and asks first when
+    // the buffer is dirty.
+    const std::string notes = dir + "/round3-notes.txt";
+    write_bytes(notes, "notes-v1");
+    expect(w.open_file(notes), "open notes for reload");
+    write_bytes(notes, "notes-v2");
+    bump_mtime(notes);
+    expect(w.open_file(notes), "clean reopen of a changed file");
+    expect(w.buffer()->get_text() == "notes-v2", "clean reopen loaded the disk copy");
+    expect(!w.dirty_, "reloaded buffer is clean");
+
+    w.buffer()->insert(w.buffer()->end(), "!");
+    expect(w.dirty_, "edit after reload is dirty");
+    write_bytes(notes, "notes-v3");
+    bump_mtime(notes);
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(!w.open_file(notes), "dirty reopen can be cancelled");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.buffer()->get_text() == "notes-v2!", "cancelled reopen keeps the buffer");
+    expect(read_bytes(notes) == "notes-v3", "cancelled reopen leaves disk alone");
+
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    expect(w.open_file(notes), "dirty reopen can discard");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(w.buffer()->get_text() == "notes-v3", "discard reopen loads disk");
+
+    w.buffer()->insert(w.buffer()->end(), "!");
+    write_bytes(notes, "external");
+    bump_mtime(notes);
+    g_setenv("LUNDUKE_EDIT_TEST_REPLACE", "reload", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    expect(!w.save_to_path(notes), "reload does not write the buffer");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(read_bytes(notes) == "external", "reload kept the disk copy");
+    expect(w.buffer()->get_text() == "external", "reload replaced the buffer");
+    expect(!w.dirty_, "reload leaves a clean buffer");
+
+    w.buffer()->set_text("mine");
+    w.buffer()->set_modified(true);
+    w.refresh_dirty_from_buffer();
+    write_bytes(notes, "other");
+    bump_mtime(notes);
+    g_setenv("LUNDUKE_EDIT_TEST_REPLACE", "reload", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "save", TRUE);
+    expect(w.save_to_path(notes), "reload prompt can still save");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    expect(read_bytes(notes) == "mine", "save from the reload prompt wrote the buffer");
+
+    // 9. Cancelling the large-file question is not an error. The hard cap
+    // still is.
+    g_setenv("LUNDUKE_EDIT_TEST_MAX_OPEN", "8", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD", "64", TRUE);
+    g_unsetenv("LUNDUKE_EDIT_TEST_LARGE");
+    const std::string big = dir + "/round3-big.txt";
+    write_bytes(big, std::string(20, 'Z'));
+    w.buffer()->set_text("stay");
+    w.last_open_error_ = "sentinel";
+    expect(!w.open_file(big), "large open cancel returns false");
+    expect(w.buffer()->get_text() == "stay", "large cancel keeps the buffer");
+    expect(w.last_open_error_ == "sentinel",
+           "large cancel is not reported as an error");
+    const std::string huge = dir + "/round3-huge.txt";
+    write_bytes(huge, std::string(80, 'Q'));
+    expect(!w.open_file(huge), "hard cap still refuses");
+    expect(w.last_open_error_.find("will not be opened") != std::string::npos,
+           "hard cap still explains the refusal");
+    expect(w.buffer()->get_text() == "stay", "hard cap keeps the buffer");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD");
+
+    // 10. Show Line Numbers and Latin-1 do not share a mnemonic.
+    expect(w.line_numbers_item_ != nullptr && w.enc_latin1_item_ != nullptr,
+           "text menu items exist");
+    const std::string numbers = w.line_numbers_item_->get_label();
+    const std::string latin = w.enc_latin1_item_->get_label();
+    expect(numbers.find("_N") != std::string::npos, "line numbers mnemonic is N");
+    expect(latin.find("_L") != std::string::npos, "latin-1 mnemonic is L");
+    expect(numbers.find("_L") == std::string::npos,
+           "line numbers does not use L");
+
+    w.find_opts_.search_selection_only = false;
+    w.find_opts_.extend_selection = false;
+    w.find_opts_.entire_word = false;
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+    g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_LARGE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
+    g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD");
+  }
+
   static int run() {
     failures = 0;
     g_setenv("LUNDUKE_EDIT_TEST", "1", TRUE);
@@ -1382,6 +1804,7 @@ struct EditChecks {
     test_open_many(*app.get(), dir);
     test_review_fixes(*app.get(), *w, dir);
     test_hostile_review(*app.get(), *w, dir);
+    test_round3(*app.get(), *w, dir);
 
     g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_OPEN");
