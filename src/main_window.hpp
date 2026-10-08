@@ -75,12 +75,15 @@ public:
 
   void rebuild_recents_menu();
 
-  // Test seams. Null unless a behavior test installs them.
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  // Test seams. Null unless a behavior test installs them. The production
+  // binary is built without LUNDUKE_EDIT_TEST_HOOKS, so these are absent.
   static ssize_t (*test_write_hook_)(int fd, const void* buf, std::size_t n,
                                      bool inplace_copy);
   static int (*test_dir_fsync_hook_)(int fd);
   static std::function<void(MainWindow*)> test_during_large_confirm_;
   static std::function<const char*(MainWindow*)> test_discard_choice_;
+#endif
 
   // Affirmative response on the stat-failure question. Enter runs Save As.
   static constexpr int kPromptSaveAs = 100;
