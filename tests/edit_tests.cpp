@@ -3217,8 +3217,10 @@ struct EditChecks {
         bool saw_opening;
         bool saw_watch;
       } tick{&w, 0, 0, 0, false, false};
+      // 1 ms, not 10. A release build finishes the read between 10 ms
+      // fires, so five ticks was a flake even though the loop was yielding.
       const guint timer = g_timeout_add(
-          10,
+          1,
           [](gpointer data) -> gboolean {
             auto* t = static_cast<Tick*>(data);
             const gint64 now = g_get_monotonic_time();
