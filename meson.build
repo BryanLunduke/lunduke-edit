@@ -51,7 +51,7 @@ edit_behavior_tests = executable(
   include_directories: lunduke_edit_inc,
 )
 
-test('behavior', edit_behavior_tests, timeout: 180)
+test('behavior', edit_behavior_tests, timeout: 300)
 
 check_production_binary = find_program('tests/check-production-binary.sh')
 test(

@@ -130,6 +130,18 @@ bool LineGutter::on_draw(const Cairo::RefPtr<Cairo::Context>& cr) {
                                   visible_rect.get_y());
   start.set_line_offset(0);
 
+  // Bound the walk by the screen. Resolving a y coordinate below the
+  // caret used to build a Pango layout for a whole long line, and walking
+  // until a y coordinate advanced shaped every line of a large file.
+  const int last_line = std::max(0, buf->get_line_count() - 1);
+  const int min_line_px = 8;
+  const int rows =
+      std::max(visible_rect.get_height(), height) / min_line_px + 4;
+  int last_visible = start.get_line() + std::min(rows, 200);
+  if (last_visible > last_line) {
+    last_visible = last_line;
+  }
+
   auto font_desc = editor_font();
 
   cr->set_source_rgb(0.35, 0.35, 0.40);
@@ -140,8 +152,10 @@ bool LineGutter::on_draw(const Cairo::RefPtr<Cairo::Context>& cr) {
     iter.backward_line();
   }
 
-  const int last_line = buf->get_line_count() - 1;
   while (true) {
+    if (iter.get_line() > last_visible) {
+      break;
+    }
     Gdk::Rectangle loc;
     text_view_.get_iter_location(iter, loc);
 

@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9-8_amd64.deb
+# → packaging/debs/lunduke-edit_0.9-9_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,13 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9-9
+
+- **Open**: a large file from the command line maps the window and shows Opening, with the busy cursor, before the text is inserted. File → Open, Open Recent, drag-and-drop, and a file-manager open use that same path.
+- **Open**: the document is replaced in one step while the view shows an empty buffer, so Pango does not shape the whole file before the first paint. Layout continues after the text is in the buffer. A very long line is tagged once, before the view shows it.
+- **Open**: Escape still cancels. The main loop keeps running during the read. The line-number gutter draws the rows on screen, so a large file's first paint does not shape every line.
+- App / Meson / About stay **0.9**. Debian package **0.9-9**.
 
 ## 0.9-8
 

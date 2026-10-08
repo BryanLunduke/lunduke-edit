@@ -88,6 +88,18 @@ bool write_fd_all(int fd, const std::string& data) {
   return true;
 }
 
+Gio::ApplicationFlags application_flags() {
+  auto flags = Gio::APPLICATION_HANDLES_OPEN;
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  // The behaviour suite already owns this application id. The command-line
+  // open child has to load the file itself, not hand it to that process.
+  if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr) {
+    flags |= Gio::APPLICATION_NON_UNIQUE;
+  }
+#endif
+  return flags;
+}
+
 std::vector<std::string> split_recent_lines(const std::string& data) {
   std::vector<std::string> lines;
   std::size_t start = 0;
@@ -115,8 +127,7 @@ Glib::RefPtr<Application> Application::create() {
 }
 
 Application::Application()
-    : Gtk::Application("org.lunduke.LundukeEdit",
-                       Gio::APPLICATION_HANDLES_OPEN) {
+    : Gtk::Application("org.lunduke.LundukeEdit", application_flags()) {
   // Before any window is built, so the first view uses the saved face.
   load_font_setting();
 }

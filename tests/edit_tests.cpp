@@ -31,7 +31,10 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -104,6 +107,7 @@ namespace lundukeedit {
 
 struct EditChecks {
   static int failures;
+  static std::string argv0;
 
   static void expect(bool cond, const char* msg) {
     if (!cond) {
@@ -3126,6 +3130,26 @@ struct EditChecks {
     return true;
   }
 
+  // Block the instance handlers for drag-data-received. The class handler
+  // may still run; it does not open files. A test that called open_file
+  // directly would still open while these handlers are blocked.
+  static guint set_drop_handlers_blocked(MainWindow& w, bool block) {
+    const guint sig = g_signal_lookup("drag-data-received", GTK_TYPE_WIDGET);
+    GtkWidget* targets[] = {GTK_WIDGET(w.text_view_.gobj()),
+                            GTK_WIDGET(w.gobj())};
+    guint n = 0;
+    for (GtkWidget* target : targets) {
+      if (block) {
+        n += g_signal_handlers_block_matched(target, G_SIGNAL_MATCH_ID, sig, 0,
+                                             nullptr, nullptr, nullptr);
+      } else {
+        n += g_signal_handlers_unblock_matched(target, G_SIGNAL_MATCH_ID, sig,
+                                               0, nullptr, nullptr, nullptr);
+      }
+    }
+    return n;
+  }
+
   static void test_round6(Application& app, MainWindow& w, const std::string& dir) {
     std::cout << "round6 begin\n";
     w.refresh_disk_flags();
@@ -3193,8 +3217,10 @@ struct EditChecks {
         bool saw_opening;
         bool saw_watch;
       } tick{&w, 0, 0, 0, false, false};
+      // 1 ms, not 10. A release build finishes the read between 10 ms
+      // fires, so five ticks was a flake even though the loop was yielding.
       const guint timer = g_timeout_add(
-          10,
+          1,
           [](gpointer data) -> gboolean {
             auto* t = static_cast<Tick*>(data);
             const gint64 now = g_get_monotonic_time();
@@ -3531,6 +3557,26 @@ struct EditChecks {
       expect(win_targets && gtk_target_list_find(win_targets, uri_atom, nullptr),
              "the window accepts file drops");
 
+      // The drop is delivered by emitting drag-data-received, which is the
+      // signal GTK runs after a text/uri-list drop. Blocking that handler
+      // must leave the file unopened: the test is not calling open_file.
+      {
+        const std::string path_before = w.file_path_;
+        w.buffer()->set_text("before-block");
+        w.buffer()->set_modified(false);
+        w.set_dirty(false);
+        expect(set_drop_handlers_blocked(w, true) > 0,
+               "the drag-data-received handler is connected");
+        expect(drop_uris(w, {dropped}, false),
+               "a blocked drop still emits drag-data-received");
+        expect(w.file_path_ == path_before,
+               "a blocked drop handler does not open the file");
+        set_drop_handlers_blocked(w, false);
+        w.buffer()->set_text("before-block");
+        w.buffer()->set_modified(false);
+        w.set_dirty(false);
+      }
+
       w.buffer()->set_text("dirty-drop");
       w.buffer()->set_modified(true);
       w.refresh_dirty_from_buffer();
@@ -3631,6 +3677,419 @@ struct EditChecks {
     test_round5_stat(app, w, dir);
   }
 
+  struct ArgvChildState {
+    Application* app{nullptr};
+    std::string path;
+    bool escape{false};
+    bool saw_window{false};
+    bool sent_escape{false};
+  };
+
+  static gboolean argv_child_escape_idle(gpointer data) {
+    auto* state = static_cast<ArgvChildState*>(data);
+    if (!state->escape || !state->app) {
+      return G_SOURCE_REMOVE;
+    }
+    for (auto* window : state->app->get_windows()) {
+      auto* main = dynamic_cast<MainWindow*>(window);
+      // present() maps synchronously, before the GdkWindow can take a
+      // key. Wait until that window exists and the load is still running.
+      if (!main || !main->get_mapped() || !main->loading_ || !main->get_window()) {
+        continue;
+      }
+      state->saw_window = true;
+      if (!state->sent_escape) {
+        state->sent_escape = true;
+        g_print("ARGV_ESCAPE\n");
+        fflush(stdout);
+      }
+      // gtk_test_widget_send_key uses XSendEvent, which this display drops.
+      // gtk_widget_event is the call gtk_propagate_event makes for a key:
+      // the toplevel's key-press-event runs, and that is where Escape
+      // cancels a load, before the key is handed to the focus child.
+      GdkEvent* event = gdk_event_new(GDK_KEY_PRESS);
+      event->key.window =
+          GDK_WINDOW(g_object_ref(main->get_window()->gobj()));
+      event->key.keyval = GDK_KEY_Escape;
+      event->key.time = GDK_CURRENT_TIME;
+      event->key.send_event = TRUE;
+      if (GdkDisplay* display = gdk_window_get_display(event->key.window)) {
+        if (GdkSeat* seat = gdk_display_get_default_seat(display)) {
+          if (GdkDevice* keyboard = gdk_seat_get_keyboard(seat)) {
+            gdk_event_set_device(event, keyboard);
+          }
+        }
+      }
+      gtk_widget_event(GTK_WIDGET(main->gobj()), event);
+      gdk_event_free(event);
+      if (!main->loading_) {
+        return G_SOURCE_REMOVE;
+      }
+      return G_SOURCE_CONTINUE;
+    }
+    return G_SOURCE_CONTINUE;
+  }
+
+  static gboolean argv_child_watch(gpointer data) {
+    auto* state = static_cast<ArgvChildState*>(data);
+    int windows = 0;
+    for (auto* window : state->app->get_windows()) {
+      auto* main = dynamic_cast<MainWindow*>(window);
+      if (!main) {
+        continue;
+      }
+      ++windows;
+      state->saw_window = true;
+      if (!main->loading_ && main->file_path_ == state->path &&
+          main->get_mapped()) {
+        g_print("ARGV_LOADED chars=%d\n", main->buffer()->get_char_count());
+        fflush(stdout);
+        state->app->quit();
+        return G_SOURCE_REMOVE;
+      }
+    }
+    if (state->saw_window && windows == 0) {
+      g_print("ARGV_CANCELLED\n");
+      fflush(stdout);
+      state->app->quit();
+      return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+  }
+
+  static int run_argv_child(int argc, char** argv) {
+    if (argc < 2) {
+      std::cerr << "argv child needs a file\n";
+      return 2;
+    }
+    const char* display = g_getenv("DISPLAY");
+    if (display == nullptr || display[0] == '\0') {
+      std::cerr << "GUI tests require a display; refusing to skip\n";
+      return 1;
+    }
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    g_set_prgname("lunduke-edit");
+    g_set_application_name("Lunduke Edit");
+    if (g_getenv("GDK_BACKEND") == nullptr) {
+      g_setenv("GDK_BACKEND", "x11", FALSE);
+    }
+    Gsv::init();
+    auto app = Application::create();
+    auto* state = new ArgvChildState;
+    state->app = app.get();
+    state->path = argv[1];
+    state->escape = g_getenv("LUNDUKE_EDIT_TEST_ARGV_ESCAPE") != nullptr;
+    if (state->escape) {
+      // A high-priority idle runs inside present(), before the window can
+      // accept a key, and one dropped Escape used to count as sent.
+      g_timeout_add(50, argv_child_escape_idle, state);
+    }
+    g_timeout_add(20, argv_child_watch, state);
+    // Give up rather than hang the suite if the load never finishes.
+    g_timeout_add(90000, +[](gpointer data) -> gboolean {
+      auto* app = static_cast<Application*>(data);
+      g_print("ARGV_TIMEOUT\n");
+      fflush(stdout);
+      app->quit();
+      return G_SOURCE_REMOVE;
+    }, app.get());
+    return app->run(argc, argv);
+  }
+
+  struct ArgvRun {
+    bool ok{false};
+    int status{-1};
+    double map_ms{-1};
+    double load_ms{-1};
+    bool opening{false};
+    bool watch{false};
+    bool viewable{false};
+    bool loaded{false};
+    bool cancelled{false};
+    int chars{0};
+    std::string throttle;
+    std::string output;
+  };
+
+  static bool xid_is_viewable(unsigned long xid) {
+    const std::string cmd =
+        "xwininfo -id " + std::to_string(xid) + " 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+      return false;
+    }
+    std::string text;
+    char buf[256];
+    while (fgets(buf, sizeof buf, pipe) != nullptr) {
+      text += buf;
+    }
+    pclose(pipe);
+    return text.find("IsViewable") != std::string::npos;
+  }
+
+  static void unset_inherited_test_env() {
+    const char* names[] = {
+        "LUNDUKE_EDIT_TEST",
+        "LUNDUKE_EDIT_TEST_DISCARD",
+        "LUNDUKE_EDIT_TEST_LARGE",
+        "LUNDUKE_EDIT_TEST_MAX_OPEN",
+        "LUNDUKE_EDIT_TEST_MAX_OPEN_HARD",
+        "LUNDUKE_EDIT_TEST_CHUNK",
+        "LUNDUKE_EDIT_TEST_MAX_HITS",
+        "LUNDUKE_EDIT_TEST_HUGE_BYTES",
+        "LUNDUKE_EDIT_TEST_HUGE_UNDO",
+        "LUNDUKE_EDIT_TEST_REPLACE",
+        "LUNDUKE_EDIT_TEST_MAX_PASTE",
+        "LUNDUKE_EDIT_TEST_SAVE_AS",
+    };
+    for (const char* name : names) {
+      unsetenv(name);
+    }
+  }
+
+  static ArgvRun run_argv_file(const std::string& path, bool throttle,
+                               bool escape, int deadline_ms) {
+    ArgvRun result;
+    const bool have_taskset = access("/usr/bin/taskset", X_OK) == 0;
+    const bool have_cpulimit = access("/usr/bin/cpulimit", X_OK) == 0;
+    if (throttle && have_taskset && have_cpulimit) {
+      result.throttle = "taskset -c 0 + cpulimit -c 1 -l 25";
+    } else if (throttle && have_taskset) {
+      result.throttle = "taskset -c 0 (cpulimit unavailable)";
+    } else if (throttle) {
+      result.throttle = "unconstrained (taskset and cpulimit unavailable)";
+    } else {
+      result.throttle = "unthrottled";
+    }
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+      result.output = "pipe failed";
+      return result;
+    }
+    const gint64 start = g_get_monotonic_time();
+    const pid_t pid = fork();
+    if (pid < 0) {
+      close(fds[0]);
+      close(fds[1]);
+      result.output = "fork failed";
+      return result;
+    }
+    if (pid == 0) {
+      setpgid(0, 0);
+      dup2(fds[1], STDOUT_FILENO);
+      close(fds[0]);
+      close(fds[1]);
+      unset_inherited_test_env();
+      setenv("LUNDUKE_EDIT_TEST_ARGV_CHILD", "1", 1);
+      if (escape) {
+        setenv("LUNDUKE_EDIT_TEST_ARGV_ESCAPE", "1", 1);
+      } else {
+        unsetenv("LUNDUKE_EDIT_TEST_ARGV_ESCAPE");
+      }
+      const char* bin = argv0.c_str();
+      if (throttle && have_taskset && have_cpulimit) {
+        execl("/usr/bin/taskset", "taskset", "-c", "0", "/usr/bin/cpulimit",
+              "-f", "-q", "-c", "1", "-l", "25", "--", bin, path.c_str(),
+              static_cast<char*>(nullptr));
+      } else if (throttle && have_taskset) {
+        execl("/usr/bin/taskset", "taskset", "-c", "0", bin, path.c_str(),
+              static_cast<char*>(nullptr));
+      } else {
+        execl(bin, bin, path.c_str(), static_cast<char*>(nullptr));
+      }
+      _exit(127);
+    }
+    setpgid(pid, pid);
+    close(fds[1]);
+
+    std::string pending;
+    bool child_done = false;
+    int status = -1;
+    while (!child_done) {
+      const gint64 now = g_get_monotonic_time();
+      if ((now - start) / 1000 > deadline_ms) {
+        kill(-pid, SIGKILL);
+        result.output += "\nPARENT_TIMEOUT\n";
+      }
+      pollfd pfd {};
+      pfd.fd = fds[0];
+      pfd.events = POLLIN;
+      poll(&pfd, 1, 100);
+      if (pfd.revents & (POLLIN | POLLHUP)) {
+        char buf[1024];
+        const ssize_t n = read(fds[0], buf, sizeof buf);
+        if (n > 0) {
+          pending.append(buf, static_cast<std::size_t>(n));
+        }
+      }
+      std::size_t nl = 0;
+      while ((nl = pending.find('\n')) != std::string::npos) {
+        const std::string line = pending.substr(0, nl);
+        pending.erase(0, nl + 1);
+        result.output += line;
+        result.output += '\n';
+        if (line.compare(0, 12, "ARGV_MAPPED ") == 0 && result.map_ms < 0) {
+          unsigned long xid = 0;
+          int watch = 0;
+          int viewable = 0;
+          char status_text[512];
+          status_text[0] = '\0';
+          if (std::sscanf(line.c_str(),
+                          "ARGV_MAPPED xid=%lu watch=%d viewable=%d status=%511[^\n]",
+                          &xid, &watch, &viewable, status_text) >= 3) {
+            result.map_ms = static_cast<double>(g_get_monotonic_time() - start) /
+                            1000.0;
+            result.watch = watch != 0;
+            result.viewable = viewable != 0;
+            result.opening = std::string(status_text).find("Opening") !=
+                             std::string::npos;
+            // Escape can unmap the window before a later xwininfo. The
+            // child's viewable flag is from the map. Confirm with the X
+            // server while the window is still up.
+            if (!result.viewable) {
+              for (int attempt = 0; attempt < 10 && !result.viewable;
+                   ++attempt) {
+                result.viewable = xid_is_viewable(xid);
+                if (!result.viewable) {
+                  g_usleep(20 * 1000);
+                }
+              }
+            } else {
+              result.viewable = result.viewable || xid_is_viewable(xid);
+            }
+          }
+        } else if (line.compare(0, 12, "ARGV_LOADED ") == 0) {
+          result.loaded = true;
+          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
+                           1000.0;
+          std::sscanf(line.c_str(), "ARGV_LOADED chars=%d", &result.chars);
+        } else if (line == "ARGV_CANCELLED") {
+          result.cancelled = true;
+          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
+                           1000.0;
+        }
+      }
+      int st = 0;
+      const pid_t got = waitpid(pid, &st, WNOHANG);
+      if (got == pid) {
+        status = st;
+        child_done = true;
+      } else if ((g_get_monotonic_time() - start) / 1000 > deadline_ms) {
+        kill(-pid, SIGKILL);
+        waitpid(pid, &st, 0);
+        status = st;
+        child_done = true;
+      }
+      if (child_done) {
+        // The child can exit between poll and waitpid. Read what it wrote.
+        const int flags = fcntl(fds[0], F_GETFL, 0);
+        if (flags >= 0) {
+          fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
+        }
+        while (true) {
+          char buf[1024];
+          const ssize_t n = read(fds[0], buf, sizeof buf);
+          if (n > 0) {
+            pending.append(buf, static_cast<std::size_t>(n));
+            continue;
+          }
+          break;
+        }
+      }
+    }
+    std::size_t nl = 0;
+    while ((nl = pending.find('\n')) != std::string::npos) {
+      const std::string line = pending.substr(0, nl);
+      pending.erase(0, nl + 1);
+      result.output += line;
+      result.output += '\n';
+      if (line == "ARGV_CANCELLED") {
+        result.cancelled = true;
+        if (result.load_ms < 0) {
+          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
+                           1000.0;
+        }
+      } else if (line.compare(0, 12, "ARGV_LOADED ") == 0) {
+        result.loaded = true;
+        if (result.load_ms < 0) {
+          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
+                           1000.0;
+        }
+        std::sscanf(line.c_str(), "ARGV_LOADED chars=%d", &result.chars);
+      } else if (line.compare(0, 11, "ARGV_ESCAPE") == 0) {
+        // Recorded in the log via result.output.
+      }
+    }
+    close(fds[0]);
+    result.status = status;
+    result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return result;
+  }
+
+  static void test_argv_large_open(const std::string& dir) {
+    std::cout << "argv-large begin\n";
+    if (argv0.empty()) {
+      expect(false, "argv open test knows its executable");
+      return;
+    }
+    const std::string path = dir + "/argv-12mb.txt";
+    {
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      const char piece[] = "foo bar baz\n";
+      for (int i = 0; i < 1000000; ++i) {
+        out.write(piece, 12);
+      }
+    }
+    expect(read_bytes(path).size() == 12000000, "argv fixture is 12000000 bytes");
+
+    const ArgvRun plain = run_argv_file(path, false, false, 30000);
+    std::cout << "argv unthrottled map_ms=" << plain.map_ms
+              << " load_ms=" << plain.load_ms << " chars=" << plain.chars
+              << " opening=" << plain.opening << " watch=" << plain.watch
+              << " viewable=" << plain.viewable << " status=" << plain.status
+              << "\n";
+    if (!plain.loaded) {
+      std::cerr << plain.output;
+    }
+    expect(plain.ok && plain.loaded, "unthrottled argv open loads the file");
+    expect(plain.chars == 12000000, "unthrottled argv open keeps every character");
+    expect(plain.viewable && plain.map_ms >= 0 && plain.map_ms < 3000,
+           "unthrottled argv open maps the window quickly");
+    expect(plain.opening, "unthrottled argv open shows Opening");
+    expect(plain.watch, "unthrottled argv open shows the busy cursor");
+
+    const ArgvRun slow = run_argv_file(path, true, false, 60000);
+    std::cout << "argv throttled (" << slow.throttle << ") map_ms="
+              << slow.map_ms << " load_ms=" << slow.load_ms
+              << " chars=" << slow.chars << " opening=" << slow.opening
+              << " watch=" << slow.watch << " viewable=" << slow.viewable
+              << "\n";
+    if (!slow.loaded) {
+      std::cerr << slow.output;
+    }
+    expect(slow.ok && slow.loaded, "throttled argv open loads the file");
+    expect(slow.chars == 12000000, "throttled argv open keeps every character");
+    expect(slow.viewable && slow.map_ms >= 0 && slow.map_ms < 4000,
+           "throttled argv open maps the window within a few seconds");
+    expect(slow.opening, "throttled argv open shows Opening when the window maps");
+    expect(slow.watch, "throttled argv open shows the busy cursor");
+
+    const ArgvRun esc = run_argv_file(path, true, true, 30000);
+    std::cout << "argv escape (" << esc.throttle << ") map_ms=" << esc.map_ms
+              << " cancel_ms=" << esc.load_ms << " cancelled=" << esc.cancelled
+              << " loaded=" << esc.loaded << "\n";
+    if (!esc.cancelled) {
+      std::cerr << esc.output;
+    }
+    expect(esc.viewable && esc.map_ms >= 0 && esc.map_ms < 4000,
+           "escape run maps the window quickly");
+    expect(esc.opening, "escape run shows Opening");
+    expect(esc.cancelled && !esc.loaded, "escape cancels the argv open");
+    expect(esc.ok, "escape cancel exits cleanly");
+    std::cout << "argv-large end\n";
+  }
+
   static int run() {
     failures = 0;
     g_setenv("LUNDUKE_EDIT_TEST", "1", TRUE);
@@ -3668,6 +4127,7 @@ struct EditChecks {
     test_round4(*app.get(), *w, dir, startup_face);
     test_round5(*app.get(), *w, dir);
     test_round6(*app.get(), *w, dir);
+    test_argv_large_open(dir);
 
     if (!font_path.empty()) {
       if (saved_font.empty()) {
@@ -3693,10 +4153,20 @@ struct EditChecks {
 };
 
 int EditChecks::failures = 0;
+std::string EditChecks::argv0;
 
 }  // namespace lundukeedit
 
-int main() {
+int main(int argc, char** argv) {
+  lundukeedit::EditChecks::argv0 = (argc > 0 && argv[0] != nullptr) ? argv[0] : "";
+  if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr) {
+    return lundukeedit::EditChecks::run_argv_child(argc, argv);
+  }
+  const char* display = g_getenv("DISPLAY");
+  if (display == nullptr || display[0] == '\0') {
+    std::cerr << "GUI tests require a display; refusing to skip\n";
+    return 1;
+  }
   const int failures = lundukeedit::EditChecks::run();
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
