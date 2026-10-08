@@ -2,6 +2,7 @@
 
 #include "application.hpp"
 #include "main_window.hpp"
+#include "test_hooks.hpp"
 
 #include <gdkmm/screen.h>
 #include <glib.h>
@@ -398,7 +399,7 @@ void Application::open_files(const std::vector<std::string>& paths) {
 }
 
 void Application::report_non_native(const std::vector<Glib::ustring>& uris) {
-  if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
+  if (test_mode()) {
     return;
   }
   Glib::ustring secondary = "Only local files can be opened.";

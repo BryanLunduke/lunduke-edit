@@ -25,7 +25,9 @@ lunduke_edit_sources = files(
   'src/find_replace_dialog.cpp',
 )
 
-executable(
+# Production binary. No test-hook define: dialogs, limits, and chunk sizes
+# stay the real defaults, and LUNDUKE_EDIT_TEST_* is not linked in.
+lunduke_edit = executable(
   'lunduke-edit',
   lunduke_edit_sources,
   dependencies: [gtkmm_dep, gtksourceviewmm_dep, x11_dep],
@@ -33,6 +35,8 @@ executable(
   install: true,
 )
 
+# Same editor sources as above, plus the behavior tests. Only this target
+# defines LUNDUKE_EDIT_TEST_HOOKS.
 edit_behavior_tests = executable(
   'edit-behavior-tests',
   files(
@@ -42,11 +46,20 @@ edit_behavior_tests = executable(
     'src/line_gutter.cpp',
     'src/find_replace_dialog.cpp',
   ),
+  cpp_args: ['-DLUNDUKE_EDIT_TEST_HOOKS'],
   dependencies: [gtkmm_dep, gtksourceviewmm_dep, x11_dep],
   include_directories: lunduke_edit_inc,
 )
 
 test('behavior', edit_behavior_tests, timeout: 180)
+
+check_production_binary = find_program('tests/check-production-binary.sh')
+test(
+  'production-binary',
+  check_production_binary,
+  args: [lunduke_edit],
+  depends: lunduke_edit,
+)
 
 install_data(
   'data/org.lunduke.LundukeEdit.desktop',

@@ -24,6 +24,10 @@ fi
 rm -rf "$DEST"
 meson install -C "$BUILD" --destdir "$DEST"
 
+# Installed, stripped binary. Meson test production-binary scans the build
+# copy; this scans the copy that goes into the deb.
+"$ROOT/tests/check-production-binary.sh" "$DEST/usr/bin/lunduke-edit"
+
 mkdir -p "$DEST/debian"
 cp "$ROOT/debian/control" "$DEST/debian/control"
 

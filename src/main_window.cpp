@@ -2,6 +2,7 @@
 
 #include "main_window.hpp"
 #include "application.hpp"
+#include "test_hooks.hpp"
 
 #include <giomm/cancellable.h>
 #include <giomm/file.h>
@@ -104,38 +105,12 @@ constexpr int kDefaultMaxFindHits = 10000;
 constexpr int kDefaultFindChunk = 200;
 constexpr std::size_t kDefaultHugeUndoBytes = 8u * 1024u * 1024u;
 
-std::size_t env_size(const char* name, std::size_t fallback) {
-  const char* value = g_getenv(name);
-  if (value == nullptr || value[0] == '\0') {
-    return fallback;
-  }
-  char* end = nullptr;
-  const unsigned long parsed = std::strtoul(value, &end, 10);
-  if (end == value) {
-    return fallback;
-  }
-  return static_cast<std::size_t>(parsed);
-}
-
-int env_int(const char* name, int fallback) {
-  const char* value = g_getenv(name);
-  if (value == nullptr || value[0] == '\0') {
-    return fallback;
-  }
-  char* end = nullptr;
-  const long parsed = std::strtol(value, &end, 10);
-  if (end == value || parsed <= 0) {
-    return fallback;
-  }
-  return static_cast<int>(parsed);
-}
-
 std::size_t max_open_bytes() {
-  return env_size("LUNDUKE_EDIT_TEST_MAX_OPEN", kDefaultMaxOpenBytes);
+  return test_max_open_bytes(kDefaultMaxOpenBytes);
 }
 
 std::size_t max_open_hard_bytes() {
-  return env_size("LUNDUKE_EDIT_TEST_MAX_OPEN_HARD", kDefaultMaxOpenHardBytes);
+  return test_max_open_hard_bytes(kDefaultMaxOpenHardBytes);
 }
 
 std::string hard_open_limit_phrase(std::size_t hard) {
@@ -152,19 +127,19 @@ std::string hard_open_refusal(std::size_t hard) {
 }
 
 std::size_t max_paste_bytes() {
-  return env_size("LUNDUKE_EDIT_TEST_MAX_PASTE", kDefaultMaxPasteBytes);
+  return test_max_paste_bytes(kDefaultMaxPasteBytes);
 }
 
 int max_find_hits() {
-  return env_int("LUNDUKE_EDIT_TEST_MAX_HITS", kDefaultMaxFindHits);
+  return test_max_find_hits(kDefaultMaxFindHits);
 }
 
 int find_chunk_size() {
-  return env_int("LUNDUKE_EDIT_TEST_CHUNK", kDefaultFindChunk);
+  return test_find_chunk(kDefaultFindChunk);
 }
 
 std::size_t huge_undo_limit() {
-  return env_size("LUNDUKE_EDIT_TEST_HUGE_BYTES", kDefaultHugeUndoBytes);
+  return test_huge_undo_bytes(kDefaultHugeUndoBytes);
 }
 
 std::size_t count_newlines(const char* data, std::size_t len) {
@@ -259,13 +234,20 @@ bool write_all_fd(int fd, const std::string& bytes, std::string& error,
                   bool inplace_copy) {
   const char* p = bytes.data();
   std::size_t left = bytes.size();
+#ifndef LUNDUKE_EDIT_TEST_HOOKS
+  (void)inplace_copy;
+#endif
   while (left > 0) {
     ssize_t n = 0;
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
     if (inplace_copy && MainWindow::test_write_hook_ != nullptr) {
       n = MainWindow::test_write_hook_(fd, p, left, true);
     } else {
       n = ::write(fd, p, left);
     }
+#else
+    n = ::write(fd, p, left);
+#endif
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -362,11 +344,15 @@ void fsync_parent_best_effort(int dirfd) {
     return;
   }
   int rc = 0;
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
   if (MainWindow::test_dir_fsync_hook_ != nullptr) {
     rc = MainWindow::test_dir_fsync_hook_(dirfd);
   } else {
     rc = ::fsync(dirfd);
   }
+#else
+  rc = ::fsync(dirfd);
+#endif
   if (rc != 0) {
     const int err = errno;
     // EINVAL and EROFS mean the filesystem has no directory flush.
@@ -876,11 +862,13 @@ bool insert_release_is_autorepeat(GdkEventKey* event) {
 
 }  // namespace
 
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
 ssize_t (*MainWindow::test_write_hook_)(int, const void*, std::size_t,
                                         bool) = nullptr;
 int (*MainWindow::test_dir_fsync_hook_)(int) = nullptr;
 std::function<void(MainWindow*)> MainWindow::test_during_large_confirm_{};
 std::function<const char*(MainWindow*)> MainWindow::test_discard_choice_{};
+#endif
 
 std::string MainWindow::ensure_save_as_path(std::string path) {
   // The file chooser already confirmed this path, including overwrite.
@@ -1530,12 +1518,14 @@ void MainWindow::load_seed_sample() {
 }
 
 bool MainWindow::confirm_large_open(const std::string& path) {
-  if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  if (test_mode()) {
     if (test_during_large_confirm_) {
       test_during_large_confirm_(this);
     }
-    return g_getenv("LUNDUKE_EDIT_TEST_LARGE") != nullptr;
+    return test_large() != nullptr;
   }
+#endif
   Gtk::MessageDialog dlg(
       *this,
       "This file is larger than 32 MiB.",
@@ -2475,7 +2465,7 @@ void MainWindow::report_error(const Glib::ustring& primary,
   ++error_reports_;
   last_error_primary_ = primary;
   last_error_secondary_ = secondary;
-  if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
+  if (test_mode()) {
     return;
   }
   Gtk::MessageDialog dlg(*this, primary, false, Gtk::MESSAGE_ERROR,
@@ -2548,13 +2538,16 @@ bool MainWindow::confirm_discard_or_save(DiscardKind kind) {
   last_prompt_secondary_ = secondary;
   last_prompt_default_ = default_response;
 
-  // Tests set this so a modal dialog does not block. Unset in normal use.
+  // Tests set this so a modal dialog does not block. Unset in normal use,
+  // and compiled out of the production binary.
   const char* choice = nullptr;
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
   if (test_discard_choice_) {
     choice = test_discard_choice_(this);
   }
+#endif
   if (choice == nullptr) {
-    choice = g_getenv("LUNDUKE_EDIT_TEST_DISCARD");
+    choice = test_discard();
   }
   if (choice != nullptr) {
     if (std::strcmp(choice, "cancel") == 0) {
@@ -2811,7 +2804,7 @@ bool MainWindow::save_document() {
 void MainWindow::on_save() { save_document(); }
 
 bool MainWindow::save_as_dialog() {
-  if (const char* hook = g_getenv("LUNDUKE_EDIT_TEST_SAVE_AS")) {
+  if (const char* hook = test_save_as()) {
     if (std::strcmp(hook, "cancel") == 0) {
       return false;
     }
@@ -3475,7 +3468,7 @@ void MainWindow::remember_file_identity(const std::string& path) {
 
 MainWindow::DiskChangeChoice MainWindow::confirm_file_changed(
     const std::string& /*path*/) {
-  if (const char* choice = g_getenv("LUNDUKE_EDIT_TEST_REPLACE")) {
+  if (const char* choice = test_replace()) {
     if (std::strcmp(choice, "reload") == 0) {
       return DiskChangeChoice::Reload;
     }
@@ -3484,7 +3477,7 @@ MainWindow::DiskChangeChoice MainWindow::confirm_file_changed(
     }
     return DiskChangeChoice::Cancel;
   }
-  if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
+  if (test_mode()) {
     return DiskChangeChoice::Replace;
   }
   Gtk::MessageDialog dlg(*this, "This file changed on disk.", false,
@@ -4109,10 +4102,10 @@ void MainWindow::on_find_dialog_hidden() {
 }
 
 bool MainWindow::confirm_huge_undo(std::size_t bytes) {
-  if (const char* choice = g_getenv("LUNDUKE_EDIT_TEST_HUGE_UNDO")) {
+  if (const char* choice = test_huge_undo_choice()) {
     return std::strcmp(choice, "allow") == 0;
   }
-  if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
+  if (test_mode()) {
     return true;
   }
   Gtk::MessageDialog dlg(
@@ -4158,8 +4151,7 @@ void MainWindow::finish_find_scan(bool show_result) {
   find_scan_.active = false;
   find_scan_.dlg = nullptr;
 
-  if (show_result && !cancelled && dlg != nullptr &&
-      g_getenv("LUNDUKE_EDIT_TEST") == nullptr) {
+  if (show_result && !cancelled && dlg != nullptr && !test_mode()) {
     if (kind == FindScan::Kind::FindAll) {
       Glib::ustring message =
           "Found " + std::to_string(count) + (count == 1 ? " match." : " matches.");
@@ -4938,7 +4930,7 @@ void MainWindow::on_find_next() {
     Gtk::TextIter sel_a, sel_b;
     if (!buf || !buf->get_selection_bounds(sel_a, sel_b) || sel_a == sel_b) {
       last_notice_ = "No text is selected.";
-      if (g_getenv("LUNDUKE_EDIT_TEST") == nullptr) {
+      if (!test_mode()) {
         Gtk::MessageDialog miss(*this, "No text is selected.", false,
                                 Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
         miss.set_secondary_text("Search Selection Only needs a selection.");
@@ -4961,7 +4953,7 @@ void MainWindow::on_find_next() {
   }
   if (!find_match(o, true)) {
     last_notice_ = "Text not found.";
-    if (g_getenv("LUNDUKE_EDIT_TEST") != nullptr) {
+    if (test_mode()) {
       return;
     }
     Gtk::MessageDialog miss(*this, "Text not found.", false, Gtk::MESSAGE_INFO,
