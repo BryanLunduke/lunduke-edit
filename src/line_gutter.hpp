@@ -7,6 +7,8 @@
 #include <gtkmm/textview.h>
 #include <pangomm/fontdescription.h>
 
+#include <vector>
+
 namespace lundukeedit {
 
 // Narrow left gutter that paints 1-based line numbers, scrolled in sync
@@ -22,6 +24,9 @@ public:
   // Rebind to the adjustment the text view is actually scrolling with.
   void follow_view_adjustment();
   bool follows_text_view_adjustment() const;
+  // 1-based line numbers the gutter would paint for the current scroll
+  // position, including the empty line after a trailing newline.
+  std::vector<int> visible_line_numbers() const;
 
 protected:
   bool on_draw(const Cairo::RefPtr<Cairo::Context>& cr) override;

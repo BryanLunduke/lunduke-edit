@@ -130,8 +130,9 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
   band(case_sensitive_, *case_pad, kBandSpacing);
 
   // Replace With: tight label→entry (same gap as Search For).
-  auto* replace_label = Gtk::manage(new Gtk::Label("Replace With:", true));
+  auto* replace_label = Gtk::manage(new Gtk::Label("Replace _With:", true));
   replace_label->set_halign(Gtk::ALIGN_START);
+  replace_label->set_mnemonic_widget(replace_entry_);
   auto* replace_block =
       Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, kLabelEntryGap));
   replace_block->pack_start(*replace_label, Gtk::PACK_SHRINK);

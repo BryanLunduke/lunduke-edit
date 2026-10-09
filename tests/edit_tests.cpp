@@ -16,6 +16,7 @@
 #include <gdk/gdkkeysyms.h>
 #include <gdk/gdkx.h>
 #include <gtk/gtk.h>
+#include <X11/Xlib.h>
 
 #include <algorithm>
 #include <csetjmp>
@@ -186,6 +187,66 @@ struct EditChecks {
            "gutter tracks the scrolling adjustment");
     expect(w.scrolled_.get_vadjustment() == w.text_view_.get_vadjustment(),
            "text view uses the scrolled window adjustment");
+  }
+
+  static bool gutter_has(const std::vector<int>& numbers, int line) {
+    return std::find(numbers.begin(), numbers.end(), line) != numbers.end();
+  }
+
+  static void test_gutter_trailing_newline(MainWindow& w) {
+    w.buffer()->set_text("a\nb\n");
+    w.buffer()->place_cursor(w.buffer()->end());
+    w.update_status();
+    flush_ui();
+    expect(w.buffer()->get_line_count() == 3,
+           "a trailing newline is its own line");
+    expect(w.status_pos_.get_text().find("Ln 3,") == 0,
+           "status numbers the empty line after a final newline");
+    auto end_short = w.buffer()->get_iter_at_line(2);
+    w.text_view_.scroll_to(end_short);
+    flush_ui();
+    const auto short_numbers = w.gutter_->visible_line_numbers();
+    expect(gutter_has(short_numbers, 3),
+           "gutter numbers the empty line after a final newline");
+
+    std::string many;
+    many.reserve(200 * 2);
+    for (int i = 0; i < 200; ++i) {
+      many += "a\n";
+    }
+    w.buffer()->set_text(many);
+    w.buffer()->place_cursor(w.buffer()->end());
+    w.update_status();
+    // scroll_to stops at unmeasured lines. The same idle Ctrl+End uses
+    // validates in short slices, then scrolls the caret on screen. A tight
+    // non-blocking loop returns before that 15 ms timeout is due, so wait
+    // on the clock until the empty last line is in the gutter.
+    w.note_caret_for_reveal();
+    const int lines = w.buffer()->get_line_count();
+    std::vector<int> numbers;
+    const gint64 deadline = g_get_monotonic_time() + 3000000;
+    while (g_get_monotonic_time() < deadline) {
+      while (g_main_context_pending(nullptr)) {
+        g_main_context_iteration(nullptr, false);
+      }
+      numbers = w.gutter_->visible_line_numbers();
+      if (gutter_has(numbers, lines) && !w.follow_caret_) {
+        break;
+      }
+      g_usleep(5000);
+    }
+    expect(lines == 201, "two hundred newlines make line 201");
+    expect(w.status_pos_.get_text().find("Ln 201,") == 0,
+           "status shows the empty last line of a longer file");
+    if (!gutter_has(numbers, lines)) {
+      std::cerr << "gutter lines:";
+      for (int n : numbers) {
+        std::cerr << " " << n;
+      }
+      std::cerr << "\n";
+    }
+    expect(gutter_has(numbers, lines),
+           "gutter numbers the empty last line, not one short of it");
   }
 
   static void test_save_open_undo(MainWindow& w, const std::string& dir) {
@@ -4342,6 +4403,8 @@ struct EditChecks {
     const guint timer =
         g_timeout_add_full(G_PRIORITY_DEFAULT, 1, loop_gap_cb, &gap, nullptr);
     w.start_replace_all(opts, nullptr);
+    expect(w.status_find_.get_text().find("Replacing") == 0,
+           "Replace All shows a status line as soon as it starts");
     bool cancelled = false;
     int progress_steps = 0;
     int last_pct = -1;
@@ -4453,6 +4516,60 @@ struct EditChecks {
              "Ln/Col matches the caret after undo of Replace All");
     }
     std::cout << "round7 replace end\n";
+
+    // A replacement whose worst-case undo record exceeds the huge-undo
+    // limit takes a counting pass before it builds anything. That pass
+    // has to show "Replacing…" instead of a blank status line.
+    std::cout << "round7 count-status begin\n";
+    {
+      std::string lines;
+      lines.reserve(4000);
+      for (int i = 0; i < 2000; ++i) {
+        lines += "a\n";
+      }
+      w.buffer()->set_text(lines);
+      flush_ui();
+      const Glib::ustring before = w.buffer()->get_text();
+      FindOptions count_opts;
+      count_opts.search_for = "a";
+      // A long replacement makes the worst-case undo estimate exceed the
+      // huge-undo limit, which is what turns the counting pass on.
+      count_opts.replace_with = std::string(10000, 'b');
+      count_opts.case_sensitive = true;
+      w.start_replace_all(count_opts, nullptr);
+      expect(w.find_scan_.counting,
+             "an oversized undo estimate counts matches before editing");
+      expect(w.status_find_.get_text().find("Replacing") == 0,
+             "the counting pass shows Replacing immediately");
+      int last_pct = w.find_scan_.progress_pct;
+      bool advanced = false;
+      for (int i = 0; i < 200000 && w.find_scan_.counting; ++i) {
+        g_main_context_iteration(nullptr, false);
+        if (w.buffer()->get_text() != before) {
+          expect(false, "the counting pass does not change the buffer");
+          break;
+        }
+        if (w.find_scan_.progress_pct > last_pct) {
+          advanced = true;
+          last_pct = w.find_scan_.progress_pct;
+        }
+        if (advanced && last_pct >= 1) {
+          break;
+        }
+      }
+      expect(advanced && last_pct >= 1,
+             "the counting pass moves the percentage");
+      GdkEventKey key {};
+      key.type = GDK_KEY_PRESS;
+      key.keyval = GDK_KEY_Escape;
+      w.on_key_press_event(&key);
+      expect(!w.find_scan_.active, "Escape during counting cancels");
+      expect(w.buffer()->get_text() == before,
+             "cancelling the counting pass leaves the buffer unchanged");
+      expect(w.status_find_.get_text().find("Replacing") == std::string::npos,
+             "cancelling the counting pass clears the status");
+    }
+    std::cout << "round7 count-status end\n";
   }
 
   struct ToolRun {
@@ -5026,6 +5143,575 @@ struct EditChecks {
     std::cout << "round7 xdnd end\n";
   }
 
+  struct ProdProbe {
+    Display* dpy{nullptr};
+    Atom wm_protocols{0};
+    Atom net_ping{0};
+    Atom net_wm_name{0};
+    Atom utf8{0};
+    Window root{0};
+    long seq{1};
+    XErrorHandler previous_handler{nullptr};
+
+    bool open() {
+      dpy = XOpenDisplay(nullptr);
+      if (dpy == nullptr) {
+        return false;
+      }
+      root = DefaultRootWindow(dpy);
+      wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
+      net_ping = XInternAtom(dpy, "_NET_WM_PING", False);
+      net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+      utf8 = XInternAtom(dpy, "UTF8_STRING", False);
+      XSelectInput(dpy, root, SubstructureNotifyMask | StructureNotifyMask);
+      previous_handler =
+          XSetErrorHandler(+[](Display*, XErrorEvent*) { return 0; });
+      return true;
+    }
+
+    void close() {
+      if (previous_handler != nullptr) {
+        XSetErrorHandler(previous_handler);
+        previous_handler = nullptr;
+      }
+      if (dpy != nullptr) {
+        XCloseDisplay(dpy);
+        dpy = nullptr;
+      }
+    }
+
+    std::string title_of(Window window) const {
+      if (dpy == nullptr || window == 0) {
+        return {};
+      }
+      Atom actual = 0;
+      int format = 0;
+      unsigned long n = 0;
+      unsigned long after = 0;
+      unsigned char* data = nullptr;
+      if (XGetWindowProperty(dpy, window, net_wm_name, 0, 1024, False, utf8,
+                             &actual, &format, &n, &after, &data) == Success &&
+          data != nullptr) {
+        std::string text(reinterpret_cast<char*>(data), n);
+        XFree(data);
+        return text;
+      }
+      if (data != nullptr) {
+        XFree(data);
+      }
+      char* name = nullptr;
+      if (XFetchName(dpy, window, &name) && name != nullptr) {
+        std::string text(name);
+        XFree(name);
+        return text;
+      }
+      return {};
+    }
+
+    Window find_editor() const {
+      if (dpy == nullptr) {
+        return 0;
+      }
+      Window root_ret = 0;
+      Window parent = 0;
+      Window* children = nullptr;
+      unsigned count = 0;
+      if (!XQueryTree(dpy, root, &root_ret, &parent, &children, &count)) {
+        return 0;
+      }
+      Window best = 0;
+      int best_area = 0;
+      for (unsigned i = 0; i < count; ++i) {
+        XClassHint hint {};
+        if (XGetClassHint(dpy, children[i], &hint) == 0) {
+          continue;
+        }
+        const bool match =
+            (hint.res_name != nullptr &&
+             std::strstr(hint.res_name, "lunduke-edit") != nullptr) ||
+            (hint.res_class != nullptr &&
+             std::strstr(hint.res_class, "lunduke") != nullptr);
+        if (hint.res_name != nullptr) {
+          XFree(hint.res_name);
+        }
+        if (hint.res_class != nullptr) {
+          XFree(hint.res_class);
+        }
+        if (!match) {
+          continue;
+        }
+        XWindowAttributes attr {};
+        if (XGetWindowAttributes(dpy, children[i], &attr) == 0 ||
+            attr.map_state != IsViewable || attr.width < 200 ||
+            attr.height < 150) {
+          continue;
+        }
+        const int area = attr.width * attr.height;
+        if (area > best_area) {
+          best = children[i];
+          best_area = area;
+        }
+      }
+      if (children != nullptr) {
+        XFree(children);
+      }
+      return best;
+    }
+
+    // Round-trip through the editor's main loop. The reply is the
+    // _NET_WM_PING the toolkit echoes to the root window.
+    double ping(Window window, int timeout_ms, pid_t pid = -1,
+                const std::function<void()>& tick = {}) {
+      if (dpy == nullptr || window == 0) {
+        return static_cast<double>(timeout_ms);
+      }
+      XEvent ev {};
+      ev.xclient.type = ClientMessage;
+      ev.xclient.window = window;
+      ev.xclient.message_type = wm_protocols;
+      ev.xclient.format = 32;
+      const long token = ++seq;
+      ev.xclient.data.l[0] = static_cast<long>(net_ping);
+      ev.xclient.data.l[1] = token;
+      ev.xclient.data.l[2] = static_cast<long>(window);
+      const gint64 t0 = g_get_monotonic_time();
+      XSendEvent(dpy, window, False, NoEventMask, &ev);
+      XFlush(dpy);
+      while (true) {
+        if (tick) {
+          tick();
+        }
+        if (pid > 0) {
+          int status = 0;
+          if (waitpid(pid, &status, WNOHANG) == pid) {
+            return -2;
+          }
+        }
+        XWindowAttributes attr {};
+        if (XGetWindowAttributes(dpy, window, &attr) == 0) {
+          return -2;
+        }
+        const double elapsed =
+            static_cast<double>(g_get_monotonic_time() - t0) / 1000.0;
+        if (elapsed >= timeout_ms) {
+          return elapsed;
+        }
+        while (XPending(dpy) != 0) {
+          XEvent got {};
+          XNextEvent(dpy, &got);
+          if (got.type == ClientMessage &&
+              got.xclient.message_type == wm_protocols &&
+              static_cast<Atom>(got.xclient.data.l[0]) == net_ping &&
+              got.xclient.data.l[1] == token) {
+            return static_cast<double>(g_get_monotonic_time() - t0) / 1000.0;
+          }
+        }
+        pollfd pfd {};
+        pfd.fd = ConnectionNumber(dpy);
+        pfd.events = POLLIN;
+        const int remain = timeout_ms - static_cast<int>(elapsed);
+        // Short waits so a cancel key can go out on time while this
+        // round trip is still measuring a longer stall.
+        const int slice = remain > 50 ? 50 : remain;
+        poll(&pfd, 1, slice > 0 ? slice : 0);
+      }
+    }
+  };
+
+  static bool xdotool_cmd(const std::string& args) {
+    const std::string cmd =
+        "/usr/bin/xdotool " + args + " >/tmp/xdotool-prod.log 2>&1";
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      std::cerr << "xdotool rc=" << rc << " args=[" << args << "]\n";
+    }
+    return rc == 0;
+  }
+
+  static std::string production_binary_path() {
+    const auto slash = argv0.find_last_of('/');
+    const std::string dir =
+        (slash == std::string::npos) ? std::string(".") : argv0.substr(0, slash);
+    return dir + "/lunduke-edit";
+  }
+
+  static pid_t spawn_production(const std::string& bin, const std::string& path,
+                                bool throttle) {
+    const pid_t pid = fork();
+    if (pid < 0) {
+      return -1;
+    }
+    if (pid == 0) {
+      setpgid(0, 0);
+      unset_inherited_test_env();
+      unsetenv("LUNDUKE_EDIT_TEST_ARGV_CHILD");
+      unsetenv("LUNDUKE_EDIT_TEST_REPLACE_CHILD");
+      unsetenv("LUNDUKE_EDIT_TEST_DND_CHILD");
+      setenv("GDK_BACKEND", "x11", 1);
+      const bool have_taskset = access("/usr/bin/taskset", X_OK) == 0;
+      if (throttle && have_taskset) {
+        execl("/usr/bin/taskset", "taskset", "-c", "0", "/usr/bin/cpulimit",
+              "-f", "-q", "-c", "1", "-l", "25", "--", bin.c_str(), path.c_str(),
+              static_cast<char*>(nullptr));
+      } else if (throttle) {
+        execl("/usr/bin/cpulimit", "cpulimit", "-f", "-q", "-c", "1", "-l", "25",
+              "--", bin.c_str(), path.c_str(), static_cast<char*>(nullptr));
+      } else {
+        execl(bin.c_str(), bin.c_str(), path.c_str(), static_cast<char*>(nullptr));
+      }
+      _exit(127);
+    }
+    setpgid(pid, pid);
+    return pid;
+  }
+
+  static void stop_production(pid_t pid) {
+    if (pid <= 0) {
+      return;
+    }
+    kill(-pid, SIGKILL);
+    int status = 0;
+    waitpid(pid, &status, 0);
+  }
+
+  static void wait_for_editor_gone(ProdProbe& probe) {
+    for (int i = 0; i < 80; ++i) {
+      if (probe.find_editor() == 0) {
+        poll(nullptr, 0, 80);
+        if (probe.find_editor() == 0) {
+          return;
+        }
+      }
+      poll(nullptr, 0, 25);
+    }
+  }
+
+  struct ProdStats {
+    double map_ms{-1};
+    double done_ms{-1};
+    double max_gap_ms{0};
+    double replace_gap_ms{0};
+    double escape_at_ms{-1};
+    bool mapped{false};
+    bool titled{false};
+    bool dirty{false};
+    bool escaped{false};
+    bool undo_ok{false};
+    int pings{0};
+  };
+
+  // Drive the shipped editor from outside the process. Gaps are
+  // _NET_WM_PING round trips after the real window maps.
+  static ProdStats watch_production(ProdProbe& probe, pid_t pid,
+                                    const std::string& base, bool replace,
+                                    bool cancel, double gap_limit_ms,
+                                    int deadline_ms, double escape_after_ms) {
+    ProdStats stats;
+    const gint64 start = g_get_monotonic_time();
+    Window editor = 0;
+    gint64 mapped_at = 0;
+    bool keys_sent = false;
+    bool replace_armed = false;
+    gint64 replace_armed_at = 0;
+    bool undo_sent = false;
+    int escape_sends = 0;
+    const int ping_timeout = static_cast<int>(gap_limit_ms) + 150;
+    auto elapsed_ms = [&]() {
+      return static_cast<double>(g_get_monotonic_time() - start) / 1000.0;
+    };
+    auto since_map = [&]() {
+      return static_cast<double>(g_get_monotonic_time() - mapped_at) / 1000.0;
+    };
+
+    while (elapsed_ms() < deadline_ms) {
+      int status = 0;
+      if (waitpid(pid, &status, WNOHANG) == pid) {
+        break;
+      }
+      if (editor == 0) {
+        editor = probe.find_editor();
+        if (editor != 0) {
+          stats.mapped = true;
+          mapped_at = g_get_monotonic_time();
+          stats.map_ms = elapsed_ms();
+        } else {
+          poll(nullptr, 0, 20);
+          continue;
+        }
+      }
+      // Escape is sent from inside the ping wait. A full-timeout poll would
+      // otherwise run past the cancel point, and one key during the commit
+      // slice is too late. Repeats every 200 ms cover about 1 s while the
+      // title is still Untitled.
+      const double rtt = probe.ping(editor, ping_timeout, pid, [&]() {
+        if (replace || !cancel || escape_sends >= 8 ||
+            since_map() < escape_after_ms) {
+          return;
+        }
+        const bool due =
+            !stats.escaped ||
+            since_map() >= stats.escape_at_ms + escape_sends * 200.0;
+        if (!due) {
+          return;
+        }
+        const std::string early = probe.title_of(editor);
+        if (early.find(base) != std::string::npos) {
+          return;
+        }
+        xdotool_cmd("windowfocus " + std::to_string(editor) +
+                    " key --clearmodifiers Escape");
+        if (!stats.escaped) {
+          stats.escape_at_ms = since_map();
+        }
+        stats.escaped = true;
+        ++escape_sends;
+      });
+      if (rtt >= 0 && rtt < 30.0) {
+        // A tight ping loop otherwise spins the CPU and crowds the editor.
+        poll(nullptr, 0, 15);
+      }
+      if (rtt < 0) {
+        // The process exited mid-ping. A command-line open that was
+        // cancelled closes its window; that is not a stalled main loop.
+        if (stats.escaped && !stats.titled) {
+          stats.done_ms = elapsed_ms();
+          break;
+        }
+        break;
+      }
+      ++stats.pings;
+      if (rtt > stats.max_gap_ms) {
+        stats.max_gap_ms = rtt;
+      }
+      if (keys_sent && rtt > stats.replace_gap_ms) {
+        stats.replace_gap_ms = rtt;
+      }
+      const std::string title = probe.title_of(editor);
+      const bool has_file = title.find(base) != std::string::npos;
+      const bool has_star = title.find(" *") != std::string::npos;
+      if (has_file) {
+        stats.titled = true;
+      }
+      if (has_star) {
+        stats.dirty = true;
+      }
+
+      if (!replace) {
+        if (cancel) {
+          if (stats.escaped && since_map() > stats.escape_at_ms + 4000.0) {
+            stats.done_ms = elapsed_ms();
+            break;
+          }
+          if (!stats.escaped && has_file) {
+            stats.done_ms = elapsed_ms();
+            break;
+          }
+        } else if (has_file) {
+          stats.done_ms = elapsed_ms();
+          // One more ping after the title flips, so a post-load draw is
+          // included in the gap.
+          const double after = probe.ping(editor, ping_timeout, pid);
+          if (after >= 0) {
+            ++stats.pings;
+            if (after > stats.max_gap_ms) {
+              stats.max_gap_ms = after;
+            }
+          }
+          break;
+        }
+        continue;
+      }
+
+      if (!keys_sent) {
+        if (!has_file) {
+          continue;
+        }
+        xdotool_cmd("windowfocus --sync " + std::to_string(editor));
+        xdotool_cmd("key --clearmodifiers ctrl+f");
+        poll(nullptr, 0, 250);
+        xdotool_cmd("type --delay 5 --clearmodifiers 'line '");
+        xdotool_cmd("key --clearmodifiers alt+w");
+        poll(nullptr, 0, 80);
+        xdotool_cmd("type --delay 5 --clearmodifiers 'row '");
+        xdotool_cmd("key --clearmodifiers alt+l");
+        keys_sent = true;
+        replace_armed = true;
+        replace_armed_at = g_get_monotonic_time();
+        continue;
+      }
+
+      const double since_replace =
+          static_cast<double>(g_get_monotonic_time() - replace_armed_at) / 1000.0;
+      if (cancel) {
+        if (!stats.escaped && since_replace >= escape_after_ms && !has_star) {
+          xdotool_cmd("key --clearmodifiers Escape");
+          stats.escaped = true;
+          stats.escape_at_ms = since_replace;
+        }
+        if (stats.escaped && since_replace > stats.escape_at_ms + 12000.0) {
+          stats.done_ms = elapsed_ms();
+          break;
+        }
+        if (!stats.escaped && has_star) {
+          stats.done_ms = elapsed_ms();
+          break;
+        }
+        continue;
+      }
+
+      if (has_star && !undo_sent) {
+        xdotool_cmd("key --clearmodifiers Escape");
+        poll(nullptr, 0, 200);
+        xdotool_cmd("windowfocus --sync " + std::to_string(editor));
+        xdotool_cmd("key --clearmodifiers ctrl+z");
+        undo_sent = true;
+        continue;
+      }
+      if (undo_sent && !has_star && has_file) {
+        stats.undo_ok = true;
+        stats.done_ms = elapsed_ms();
+        break;
+      }
+      (void)replace_armed;
+    }
+    return stats;
+  }
+
+  static void write_repeated(const std::string& path, const std::string& piece,
+                             std::size_t bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    std::size_t wrote = 0;
+    while (wrote < bytes) {
+      const std::size_t n = std::min(piece.size(), bytes - wrote);
+      out.write(piece.data(), static_cast<std::streamsize>(n));
+      wrote += n;
+    }
+  }
+
+  static void test_production_responsiveness(const std::string& dir) {
+    std::cout << "production responsiveness begin\n";
+    const char* display = g_getenv("DISPLAY");
+    if (display == nullptr || display[0] == '\0') {
+      expect(false, "production stall test has a display");
+      return;
+    }
+    if (access("/usr/bin/xdotool", X_OK) != 0) {
+      expect(false, "production stall test requires /usr/bin/xdotool");
+      return;
+    }
+    const bool have_cpulimit = access("/usr/bin/cpulimit", X_OK) == 0;
+    const std::string bin = production_binary_path();
+    if (access(bin.c_str(), X_OK) != 0) {
+      expect(false, "production binary lunduke-edit is beside the test");
+      std::cerr << "missing " << bin << "\n";
+      return;
+    }
+    const std::string open_path = dir + "/prod-open-12mb.txt";
+    const std::string replace_path = dir + "/prod-replace-12mb.txt";
+    write_repeated(open_path, "foo bar baz\n", 12000000);
+    write_repeated(replace_path,
+                   "line dog sit quick ipsum fox value line\n", 12000000);
+    expect(read_bytes(open_path).size() == 12000000,
+           "production open fixture is 12000000 bytes");
+    expect(read_bytes(replace_path).size() == 12000000,
+           "production replace fixture is 12000000 bytes");
+
+    struct Leg {
+      const char* name;
+      bool throttle;
+      bool replace;
+      bool cancel;
+      double gap_limit;
+      int deadline_ms;
+      double escape_after_ms;
+      double escape_min_ms;
+      const char* path;
+    };
+    // Unthrottled open finishes in well under a second, so Escape is sent
+    // while the title is still Untitled. A cpulimit open finishes near one
+    // second on a fast CPU; Escape starts at 400 ms and is repeated through
+    // about 1 s while the title stays Untitled. Replace All is still running
+    // at one second, which is when Escape is pressed there.
+    const Leg legs[] = {
+        {"open-unthrottled", false, false, false, 250.0, 60000, 0, 0,
+         open_path.c_str()},
+        {"open-escape-unthrottled", false, false, true, 250.0, 20000, 60.0,
+         40.0, open_path.c_str()},
+        {"open-cpulimit", true, false, false, 1000.0, 120000, 0, 0,
+         open_path.c_str()},
+        {"open-escape-cpulimit", true, false, true, 1000.0, 60000, 400.0,
+         300.0, open_path.c_str()},
+        {"replace-unthrottled", false, true, false, 250.0, 180000, 0, 0,
+         replace_path.c_str()},
+        {"replace-escape-unthrottled", false, true, true, 250.0, 60000, 1000.0,
+         900.0, replace_path.c_str()},
+        {"replace-cpulimit", true, true, false, 1000.0, 300000, 0, 0,
+         replace_path.c_str()},
+        {"replace-escape-cpulimit", true, true, true, 1000.0, 180000, 1000.0,
+         900.0, replace_path.c_str()},
+    };
+
+    for (const Leg& leg : legs) {
+      if (leg.throttle && !have_cpulimit) {
+        expect(false, "production stall test requires /usr/bin/cpulimit");
+        std::cout << "production " << leg.name << " cpulimit missing\n";
+        continue;
+      }
+      ProdProbe probe;
+      expect(probe.open(), "production stall test opens its own X display");
+      if (probe.dpy == nullptr) {
+        return;
+      }
+      const std::string path = leg.path;
+      const auto slash = path.find_last_of('/');
+      const std::string base =
+          (slash == std::string::npos) ? path : path.substr(slash + 1);
+      const pid_t pid = spawn_production(bin, path, leg.throttle);
+      expect(pid > 0, "production editor starts");
+      if (pid <= 0) {
+        probe.close();
+        continue;
+      }
+      const ProdStats stats =
+          watch_production(probe, pid, base, leg.replace, leg.cancel,
+                           leg.gap_limit, leg.deadline_ms, leg.escape_after_ms);
+      stop_production(pid);
+      wait_for_editor_gone(probe);
+      probe.close();
+      std::cout << "production " << leg.name << " map_ms=" << stats.map_ms
+                << " done_ms=" << stats.done_ms
+                << " max_gap_ms=" << stats.max_gap_ms
+                << " replace_gap_ms=" << stats.replace_gap_ms
+                << " pings=" << stats.pings << " titled=" << stats.titled
+                << " dirty=" << stats.dirty << " escaped=" << stats.escaped
+                << " escape_at_ms=" << stats.escape_at_ms
+                << " undo_ok=" << stats.undo_ok << "\n";
+      expect(stats.mapped && stats.map_ms >= 0 && stats.map_ms < 5000,
+             "production window maps");
+      expect(stats.pings > 0 && stats.max_gap_ms <= leg.gap_limit,
+             "production main loop stays inside the stall bound");
+      if (!leg.replace && !leg.cancel) {
+        expect(stats.titled, "production open finishes and retitles");
+        expect(stats.done_ms > stats.map_ms, "production open reports load time");
+      }
+      if (!leg.replace && leg.cancel) {
+        expect(stats.escaped && stats.escape_at_ms >= leg.escape_min_ms,
+               "Escape during open is pressed while the file is still loading");
+        expect(!stats.titled, "Escape during open cancels before the file loads");
+      }
+      if (leg.replace && !leg.cancel) {
+        expect(stats.dirty, "Replace All marks the buffer dirty");
+        expect(stats.undo_ok, "Replace All is one undo step");
+      }
+      if (leg.replace && leg.cancel) {
+        expect(stats.escaped && stats.escape_at_ms >= leg.escape_min_ms,
+               "Escape during Replace All is pressed while it is still running");
+        expect(!stats.dirty, "Escape during Replace All leaves the buffer clean");
+      }
+    }
+    std::cout << "production responsiveness end\n";
+  }
+
   static int run() {
     failures = 0;
     g_setenv("LUNDUKE_EDIT_TEST", "1", TRUE);
@@ -5035,6 +5721,10 @@ struct EditChecks {
 
     const std::string dir = "/tmp/lunduke-edit-tests";
     g_mkdir_with_parents(dir.c_str(), 0700);
+
+    // Before this process registers org.lunduke.LundukeEdit. The production
+    // binary is a single instance and would otherwise hand the file here.
+    test_production_responsiveness(dir);
 
     // A face left by an earlier run must not become this process's default.
     const std::string font_path = font_config_path();
@@ -5054,6 +5744,7 @@ struct EditChecks {
            "the default face keeps the monospace style");
 
     test_columns_and_gutter(*w);
+    test_gutter_trailing_newline(*w);
     test_save_open_undo(*w, dir);
     test_find_replace(*w);
     test_open_many(*app.get(), dir);

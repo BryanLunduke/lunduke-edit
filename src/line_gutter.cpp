@@ -5,8 +5,81 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <vector>
 
 namespace lundukeedit {
+
+namespace {
+
+struct GutterPaint {
+  int number{0};
+  int y{0};
+  int height{0};
+};
+
+// Lines the gutter should number for this scroll position. forward_line()
+// returns false when it lands on the empty line after a trailing newline,
+// because that position is the end iterator, even though the line number
+// did advance. Stopping on the false return skips that line.
+std::vector<GutterPaint> collect_gutter_rows(Gtk::TextView& text_view,
+                                             int widget_height) {
+  std::vector<GutterPaint> rows;
+  auto buf = text_view.get_buffer();
+  if (!buf) {
+    return rows;
+  }
+  Gdk::Rectangle visible_rect;
+  text_view.get_visible_rect(visible_rect);
+
+  Gtk::TextIter start;
+  text_view.get_iter_at_location(start, visible_rect.get_x(),
+                                 visible_rect.get_y());
+  start.set_line_offset(0);
+
+  const int last_line = std::max(0, buf->get_line_count() - 1);
+  const int min_line_px = 8;
+  const int row_budget =
+      std::max(visible_rect.get_height(), widget_height) / min_line_px + 4;
+  int last_visible = start.get_line() + std::min(row_budget, 200);
+  if (last_visible > last_line) {
+    last_visible = last_line;
+  }
+
+  Gtk::TextIter iter = start;
+  if (iter.get_line() > 0) {
+    iter.backward_line();
+  }
+
+  while (true) {
+    if (iter.get_line() > last_visible) {
+      break;
+    }
+    Gdk::Rectangle loc;
+    text_view.get_iter_location(iter, loc);
+    int wx = 0;
+    int wy = 0;
+    text_view.buffer_to_window_coords(Gtk::TEXT_WINDOW_TEXT, loc.get_x(),
+                                      loc.get_y(), wx, wy);
+    const int y = wy;
+    if (y > widget_height + loc.get_height()) {
+      break;
+    }
+    if (y + loc.get_height() >= 0) {
+      rows.push_back(GutterPaint{iter.get_line() + 1, y, loc.get_height()});
+    }
+    if (iter.get_line() >= last_line) {
+      break;
+    }
+    const int prev = iter.get_line();
+    iter.forward_line();
+    if (iter.get_line() == prev) {
+      break;
+    }
+  }
+  return rows;
+}
+
+}  // namespace
 
 LineGutter::LineGutter(Gtk::TextView& text_view) : text_view_(text_view) {
   set_size_request(36, -1);
@@ -102,6 +175,16 @@ void LineGutter::update_width() {
   set_size_request(width, -1);
 }
 
+std::vector<int> LineGutter::visible_line_numbers() const {
+  std::vector<int> numbers;
+  const auto rows = collect_gutter_rows(text_view_, get_allocated_height());
+  numbers.reserve(rows.size());
+  for (const auto& row : rows) {
+    numbers.push_back(row.number);
+  }
+  return numbers;
+}
+
 bool LineGutter::on_draw(const Cairo::RefPtr<Cairo::Context>& cr) {
   const int width = get_allocated_width();
   const int height = get_allocated_height();
@@ -118,82 +201,20 @@ bool LineGutter::on_draw(const Cairo::RefPtr<Cairo::Context>& cr) {
   cr->line_to(width - 0.5, height);
   cr->stroke();
 
-  auto buf = text_view_.get_buffer();
-  auto vadj = text_view_.get_vadjustment();
-  const double scroll_y = vadj ? vadj->get_value() : 0.0;
-
-  Gdk::Rectangle visible_rect;
-  text_view_.get_visible_rect(visible_rect);
-
-  Gtk::TextIter start;
-  text_view_.get_iter_at_location(start, visible_rect.get_x(),
-                                  visible_rect.get_y());
-  start.set_line_offset(0);
-
-  // Bound the walk by the screen. Resolving a y coordinate below the
-  // caret used to build a Pango layout for a whole long line, and walking
-  // until a y coordinate advanced shaped every line of a large file.
-  const int last_line = std::max(0, buf->get_line_count() - 1);
-  const int min_line_px = 8;
-  const int rows =
-      std::max(visible_rect.get_height(), height) / min_line_px + 4;
-  int last_visible = start.get_line() + std::min(rows, 200);
-  if (last_visible > last_line) {
-    last_visible = last_line;
-  }
-
   auto font_desc = editor_font();
-
   cr->set_source_rgb(0.35, 0.35, 0.40);
 
-  Gtk::TextIter iter = start;
-  // Walk a few lines above the visible top in case of partial lines.
-  if (iter.get_line() > 0) {
-    iter.backward_line();
+  for (const auto& row : collect_gutter_rows(text_view_, height)) {
+    auto layout = create_pango_layout(std::to_string(row.number));
+    layout->set_font_description(font_desc);
+    int tw = 0;
+    int th = 0;
+    layout->get_pixel_size(tw, th);
+    const int x = width - tw - 6;
+    const int text_y = row.y + std::max(0, (row.height - th) / 2);
+    cr->move_to(x, text_y);
+    layout->show_in_cairo_context(cr);
   }
-
-  while (true) {
-    if (iter.get_line() > last_visible) {
-      break;
-    }
-    Gdk::Rectangle loc;
-    text_view_.get_iter_location(iter, loc);
-
-    // Convert buffer coords -> widget coords for the text view, then
-    // map Y into the gutter (same scroll offset).
-    int wx = 0, wy = 0;
-    text_view_.buffer_to_window_coords(Gtk::TEXT_WINDOW_TEXT, loc.get_x(),
-                                       loc.get_y(), wx, wy);
-
-    // wy is already relative to the text window (scrolled). Gutter shares
-    // the same vertical space as the scrolled text allocation.
-    const int y = wy;
-
-    if (y > height + loc.get_height()) {
-      break;
-    }
-
-    if (y + loc.get_height() >= 0) {
-      const int line_no = iter.get_line() + 1;
-      auto layout = create_pango_layout(std::to_string(line_no));
-      layout->set_font_description(font_desc);
-      int tw = 0, th = 0;
-      layout->get_pixel_size(tw, th);
-      const int x = width - tw - 6;
-      const int text_y = y + std::max(0, (loc.get_height() - th) / 2);
-      cr->move_to(x, text_y);
-      layout->show_in_cairo_context(cr);
-    }
-
-    if (iter.get_line() >= last_line) {
-      break;
-    }
-    if (!iter.forward_line()) {
-      break;
-    }
-  }
-
-  (void)scroll_y;
   return true;
 }
 
