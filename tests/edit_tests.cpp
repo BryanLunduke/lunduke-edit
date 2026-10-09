@@ -103,6 +103,38 @@ gboolean find_accel(GtkAccelKey* key, GClosure*, gpointer data) {
   return FALSE;
 }
 
+std::vector<pid_t> live_children;
+
+void remember_child(pid_t pid) {
+  if (pid > 0) {
+    live_children.push_back(pid);
+  }
+}
+
+void forget_child(pid_t pid) {
+  live_children.erase(std::remove(live_children.begin(), live_children.end(), pid),
+                      live_children.end());
+}
+
+// Kill one child we forked, and the process group it leads, by that pid.
+void kill_child_tree(pid_t pid) {
+  if (pid <= 0) {
+    return;
+  }
+  kill(-pid, SIGKILL);
+  kill(pid, SIGKILL);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  forget_child(pid);
+}
+
+void kill_live_children() {
+  const std::vector<pid_t> copy = live_children;
+  for (pid_t pid : copy) {
+    kill_child_tree(pid);
+  }
+}
+
 }  // namespace
 
 namespace lundukeedit {
@@ -3976,6 +4008,8 @@ struct EditChecks {
   }
 
   static void unset_inherited_test_env() {
+    // DBUS_SESSION_BUS_ADDRESS stays set so a child uses the suite's bus
+    // instead of autolaunching a dbus-daemon.
     const char* names[] = {
         "LUNDUKE_EDIT_TEST",
         "LUNDUKE_EDIT_TEST_DISCARD",
@@ -3986,6 +4020,7 @@ struct EditChecks {
         "LUNDUKE_EDIT_TEST_MAX_HITS",
         "LUNDUKE_EDIT_TEST_HUGE_BYTES",
         "LUNDUKE_EDIT_TEST_HUGE_UNDO",
+        "LUNDUKE_EDIT_TEST_COMMIT_STEP",
         "LUNDUKE_EDIT_TEST_REPLACE",
         "LUNDUKE_EDIT_TEST_MAX_PASTE",
         "LUNDUKE_EDIT_TEST_SAVE_AS",
@@ -4143,6 +4178,7 @@ struct EditChecks {
       _exit(127);
     }
     setpgid(pid, pid);
+    remember_child(pid);
     close(fds[1]);
 
     std::string pending;
@@ -4212,6 +4248,7 @@ struct EditChecks {
       note_argv_line(result, line, start, gap_last, gap_open);
     }
     close(fds[0]);
+    forget_child(pid);
     result.status = status;
     result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
     return result;
@@ -4349,6 +4386,185 @@ struct EditChecks {
       ++gap->progress_n;
     }
     return G_SOURCE_CONTINUE;
+  }
+
+  static void mark_buffer_clean(MainWindow& w) {
+    if (auto buf = w.buffer()) {
+      buf->set_modified(false);
+    }
+    w.encoding_dirty_ = false;
+    w.file_missing_ = false;
+    w.file_unreadable_ = false;
+    w.refresh_dirty_from_buffer();
+  }
+
+  static void note_dirty(MainWindow& w, bool& saw) {
+    if (w.dirty_) {
+      saw = true;
+    }
+  }
+
+  static void settle_cancel(MainWindow& w, bool& saw) {
+    for (int i = 0; i < 400000 && (w.find_scan_.active || w.bulk_undo_running_);
+         ++i) {
+      g_main_context_iteration(nullptr, false);
+      note_dirty(w, saw);
+    }
+    for (int i = 0; i < 40; ++i) {
+      g_main_context_iteration(nullptr, false);
+      note_dirty(w, saw);
+    }
+  }
+
+  // Escape while the huge-undo dialog is up, before the swap, and during
+  // each part of the swap. A cancelled Replace All must finish unmodified
+  // and must not publish a dirty title at any point in between.
+  static void test_replace_cancel_phases(MainWindow& w) {
+    std::cout << "round7 cancel-phases begin\n";
+    const Glib::ustring original = w.buffer()->get_text();
+    expect(original.bytes() >= 1000000,
+           "cancel phases start from the 1MB fixture");
+    FindOptions opts;
+    opts.search_for = "line ";
+    opts.replace_with = "row ";
+    opts.case_sensitive = true;
+
+    mark_buffer_clean(w);
+    g_setenv("LUNDUKE_EDIT_TEST_HUGE_BYTES", "1000", TRUE);
+    g_setenv("LUNDUKE_EDIT_TEST_HUGE_UNDO", "deny", TRUE);
+    bool saw = false;
+    note_dirty(w, saw);
+    w.start_replace_all(opts, nullptr);
+    note_dirty(w, saw);
+    std::cout << "cancel-phase confirm saw_dirty=" << saw
+              << " modified=" << w.buffer()->get_modified()
+              << " dirty=" << w.dirty_ << "\n";
+    expect(!w.find_scan_.active, "denying the huge-undo dialog does not apply");
+    expect(w.buffer()->get_text() == original,
+           "denying the huge-undo dialog leaves the text unchanged");
+    expect(!w.buffer()->get_modified() && !w.dirty_,
+           "denying the huge-undo dialog leaves the buffer clean");
+    expect(!saw, "denying the huge-undo dialog never marks the buffer dirty");
+
+    g_setenv("LUNDUKE_EDIT_TEST_HUGE_UNDO", "allow", TRUE);
+    mark_buffer_clean(w);
+    w.start_replace_all(opts, nullptr);
+    saw = false;
+    bool before_apply = false;
+    for (int i = 0; i < 400000 && w.find_scan_.active; ++i) {
+      g_main_context_iteration(nullptr, false);
+      note_dirty(w, saw);
+      if (!before_apply && !w.find_scan_.commit_started &&
+          w.find_scan_.progress_pct >= 1) {
+        w.cancel_find_scan();
+        note_dirty(w, saw);
+        before_apply = true;
+      }
+    }
+    settle_cancel(w, saw);
+    std::cout << "cancel-phase before-apply saw_dirty=" << saw
+              << " hit=" << before_apply
+              << " modified=" << w.buffer()->get_modified()
+              << " dirty=" << w.dirty_ << "\n";
+    expect(before_apply, "Escape before the apply sees the counting pass");
+    expect(w.buffer()->get_text() == original,
+           "Escape before the apply leaves the text unchanged");
+    expect(!w.buffer()->get_modified() && !w.dirty_,
+           "Escape before the apply leaves the buffer clean");
+    expect(!saw, "Escape before the apply never marks the buffer dirty");
+
+    auto cancel_at = [&](const char* step, const char* label, auto pred) {
+      mark_buffer_clean(w);
+      g_setenv("LUNDUKE_EDIT_TEST_COMMIT_STEP", step, TRUE);
+      w.start_replace_all(opts, nullptr);
+      bool hit = false;
+      bool phase_saw = false;
+      for (int i = 0; i < 400000 && (w.find_scan_.active || !hit); ++i) {
+        g_main_context_iteration(nullptr, false);
+        note_dirty(w, phase_saw);
+        if (!hit && pred()) {
+          w.cancel_find_scan();
+          note_dirty(w, phase_saw);
+          hit = true;
+          break;
+        }
+        if (!w.find_scan_.active) {
+          break;
+        }
+      }
+      settle_cancel(w, phase_saw);
+      std::cout << "cancel-phase " << label << " saw_dirty=" << phase_saw
+                << " hit=" << hit
+                << " modified=" << w.buffer()->get_modified()
+                << " dirty=" << w.dirty_
+                << " text_same=" << (w.buffer()->get_text() == original)
+                << "\n";
+      expect(hit, label);
+      expect(w.buffer()->get_text() == original, label);
+      expect(!w.buffer()->get_modified() && !w.dirty_, label);
+      expect(!phase_saw, label);
+      g_unsetenv("LUNDUKE_EDIT_TEST_COMMIT_STEP");
+    };
+    cancel_at("erase", "Escape during the swap erase leaves the buffer clean",
+              [&]() {
+                return w.find_scan_.commit_started && !w.find_scan_.commit_erased;
+              });
+    cancel_at(
+        "insert", "Escape during the swap insert leaves the buffer clean",
+        [&]() {
+          return w.find_scan_.commit_erased && !w.find_scan_.commit_inserted;
+        });
+    cancel_at("line",
+              "Escape during the swap line notes leaves the buffer clean",
+              [&]() {
+                return w.find_scan_.commit_inserted &&
+                       !w.find_scan_.commit_lines_noted;
+              });
+
+    // Span above the heavy-commit threshold, hay below the sliced-undo
+    // threshold: cancel takes the single undo() path.
+    g_unsetenv("LUNDUKE_EDIT_TEST_HUGE_BYTES");
+    g_unsetenv("LUNDUKE_EDIT_TEST_HUGE_UNDO");
+    g_setenv("LUNDUKE_EDIT_TEST_COMMIT_STEP", "erase", TRUE);
+    std::string small;
+    small.reserve(12000);
+    while (small.size() < 10000) {
+      small += "line x\n";
+    }
+    w.buffer()->set_text(small);
+    mark_buffer_clean(w);
+    const Glib::ustring small_original = w.buffer()->get_text();
+    w.start_replace_all(opts, nullptr);
+    saw = false;
+    bool small_hit = false;
+    bool small_sliced = false;
+    for (int i = 0; i < 400000 && w.find_scan_.active; ++i) {
+      g_main_context_iteration(nullptr, false);
+      note_dirty(w, saw);
+      if (!small_hit && w.find_scan_.commit_started &&
+          !w.find_scan_.commit_erased) {
+        small_sliced = w.find_scan_.hay.size() >= 32u * 1024u;
+        w.cancel_find_scan();
+        note_dirty(w, saw);
+        small_hit = true;
+      }
+    }
+    settle_cancel(w, saw);
+    std::cout << "cancel-phase small-undo saw_dirty=" << saw
+              << " hit=" << small_hit << " sliced=" << small_sliced
+              << " modified=" << w.buffer()->get_modified()
+              << " dirty=" << w.dirty_ << "\n";
+    expect(small_hit && !small_sliced,
+           "a short heavy commit can be cancelled at the swap");
+    expect(w.buffer()->get_text() == small_original,
+           "cancelling a short swap leaves the text unchanged");
+    expect(!w.buffer()->get_modified() && !w.dirty_ && !saw,
+           "cancelling a short swap leaves the buffer clean");
+
+    g_unsetenv("LUNDUKE_EDIT_TEST_HUGE_BYTES");
+    g_unsetenv("LUNDUKE_EDIT_TEST_HUGE_UNDO");
+    g_unsetenv("LUNDUKE_EDIT_TEST_COMMIT_STEP");
+    std::cout << "round7 cancel-phases end\n";
   }
 
   static void test_round7_status_and_replace(MainWindow& w, const std::string& dir) {
@@ -4517,6 +4733,8 @@ struct EditChecks {
     }
     std::cout << "round7 replace end\n";
 
+    test_replace_cancel_phases(w);
+
     // A replacement whose worst-case undo record exceeds the huge-undo
     // limit takes a counting pass before it builds anything. That pass
     // has to show "Replacing…" instead of a blank status line.
@@ -4651,6 +4869,7 @@ struct EditChecks {
       _exit(127);
     }
     setpgid(pid, pid);
+    remember_child(pid);
     close(fds[1]);
     std::string pending;
     bool child_done = false;
@@ -4698,6 +4917,7 @@ struct EditChecks {
       }
     }
     close(fds[0]);
+    forget_child(pid);
     result.output = pending;
     result.status = status;
     result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -4973,10 +5193,12 @@ struct EditChecks {
     write_bytes(path, "dropped file content\n");
     // pgrep would see an xfwm4 on some other DISPLAY and skip this one.
     // Start a manager here and wait until this screen advertises it.
+    pid_t wm_pid = -1;
     if (std::system("xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1") !=
         0) {
       const pid_t wm = fork();
       if (wm == 0) {
+        setpgid(0, 0);
         int fd = open("/dev/null", O_RDWR);
         if (fd >= 0) {
           dup2(fd, STDOUT_FILENO);
@@ -4987,6 +5209,11 @@ struct EditChecks {
         }
         execl("/usr/bin/xfwm4", "xfwm4", "--replace", static_cast<char*>(nullptr));
         _exit(127);
+      }
+      if (wm > 0) {
+        setpgid(wm, wm);
+        remember_child(wm);
+        wm_pid = wm;
       }
       for (int i = 0; i < 80; ++i) {
         if (std::system(
@@ -5012,10 +5239,14 @@ struct EditChecks {
       int src_fds[2];
       if (pipe(edit_fds) != 0 || pipe(src_fds) != 0) {
         expect(false, "XDND pipes");
+        if (wm_pid > 0) {
+          kill_child_tree(wm_pid);
+        }
         return;
       }
       const pid_t edit_pid = fork();
       if (edit_pid == 0) {
+        setpgid(0, 0);
         dup2(edit_fds[1], STDOUT_FILENO);
         dup2(edit_fds[1], STDERR_FILENO);
         close(edit_fds[0]);
@@ -5032,8 +5263,13 @@ struct EditChecks {
         execl(argv0.c_str(), argv0.c_str(), static_cast<char*>(nullptr));
         _exit(127);
       }
+      if (edit_pid > 0) {
+        setpgid(edit_pid, edit_pid);
+        remember_child(edit_pid);
+      }
       const pid_t src_pid = fork();
       if (src_pid == 0) {
+        setpgid(0, 0);
         dup2(src_fds[1], STDOUT_FILENO);
         dup2(src_fds[1], STDERR_FILENO);
         close(src_fds[0]);
@@ -5045,6 +5281,10 @@ struct EditChecks {
         setenv("GDK_BACKEND", "x11", 1);
         execl(helper.c_str(), helper.c_str(), static_cast<char*>(nullptr));
         _exit(127);
+      }
+      if (src_pid > 0) {
+        setpgid(src_pid, src_pid);
+        remember_child(src_pid);
       }
       close(edit_fds[1]);
       close(src_fds[1]);
@@ -5128,10 +5368,8 @@ struct EditChecks {
           g_usleep(500 * 1000);
         }
       }
-      kill(edit_pid, SIGKILL);
-      kill(src_pid, SIGKILL);
-      waitpid(edit_pid, nullptr, 0);
-      waitpid(src_pid, nullptr, 0);
+      kill_child_tree(edit_pid);
+      kill_child_tree(src_pid);
       close(edit_fds[0]);
       close(src_fds[0]);
       if (!opened) {
@@ -5140,6 +5378,9 @@ struct EditChecks {
       }
     }
     expect(opened, "a real XDND text/uri-list drop opens the file");
+    if (wm_pid > 0) {
+      kill_child_tree(wm_pid);
+    }
     std::cout << "round7 xdnd end\n";
   }
 
@@ -5274,34 +5515,109 @@ struct EditChecks {
       return best;
     }
 
+    Window transient_owner(Window window) const {
+      if (dpy == nullptr || window == 0) {
+        return 0;
+      }
+      const Atom atom = XInternAtom(dpy, "WM_TRANSIENT_FOR", True);
+      if (atom == None) {
+        return 0;
+      }
+      Atom actual = 0;
+      int format = 0;
+      unsigned long n = 0;
+      unsigned long after = 0;
+      unsigned char* data = nullptr;
+      Window owner = 0;
+      if (XGetWindowProperty(dpy, window, atom, 0, 1, False, AnyPropertyType,
+                             &actual, &format, &n, &after, &data) == Success &&
+          data != nullptr && n >= 1 && format == 32) {
+        owner = *reinterpret_cast<Window*>(data);
+      }
+      if (data != nullptr) {
+        XFree(data);
+      }
+      return owner;
+    }
+
+    // Dialogs are root children when nothing is reparenting them, and
+    // children of a frame when a window manager is. Match the title on
+    // either, and also a window that is transient for the editor.
     Window find_title(const char* needle) const {
       if (dpy == nullptr || needle == nullptr) {
         return 0;
       }
-      Window root_ret = 0;
-      Window parent = 0;
-      Window* children = nullptr;
-      unsigned count = 0;
-      if (!XQueryTree(dpy, root, &root_ret, &parent, &children, &count)) {
+      Window found = 0;
+      const auto visit = [&](auto&& self, Window window, int depth) -> void {
+        if (found != 0 || window == 0 || depth > 4) {
+          return;
+        }
+        const std::string text = title_of(window);
+        XWindowAttributes attr {};
+        const bool viewable = XGetWindowAttributes(dpy, window, &attr) != 0 &&
+                              attr.map_state == IsViewable;
+        if (viewable && text.find(needle) != std::string::npos) {
+          found = window;
+          return;
+        }
+        Window root_ret = 0;
+        Window parent = 0;
+        Window* children = nullptr;
+        unsigned count = 0;
+        if (!XQueryTree(dpy, window, &root_ret, &parent, &children, &count)) {
+          return;
+        }
+        for (unsigned i = 0; i < count && found == 0; ++i) {
+          self(self, children[i], depth + 1);
+        }
+        if (children != nullptr) {
+          XFree(children);
+        }
+      };
+      visit(visit, root, 0);
+      return found;
+    }
+
+    // Title match first. If a window manager ate the name, a viewable
+    // window that is transient for the editor still counts.
+    Window find_related(Window editor, const char* needle) const {
+      if (Window named = find_title(needle)) {
+        return named;
+      }
+      if (dpy == nullptr || editor == 0 || needle == nullptr) {
         return 0;
       }
       Window found = 0;
-      for (unsigned i = 0; i < count; ++i) {
-        const std::string text = title_of(children[i]);
-        if (text.find(needle) == std::string::npos) {
-          continue;
+      const auto visit = [&](auto&& self, Window window, int depth) -> void {
+        if (found != 0 || window == 0 || depth > 4) {
+          return;
         }
         XWindowAttributes attr {};
-        if (XGetWindowAttributes(dpy, children[i], &attr) == 0 ||
-            attr.map_state != IsViewable) {
-          continue;
+        const bool viewable = XGetWindowAttributes(dpy, window, &attr) != 0 &&
+                              attr.map_state == IsViewable;
+        const Window owner = transient_owner(window);
+        if (viewable && owner == editor) {
+          const std::string text = title_of(window);
+          if (text.find(needle) != std::string::npos) {
+            found = window;
+            return;
+          }
         }
-        found = children[i];
-        break;
-      }
-      if (children != nullptr) {
-        XFree(children);
-      }
+        Window root_ret = 0;
+        Window parent = 0;
+        Window* children = nullptr;
+        unsigned count = 0;
+        if (!XQueryTree(dpy, window, &root_ret, &parent, &children, &count)) {
+          return;
+        }
+        for (unsigned i = 0; i < count && found == 0; ++i) {
+          self(self, children[i], depth + 1);
+        }
+        if (children != nullptr) {
+          XFree(children);
+        }
+      };
+      visit(visit, root, 0);
       return found;
     }
 
@@ -5365,6 +5681,14 @@ struct EditChecks {
     }
   };
 
+  // A key command that dies after the press leaves that key down. The
+  // next window then sees Escape autorepeat and treats it as Cancel.
+  static void release_stuck_keys() {
+    std::system(
+        "/usr/bin/xdotool keyup Escape Return alt ctrl shift super "
+        ">/dev/null 2>&1");
+  }
+
   static bool xdotool_cmd(const std::string& args) {
     const std::string cmd =
         "/usr/bin/xdotool " + args + " >/tmp/xdotool-prod.log 2>&1";
@@ -5409,16 +5733,12 @@ struct EditChecks {
       _exit(127);
     }
     setpgid(pid, pid);
+    remember_child(pid);
     return pid;
   }
 
   static void stop_production(pid_t pid) {
-    if (pid <= 0) {
-      return;
-    }
-    kill(-pid, SIGKILL);
-    int status = 0;
-    waitpid(pid, &status, 0);
+    kill_child_tree(pid);
   }
 
   static void wait_for_editor_gone(ProdProbe& probe) {
@@ -5449,6 +5769,7 @@ struct EditChecks {
     bool dirty{false};
     bool escaped{false};
     bool undo_ok{false};
+    bool apply_seen{false};
     int pings{0};
     int max_height{0};
   };
@@ -5506,6 +5827,47 @@ struct EditChecks {
     XFlush(dpy);
   }
 
+  // Percent from a title that mirrors "Replacing… N%". -1 when the
+  // apply status is not in the title.
+  static int replacing_percent(const std::string& title) {
+    const auto pos = title.find("Replacing");
+    if (pos == std::string::npos) {
+      return -1;
+    }
+    const auto pct = title.find('%', pos);
+    if (pct == std::string::npos) {
+      return -1;
+    }
+    int value = -1;
+    for (std::size_t i = pos; i < pct; ++i) {
+      if (title[i] >= '0' && title[i] <= '9') {
+        value = 0;
+        while (i < pct && title[i] >= '0' && title[i] <= '9') {
+          value = value * 10 + (title[i] - '0');
+          ++i;
+        }
+      }
+    }
+    return value;
+  }
+
+  // Focus the window, then deliver the key to that id. windowactivate
+  // --sync waits for a window manager; with none it returns at once.
+  // key itself has no --sync. XSetInputFocus runs first so key --window
+  // uses XTest instead of a ClientMessage GTK drops.
+  static void send_key(ProdProbe& probe, Window window, const char* key) {
+    if (probe.dpy == nullptr || window == 0 || key == nullptr) {
+      return;
+    }
+    XRaiseWindow(probe.dpy, window);
+    XSetInputFocus(probe.dpy, window, RevertToParent, CurrentTime);
+    XFlush(probe.dpy);
+    const std::string id = std::to_string(static_cast<unsigned long>(window));
+    xdotool_cmd("windowactivate --sync " + id);
+    xdotool_cmd("key --window " + id + " --clearmodifiers " + key);
+    release_stuck_keys();
+  }
+
   // Drive the shipped editor from outside the process. Gaps are
   // _NET_WM_PING round trips after the real window maps.
   static ProdStats watch_production(ProdProbe& probe, pid_t pid,
@@ -5520,7 +5882,7 @@ struct EditChecks {
     gint64 mapped_at = 0;
     bool keys_sent = false;
     bool replace_armed = false;
-    gint64 replace_armed_at = 0;
+    gint64 apply_seen_at = 0;
     bool undo_sent = false;
     int undo_tries = 0;
     gint64 last_undo_key = 0;
@@ -5532,6 +5894,7 @@ struct EditChecks {
     // Measure past the pass/fail line so a timeout is not mistaken for
     // the real stall. The expect below still uses gap_limit_ms.
     const int ping_timeout = std::max(4000, static_cast<int>(gap_limit_ms) + 150);
+    release_stuck_keys();
     auto elapsed_ms = [&]() {
       return static_cast<double>(g_get_monotonic_time() - start) / 1000.0;
     };
@@ -5630,8 +5993,14 @@ struct EditChecks {
         if (early.find(base) != std::string::npos) {
           return;
         }
-        xdotool_cmd("windowfocus " + std::to_string(editor) +
-                    " key --clearmodifiers Escape");
+        if (probe.dpy != nullptr) {
+          XRaiseWindow(probe.dpy, editor);
+          XSetInputFocus(probe.dpy, editor, RevertToParent, CurrentTime);
+          XFlush(probe.dpy);
+        }
+        xdotool_cmd("key --window " + std::to_string(static_cast<unsigned long>(editor)) +
+                    " --clearmodifiers Escape");
+        release_stuck_keys();
         if (!stats.escaped) {
           stats.escape_at_ms = since_map();
         }
@@ -5673,7 +6042,10 @@ struct EditChecks {
       if (has_file) {
         stats.titled = true;
       }
-      if (has_star) {
+      // Cancel legs judge the title after the apply and its restore have
+      // finished. A star seen while "Replacing" or "Restoring" is up is
+      // not the final buffer.
+      if (has_star && !(replace && cancel)) {
         stats.dirty = true;
       }
       if (stats.escaped && !has_file && stats.honor_ms < 0 &&
@@ -5715,45 +6087,76 @@ struct EditChecks {
         if (!has_file) {
           continue;
         }
-        xdotool_cmd("windowfocus --sync " + std::to_string(editor));
-        xdotool_cmd("key --clearmodifiers ctrl+f");
+        send_key(probe, editor, "ctrl+f");
         poll(nullptr, 0, 250);
+        Window find_dlg = probe.find_related(editor, "Find");
+        if (find_dlg == 0) {
+          // Do not type into the document. Retry until Find & Replace exists.
+          continue;
+        }
         const std::string find_text = needle != nullptr ? needle : "line ";
         const std::string repl_text =
             replacement != nullptr ? replacement : "row ";
+        send_key(probe, find_dlg, "ctrl+a");
         xdotool_cmd("type --delay 5 --clearmodifiers '" + find_text + "'");
-        xdotool_cmd("key --clearmodifiers alt+w");
+        send_key(probe, find_dlg, "alt+w");
         poll(nullptr, 0, 80);
         xdotool_cmd("type --delay 5 --clearmodifiers '" + repl_text + "'");
-        xdotool_cmd("key --clearmodifiers alt+l");
+        send_key(probe, find_dlg, "alt+l");
         keys_sent = true;
         replace_armed = true;
-        replace_armed_at = g_get_monotonic_time();
         continue;
       }
 
-      const double since_replace =
-          static_cast<double>(g_get_monotonic_time() - replace_armed_at) / 1000.0;
-      // The worst-case undo warning is shown before counting. Dismiss it
-      // or Replace All never starts. The title contains "very large undo".
-      if (Window undo_dlg = probe.find_title("very large undo")) {
-        const std::string id =
-            std::to_string(static_cast<unsigned long>(undo_dlg));
-        xdotool_cmd("windowfocus " + id + " key --clearmodifiers alt+r");
-        poll(nullptr, 0, 30);
+      // The worst-case undo warning is shown before counting. Accept it
+      // by name or by transient-for, or Replace All never starts.
+      if (Window undo_dlg = probe.find_related(editor, "very large undo")) {
+        send_key(probe, undo_dlg, "alt+r");
+        poll(nullptr, 0, 40);
         continue;
       }
       if (cancel) {
-        if (!stats.escaped && since_replace >= escape_after_ms && !has_star) {
-          xdotool_cmd("key --clearmodifiers Escape");
-          stats.escaped = true;
-          stats.escape_at_ms = since_replace;
+        const int pct = replacing_percent(title);
+        if (!stats.apply_seen && pct >= 96) {
+          stats.apply_seen = true;
+          apply_seen_at = g_get_monotonic_time();
         }
-        if (stats.escaped && since_replace > stats.escape_at_ms + 12000.0) {
+        const double since_apply =
+            stats.apply_seen
+                ? static_cast<double>(g_get_monotonic_time() - apply_seen_at) /
+                      1000.0
+                : 0.0;
+        const bool in_apply = pct >= 96 && pct < 100;
+        if (stats.apply_seen && in_apply && since_apply >= escape_after_ms &&
+            escape_sends < 8) {
+          const bool due = !stats.escaped ||
+                           since_apply >= stats.escape_at_ms + escape_sends * 200.0;
+          if (due) {
+            Window target = probe.find_related(editor, "Find");
+            if (target == 0) {
+              target = editor;
+            }
+            send_key(probe, target, "Escape");
+            if (!stats.escaped) {
+              stats.escaped = true;
+              stats.escape_at_ms = since_apply;
+            }
+            ++escape_sends;
+          }
+        }
+        const bool replacing = title.find("Replacing") != std::string::npos;
+        const bool restoring = title.find("Restoring") != std::string::npos;
+        // The title read above is from before this iteration's key. Once
+        // Escape has been delivered, wait until both progress strings are
+        // gone and then take the star from that settled title.
+        if (stats.escaped && escape_sends > 0 && !replacing && !restoring &&
+            since_apply > stats.escape_at_ms + 150.0) {
+          stats.dirty = has_star;
           stats.done_ms = elapsed_ms();
           break;
         }
-        if (!stats.escaped && has_star) {
+        if (!stats.escaped && has_star && !replacing && !restoring) {
+          stats.dirty = true;
           stats.done_ms = elapsed_ms();
           break;
         }
@@ -5764,25 +6167,21 @@ struct EditChecks {
         // The result dialog and Find & Replace are still mapped. A bare
         // Ctrl+Z goes to whichever of those has the keyboard, and the
         // document never sees it. Dismiss them, then undo in the editor.
-        if (Window done = probe.find_title("Replace All")) {
-          const std::string id =
-              std::to_string(static_cast<unsigned long>(done));
-          xdotool_cmd("windowfocus " + id + " key --clearmodifiers Return");
+        // "very large undo" was already handled above; this "Replace All"
+        // title is the result dialog.
+        if (Window done = probe.find_related(editor, "Replace All")) {
+          send_key(probe, done, "Return");
           poll(nullptr, 0, 40);
           continue;
         }
-        if (Window find = probe.find_title("Find")) {
-          const std::string id =
-              std::to_string(static_cast<unsigned long>(find));
-          xdotool_cmd("windowfocus " + id + " key --clearmodifiers Escape");
+        if (Window find = probe.find_related(editor, "Find")) {
+          send_key(probe, find, "Escape");
           poll(nullptr, 0, 40);
           continue;
         }
         const std::string id = std::to_string(static_cast<unsigned long>(editor));
-        // One xdotool invocation: focus and the key stay together.
-        xdotool_cmd("windowfocus " + id +
-                    " mousemove --window " + id +
-                    " 280 200 click 1 key --clearmodifiers ctrl+z");
+        xdotool_cmd("mousemove --window " + id + " 280 200 click 1");
+        send_key(probe, editor, "ctrl+z");
         undo_sent = true;
         last_undo_key = g_get_monotonic_time();
         ++undo_tries;
@@ -5792,8 +6191,7 @@ struct EditChecks {
       // retries cover that without repeating for the whole undo.
       if (has_star && undo_sent && undo_tries < 6 &&
           g_get_monotonic_time() - last_undo_key > 400000) {
-        const std::string id = std::to_string(static_cast<unsigned long>(editor));
-        xdotool_cmd("windowfocus " + id + " key --clearmodifiers ctrl+z");
+        send_key(probe, editor, "ctrl+z");
         last_undo_key = g_get_monotonic_time();
         ++undo_tries;
       }
@@ -5915,7 +6313,7 @@ struct EditChecks {
          ProdGeom::Tall, short_path.c_str(), "row", "ROW"},
         {"replace-short-resize", false, true, false, 200.0, 300000, 0, 0,
          ProdGeom::ResizeApply, short_path.c_str(), "row", "ROW"},
-        {"replace-escape-work", false, true, true, 200.0, 90000, 1000.0, 900.0,
+        {"replace-escape-work", false, true, true, 200.0, 90000, 80.0, 40.0,
          ProdGeom::Default, replace_path.c_str(), "line ", "row "},
         {"replace-work-cpulimit", true, true, false, 1000.0, 300000, 0, 0,
          ProdGeom::Default, replace_path.c_str(), "line ", "row "},
@@ -5927,8 +6325,8 @@ struct EditChecks {
          ProdGeom::Default, short_path.c_str(), "row", "ROW"},
         {"replace-short-tall-cpulimit", true, true, false, 1000.0, 420000, 0, 0,
          ProdGeom::Tall, short_path.c_str(), "row", "ROW"},
-        {"replace-escape-cpulimit", true, true, true, 1000.0, 240000, 1000.0,
-         900.0, ProdGeom::Default, replace_path.c_str(), "line ", "row "},
+        {"replace-escape-cpulimit", true, true, true, 1000.0, 240000, 80.0,
+         40.0, ProdGeom::Default, replace_path.c_str(), "line ", "row "},
     };
 
     const char* only = g_getenv("LUNDUKE_EDIT_PROD_FILTER");
@@ -5976,6 +6374,7 @@ struct EditChecks {
                 << " honor_ms=" << stats.honor_ms
                 << " honored=" << stats.honored
                 << " undo_ok=" << stats.undo_ok
+                << " apply_seen=" << stats.apply_seen
                 << " height=" << stats.max_height << "\n";
       if (leg.geom == ProdGeom::Tall || leg.geom == ProdGeom::Maximize ||
           leg.geom == ProdGeom::ResizeLoad || leg.geom == ProdGeom::ResizeApply) {
@@ -5985,7 +6384,13 @@ struct EditChecks {
       expect(stats.mapped && stats.map_ms >= 0 &&
                  stats.map_ms < (leg.throttle ? 15000.0 : 5000.0),
              "production window maps");
-      expect(stats.pings > 0 && stats.max_gap_ms <= leg.gap_limit,
+      // A cancel that lands before the first ping reply still kept the
+      // main loop alive. Zero pings is a pass only for that honored exit.
+      // The gap bound is unchanged.
+      const bool honored_without_pings =
+          leg.cancel && stats.honored && stats.pings == 0;
+      expect((stats.pings > 0 || honored_without_pings) &&
+                 stats.max_gap_ms <= leg.gap_limit,
              "production main loop stays inside the stall bound");
       if (!leg.replace && !leg.cancel) {
         expect(stats.titled, "production open finishes and retitles");
@@ -6005,6 +6410,8 @@ struct EditChecks {
         expect(stats.undo_ok, "Replace All is one undo step");
       }
       if (leg.replace && leg.cancel) {
+        expect(stats.apply_seen,
+               "Escape during Replace All waits until the apply has started");
         expect(stats.escaped && stats.escape_at_ms >= leg.escape_min_ms,
                "Escape during Replace All is pressed while it is still running");
         expect(!stats.dirty, "Escape during Replace All leaves the buffer clean");
@@ -6083,6 +6490,8 @@ struct EditChecks {
     g_unsetenv("LUNDUKE_EDIT_TEST_HUGE_UNDO");
     g_unsetenv("LUNDUKE_EDIT_TEST_REPLACE");
     g_unsetenv("LUNDUKE_EDIT_TEST_MAX_PASTE");
+    g_unsetenv("LUNDUKE_EDIT_TEST_COMMIT_STEP");
+    kill_live_children();
 
     return failures;
   }
@@ -6104,6 +6513,24 @@ int main(int argc, char** argv) {
   if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr) {
     return lundukeedit::EditChecks::run_argv_child(argc, argv);
   }
+  // Children inherit this bus. Without it each editor autolaunches a
+  // session dbus-daemon that double-forks out of the process group.
+  const char* bus = g_getenv("DBUS_SESSION_BUS_ADDRESS");
+  if ((bus == nullptr || bus[0] == '\0') &&
+      g_getenv("LUNDUKE_EDIT_DBUS_WRAP") == nullptr) {
+    std::vector<char*> args;
+    args.push_back(const_cast<char*>("dbus-run-session"));
+    args.push_back(const_cast<char*>("--"));
+    for (int i = 0; i < argc; ++i) {
+      args.push_back(argv[i]);
+    }
+    args.push_back(nullptr);
+    setenv("LUNDUKE_EDIT_DBUS_WRAP", "1", 1);
+    execvp("dbus-run-session", args.data());
+    std::cerr << "dbus-run-session failed to start\n";
+    return 1;
+  }
+  std::atexit(kill_live_children);
   const char* display = g_getenv("DISPLAY");
   if (display == nullptr || display[0] == '\0') {
     std::cerr << "GUI tests require a display; refusing to skip\n";

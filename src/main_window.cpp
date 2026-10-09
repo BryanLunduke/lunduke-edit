@@ -3069,6 +3069,16 @@ void MainWindow::update_title() {
     title += " *";
   }
   title += " — Lunduke Edit";
+  // The apply percentage lives on the status bar. Mirror it in the
+  // title so an external probe can see that the swap has started.
+  if (find_scan_.active && find_scan_.kind == FindScan::Kind::ReplaceAll) {
+    const Glib::ustring status = status_find_.get_text();
+    if (status.find("Replacing") == 0) {
+      title = status + " — " + title;
+    }
+  } else if (bulk_undo_running_ && bulk_undo_from_cancel_) {
+    title = "Restoring… — " + title;
+  }
   set_title(title);
 }
 
@@ -3906,9 +3916,9 @@ void MainWindow::finish_bulk_undo() {
         std::min(bulk_undo_start_, buf->get_char_count())));
   }
   ending_restore_ = false;
-  bytes_frozen_ = false;
   bulk_undo_armed_ = false;
   bulk_undo_running_ = false;
+  bulk_undo_from_cancel_ = false;
   bulk_undo_old_.clear();
   bulk_undo_old_.shrink_to_fit();
   if (buf && !source_lines_.empty() &&
@@ -3916,9 +3926,13 @@ void MainWindow::finish_bulk_undo() {
     source_lines_.clear();
     clear_ending_history();
   }
+  // Unpark while the byte status is still frozen. Attaching the document
+  // can emit modified-changed, and a cancelled replace must not flash a
+  // star for that.
   if (view_parked_) {
     unpark_document_view();
   }
+  bytes_frozen_ = false;
   refresh_dirty_from_buffer();
   update_undo_redo_sensitivity();
   update_status();
@@ -5099,14 +5113,20 @@ void MainWindow::end_find_user_action() {
 }
 
 void MainWindow::cancel_find_scan() {
-  bytes_frozen_ = false;
   const bool rollback = (find_scan_.user_action_open || find_scan_.commit_applied) &&
                         find_scan_.kind == FindScan::Kind::ReplaceAll;
   const bool parked = find_scan_.commit_parked;
   find_scan_.cancel = true;
   find_scan_.commit_applied = false;
   find_idle_.disconnect();
+  // end_user_action marks the half-applied buffer modified and emits
+  // modified-changed. Keep the status frozen across that, and across the
+  // restore, so a cancelled replace does not flash a dirty title.
+  if (!rollback) {
+    bytes_frozen_ = false;
+  }
   end_find_user_action();
+  bool slice_restore = false;
   if (rollback) {
     if (auto buf = buffer()) {
       const bool slice_it =
@@ -5116,17 +5136,25 @@ void MainWindow::cancel_find_scan() {
         bulk_undo_start_ = find_scan_.replace_start;
         bulk_undo_end_ = find_scan_.commit_off;
         bulk_undo_armed_ = true;
+        bulk_undo_from_cancel_ = true;
         start_bulk_undo();
+        slice_restore = bulk_undo_running_;
       } else if (buf->can_undo()) {
         buf->undo();
+        if (bulk_undo_was_clean_) {
+          buf->set_modified(false);
+        }
+      } else if (bulk_undo_was_clean_) {
+        buf->set_modified(false);
       }
     }
-    if (!bulk_undo_running_) {
-      refresh_dirty_from_buffer();
-    }
   }
-  if (parked && view_parked_ && !bulk_undo_running_) {
+  if (parked && view_parked_ && !slice_restore) {
     unpark_document_view();
+  }
+  if (!slice_restore) {
+    bytes_frozen_ = false;
+    refresh_dirty_from_buffer();
   }
   find_scan_.commit_parked = false;
   find_scan_.active = false;
@@ -5135,6 +5163,10 @@ void MainWindow::cancel_find_scan() {
   if (status_find_.get_text().find("Replacing") == 0) {
     set_find_count(-1, false);
   }
+  // Drop "Replacing…" now that the scan is idle. A sliced restore is
+  // still parked and still frozen, so this publishes "Restoring…" and
+  // not a star.
+  update_title();
   update_undo_redo_sensitivity();
 }
 
@@ -5232,6 +5264,7 @@ void MainWindow::finish_find_scan(bool show_result) {
   }
   update_undo_redo_sensitivity();
   update_status();
+  update_title();
   if (kind == FindScan::Kind::FindAll) {
     // update_status does not touch the match label; put it back if a
     // cursor update ran above. set_find_count is idempotent.
@@ -5710,6 +5743,16 @@ bool MainWindow::pump_replace_commit() {
                  buf->get_iter_at_offset(find_scan_.commit_off));
       find_scan_.commit_off = from;
       erased_any = true;
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+      // One erase, then yield, so a behavior test can cancel mid-swap.
+      // Absent from the production binary.
+      if (const char* step = g_getenv("LUNDUKE_EDIT_TEST_COMMIT_STEP")) {
+        if (std::strcmp(step, "erase") == 0) {
+          set_replace_progress(96);
+          return true;
+        }
+      }
+#endif
     }
     find_scan_.commit_erased = true;
     find_scan_.commit_off = find_scan_.replace_start;
@@ -5747,6 +5790,17 @@ bool MainWindow::pump_replace_commit() {
       find_scan_.commit_off += static_cast<int>(piece.length());
       find_scan_.commit_byte += n;
       inserted_any = true;
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+      if (const char* step = g_getenv("LUNDUKE_EDIT_TEST_COMMIT_STEP")) {
+        if (std::strcmp(step, "insert") == 0) {
+          const int pct =
+              97 + static_cast<int>((find_scan_.commit_byte * 2) /
+                                    std::max<std::size_t>(built.size(), 1));
+          set_replace_progress(std::min(pct, 99));
+          return true;
+        }
+      }
+#endif
     }
     find_scan_.commit_inserted = true;
     if (slice_expired(inserted_any)) {
@@ -5785,6 +5839,14 @@ bool MainWindow::pump_replace_commit() {
           source_lines_.push_back(std::move(line));
         }
         noted = true;
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+        if (const char* step = g_getenv("LUNDUKE_EDIT_TEST_COMMIT_STEP")) {
+          if (std::strcmp(step, "line") == 0) {
+            set_replace_progress(99);
+            return true;
+          }
+        }
+#endif
       }
       if (!source_lines_.empty() && source_lines_.back().kind != 0) {
         SourceLine phantom;
@@ -6036,6 +6098,7 @@ void MainWindow::set_replace_progress(int pct) {
   find_scan_.progress_pct = pct;
   status_find_.set_text("Replacing… " + std::to_string(pct) + "%");
   status_find_frame_.show();
+  update_title();
 }
 
 bool MainWindow::on_find_idle() {

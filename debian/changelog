@@ -23,6 +23,10 @@ lunduke-edit (0.9-11) unstable; urgency=medium
     record before the counting pass.
   * Undo of a large Replace All restores the previous text in short
     slices, so that one step does not freeze the main loop.
+  * Cancelling Replace All — from the large-undo question, before the
+    swap, or during the swap — leaves the buffer unmodified and does
+    not mark it dirty. The stall test delivers Escape to the Find
+    window only after that swap has started.
 
  -- Phil <phil@brushpad.local>  Fri, 09 Oct 2026 18:00:00 +0000
 
