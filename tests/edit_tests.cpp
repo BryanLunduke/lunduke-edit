@@ -5154,8 +5154,24 @@ struct EditChecks {
     XErrorHandler previous_handler{nullptr};
 
     bool open() {
-      dpy = XOpenDisplay(nullptr);
+      // xvfb-run's display is not always ready on the first try. Use the
+      // DISPLAY and XAUTHORITY it exported, and retry instead of failing
+      // the leg.
+      const char* name = std::getenv("DISPLAY");
+      for (int attempt = 0; attempt < 40; ++attempt) {
+        dpy = XOpenDisplay(name);
+        if (dpy != nullptr) {
+          break;
+        }
+        poll(nullptr, 0, attempt < 10 ? 25 : 50);
+      }
       if (dpy == nullptr) {
+        std::cerr << "XOpenDisplay failed DISPLAY="
+                  << (name != nullptr ? name : "(null)") << " XAUTHORITY="
+                  << (std::getenv("XAUTHORITY") != nullptr
+                          ? std::getenv("XAUTHORITY")
+                          : "(null)")
+                  << "\n";
         return false;
       }
       root = DefaultRootWindow(dpy);
@@ -5256,6 +5272,37 @@ struct EditChecks {
         XFree(children);
       }
       return best;
+    }
+
+    Window find_title(const char* needle) const {
+      if (dpy == nullptr || needle == nullptr) {
+        return 0;
+      }
+      Window root_ret = 0;
+      Window parent = 0;
+      Window* children = nullptr;
+      unsigned count = 0;
+      if (!XQueryTree(dpy, root, &root_ret, &parent, &children, &count)) {
+        return 0;
+      }
+      Window found = 0;
+      for (unsigned i = 0; i < count; ++i) {
+        const std::string text = title_of(children[i]);
+        if (text.find(needle) == std::string::npos) {
+          continue;
+        }
+        XWindowAttributes attr {};
+        if (XGetWindowAttributes(dpy, children[i], &attr) == 0 ||
+            attr.map_state != IsViewable) {
+          continue;
+        }
+        found = children[i];
+        break;
+      }
+      if (children != nullptr) {
+        XFree(children);
+      }
+      return found;
     }
 
     // Round-trip through the editor's main loop. The reply is the
@@ -5392,6 +5439,11 @@ struct EditChecks {
     double max_gap_ms{0};
     double replace_gap_ms{0};
     double escape_at_ms{-1};
+    double honor_ms{-1};
+    double gap_at_ms{-1};
+    bool gap_after_undo{false};
+    bool gap_after_keys{false};
+    bool honored{false};
     bool mapped{false};
     bool titled{false};
     bool dirty{false};
@@ -5400,12 +5452,45 @@ struct EditChecks {
     int pings{0};
   };
 
+  enum class ProdGeom { Default, Tall, Maximize, ResizeLoad, ResizeApply };
+
+  static void shape_window(ProdProbe& probe, Window editor, int width,
+                           int height, bool maximize) {
+    const std::string id = std::to_string(static_cast<unsigned long>(editor));
+    xdotool_cmd("windowmove " + id + " 8 8");
+    xdotool_cmd("windowsize " + id + " " + std::to_string(width) + " " +
+                std::to_string(height));
+    if (!maximize || probe.dpy == nullptr) {
+      return;
+    }
+    Display* dpy = probe.dpy;
+    Atom state = XInternAtom(dpy, "_NET_WM_STATE", False);
+    Atom vert = XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_VERT", False);
+    Atom horz = XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
+    XEvent ev {};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = editor;
+    ev.xclient.message_type = state;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = 1;
+    ev.xclient.data.l[1] = static_cast<long>(vert);
+    ev.xclient.data.l[2] = static_cast<long>(horz);
+    ev.xclient.data.l[3] = 1;
+    // Delivered to the window manager. This connection does not select
+    // SubstructureRedirectMask; that mask belongs to xfwm4.
+    XSendEvent(dpy, probe.root, False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XFlush(dpy);
+  }
+
   // Drive the shipped editor from outside the process. Gaps are
   // _NET_WM_PING round trips after the real window maps.
   static ProdStats watch_production(ProdProbe& probe, pid_t pid,
                                     const std::string& base, bool replace,
                                     bool cancel, double gap_limit_ms,
-                                    int deadline_ms, double escape_after_ms) {
+                                    int deadline_ms, double escape_after_ms,
+                                    ProdGeom geom, const char* needle,
+                                    const char* replacement) {
     ProdStats stats;
     const gint64 start = g_get_monotonic_time();
     Window editor = 0;
@@ -5414,8 +5499,15 @@ struct EditChecks {
     bool replace_armed = false;
     gint64 replace_armed_at = 0;
     bool undo_sent = false;
+    int undo_tries = 0;
+    gint64 last_undo_key = 0;
     int escape_sends = 0;
-    const int ping_timeout = static_cast<int>(gap_limit_ms) + 150;
+    bool shaped = false;
+    bool shaped_late = false;
+    gint64 last_resize = 0;
+    // Measure past the pass/fail line so a timeout is not mistaken for
+    // the real stall. The expect below still uses gap_limit_ms.
+    const int ping_timeout = std::max(4000, static_cast<int>(gap_limit_ms) + 150);
     auto elapsed_ms = [&]() {
       return static_cast<double>(g_get_monotonic_time() - start) / 1000.0;
     };
@@ -5437,6 +5529,35 @@ struct EditChecks {
         } else {
           poll(nullptr, 0, 20);
           continue;
+        }
+      }
+      if (editor != 0 && geom == ProdGeom::Tall && !shaped) {
+        shape_window(probe, editor, 1280, 770, false);
+        shaped = true;
+      } else if (editor != 0 && geom == ProdGeom::Maximize && !shaped) {
+        shape_window(probe, editor, 1280, 770, true);
+        shaped = true;
+      } else if (editor != 0 && geom == ProdGeom::ResizeLoad && !replace) {
+        if (!shaped && since_map() >= 40.0) {
+          shape_window(probe, editor, 1000, 620, false);
+          shaped = true;
+        } else if (shaped && !shaped_late && since_map() >= 200.0) {
+          shape_window(probe, editor, 1280, 770, true);
+          shaped_late = true;
+        }
+      } else if (editor != 0 && geom == ProdGeom::ResizeApply) {
+        if (!shaped) {
+          shape_window(probe, editor, 1200, 500, false);
+          shaped = true;
+          last_resize = g_get_monotonic_time();
+        } else if (keys_sent &&
+                   g_get_monotonic_time() - last_resize > 250000) {
+          if ((shaped_late = !shaped_late)) {
+            shape_window(probe, editor, 1280, 770, true);
+          } else {
+            shape_window(probe, editor, 1200, 500, false);
+          }
+          last_resize = g_get_monotonic_time();
         }
       }
       // Escape is sent from inside the ping wait. A full-timeout poll would
@@ -5474,6 +5595,12 @@ struct EditChecks {
         // The process exited mid-ping. A command-line open that was
         // cancelled closes its window; that is not a stalled main loop.
         if (stats.escaped && !stats.titled) {
+          if (stats.honor_ms < 0 && stats.escape_at_ms >= 0) {
+            stats.honor_ms = since_map() - stats.escape_at_ms;
+          }
+          if (stats.honor_ms >= 0 && stats.honor_ms <= 300.0) {
+            stats.honored = true;
+          }
           stats.done_ms = elapsed_ms();
           break;
         }
@@ -5482,6 +5609,9 @@ struct EditChecks {
       ++stats.pings;
       if (rtt > stats.max_gap_ms) {
         stats.max_gap_ms = rtt;
+        stats.gap_at_ms = elapsed_ms();
+        stats.gap_after_undo = undo_sent;
+        stats.gap_after_keys = keys_sent;
       }
       if (keys_sent && rtt > stats.replace_gap_ms) {
         stats.replace_gap_ms = rtt;
@@ -5494,6 +5624,14 @@ struct EditChecks {
       }
       if (has_star) {
         stats.dirty = true;
+      }
+      if (stats.escaped && !has_file && stats.honor_ms < 0 &&
+          stats.escape_at_ms >= 0) {
+        stats.honor_ms = since_map() - stats.escape_at_ms;
+      }
+      if (stats.escaped && !has_file && stats.escape_at_ms >= 0 &&
+          since_map() >= stats.escape_at_ms + 300.0) {
+        stats.honored = true;
       }
 
       if (!replace) {
@@ -5529,10 +5667,13 @@ struct EditChecks {
         xdotool_cmd("windowfocus --sync " + std::to_string(editor));
         xdotool_cmd("key --clearmodifiers ctrl+f");
         poll(nullptr, 0, 250);
-        xdotool_cmd("type --delay 5 --clearmodifiers 'line '");
+        const std::string find_text = needle != nullptr ? needle : "line ";
+        const std::string repl_text =
+            replacement != nullptr ? replacement : "row ";
+        xdotool_cmd("type --delay 5 --clearmodifiers '" + find_text + "'");
         xdotool_cmd("key --clearmodifiers alt+w");
         poll(nullptr, 0, 80);
-        xdotool_cmd("type --delay 5 --clearmodifiers 'row '");
+        xdotool_cmd("type --delay 5 --clearmodifiers '" + repl_text + "'");
         xdotool_cmd("key --clearmodifiers alt+l");
         keys_sent = true;
         replace_armed = true;
@@ -5542,6 +5683,15 @@ struct EditChecks {
 
       const double since_replace =
           static_cast<double>(g_get_monotonic_time() - replace_armed_at) / 1000.0;
+      // The worst-case undo warning is shown before counting. Dismiss it
+      // or Replace All never starts. The title contains "very large undo".
+      if (Window undo_dlg = probe.find_title("very large undo")) {
+        const std::string id =
+            std::to_string(static_cast<unsigned long>(undo_dlg));
+        xdotool_cmd("windowfocus " + id + " key --clearmodifiers alt+r");
+        poll(nullptr, 0, 30);
+        continue;
+      }
       if (cancel) {
         if (!stats.escaped && since_replace >= escape_after_ms && !has_star) {
           xdotool_cmd("key --clearmodifiers Escape");
@@ -5560,12 +5710,41 @@ struct EditChecks {
       }
 
       if (has_star && !undo_sent) {
-        xdotool_cmd("key --clearmodifiers Escape");
-        poll(nullptr, 0, 200);
-        xdotool_cmd("windowfocus --sync " + std::to_string(editor));
-        xdotool_cmd("key --clearmodifiers ctrl+z");
+        // The result dialog and Find & Replace are still mapped. A bare
+        // Ctrl+Z goes to whichever of those has the keyboard, and the
+        // document never sees it. Dismiss them, then undo in the editor.
+        if (Window done = probe.find_title("Replace All")) {
+          const std::string id =
+              std::to_string(static_cast<unsigned long>(done));
+          xdotool_cmd("windowfocus " + id + " key --clearmodifiers Return");
+          poll(nullptr, 0, 40);
+          continue;
+        }
+        if (Window find = probe.find_title("Find")) {
+          const std::string id =
+              std::to_string(static_cast<unsigned long>(find));
+          xdotool_cmd("windowfocus " + id + " key --clearmodifiers Escape");
+          poll(nullptr, 0, 40);
+          continue;
+        }
+        const std::string id = std::to_string(static_cast<unsigned long>(editor));
+        // One xdotool invocation: focus and the key stay together.
+        xdotool_cmd("windowfocus " + id +
+                    " mousemove --window " + id +
+                    " 280 200 click 1 key --clearmodifiers ctrl+z");
         undo_sent = true;
+        last_undo_key = g_get_monotonic_time();
+        ++undo_tries;
         continue;
+      }
+      // The first key can land before the text view has focus. A few
+      // retries cover that without repeating for the whole undo.
+      if (has_star && undo_sent && undo_tries < 6 &&
+          g_get_monotonic_time() - last_undo_key > 400000) {
+        const std::string id = std::to_string(static_cast<unsigned long>(editor));
+        xdotool_cmd("windowfocus " + id + " key --clearmodifiers ctrl+z");
+        last_undo_key = g_get_monotonic_time();
+        ++undo_tries;
       }
       if (undo_sent && !has_star && has_file) {
         stats.undo_ok = true;
@@ -5608,13 +5787,17 @@ struct EditChecks {
     }
     const std::string open_path = dir + "/prod-open-12mb.txt";
     const std::string replace_path = dir + "/prod-replace-12mb.txt";
+    const std::string short_path = dir + "/prod-short-12mb.txt";
     write_repeated(open_path, "foo bar baz\n", 12000000);
     write_repeated(replace_path,
                    "line dog sit quick ipsum fox value line\n", 12000000);
+    write_repeated(short_path, "row\n", 12000000);
     expect(read_bytes(open_path).size() == 12000000,
            "production open fixture is 12000000 bytes");
     expect(read_bytes(replace_path).size() == 12000000,
            "production replace fixture is 12000000 bytes");
+    expect(read_bytes(short_path).size() == 12000000,
+           "production short-line fixture is 12000000 bytes");
 
     struct Leg {
       const char* name;
@@ -5625,33 +5808,82 @@ struct EditChecks {
       int deadline_ms;
       double escape_after_ms;
       double escape_min_ms;
+      ProdGeom geom;
       const char* path;
+      const char* needle;
+      const char* replacement;
     };
-    // Unthrottled open finishes in well under a second, so Escape is sent
-    // while the title is still Untitled. A cpulimit open finishes near one
-    // second on a fast CPU; Escape starts at 400 ms and is repeated through
-    // about 1 s while the title stays Untitled. Replace All is still running
-    // at one second, which is when Escape is pressed there.
+    // Unthrottled gap is 200 ms. cpulimit -l 25, pinned to one CPU, is
+    // 1000 ms. Escape during an unthrottled open must take effect within
+    // 300 ms, including a press during the last part of a short-line load.
     const Leg legs[] = {
-        {"open-unthrottled", false, false, false, 250.0, 60000, 0, 0,
-         open_path.c_str()},
-        {"open-escape-unthrottled", false, false, true, 250.0, 20000, 60.0,
-         40.0, open_path.c_str()},
-        {"open-cpulimit", true, false, false, 1000.0, 120000, 0, 0,
-         open_path.c_str()},
-        {"open-escape-cpulimit", true, false, true, 1000.0, 60000, 400.0,
-         300.0, open_path.c_str()},
-        {"replace-unthrottled", false, true, false, 250.0, 180000, 0, 0,
-         replace_path.c_str()},
-        {"replace-escape-unthrottled", false, true, true, 250.0, 60000, 1000.0,
-         900.0, replace_path.c_str()},
-        {"replace-cpulimit", true, true, false, 1000.0, 300000, 0, 0,
-         replace_path.c_str()},
-        {"replace-escape-cpulimit", true, true, true, 1000.0, 180000, 1000.0,
-         900.0, replace_path.c_str()},
+        {"open-work-default", false, false, false, 200.0, 60000, 0, 0,
+         ProdGeom::Default, open_path.c_str(), nullptr, nullptr},
+        {"open-work-tall", false, false, false, 200.0, 60000, 0, 0,
+         ProdGeom::Tall, open_path.c_str(), nullptr, nullptr},
+        {"open-work-max", false, false, false, 200.0, 60000, 0, 0,
+         ProdGeom::Maximize, open_path.c_str(), nullptr, nullptr},
+        {"open-work-resize", false, false, false, 200.0, 60000, 0, 0,
+         ProdGeom::ResizeLoad, open_path.c_str(), nullptr, nullptr},
+        {"open-short-default", false, false, false, 200.0, 120000, 0, 0,
+         ProdGeom::Default, short_path.c_str(), nullptr, nullptr},
+        {"open-short-tall", false, false, false, 200.0, 120000, 0, 0,
+         ProdGeom::Tall, short_path.c_str(), nullptr, nullptr},
+        {"open-short-resize", false, false, false, 200.0, 120000, 0, 0,
+         ProdGeom::ResizeLoad, short_path.c_str(), nullptr, nullptr},
+        {"open-escape-work", false, false, true, 200.0, 20000, 60.0, 40.0,
+         ProdGeom::Default, open_path.c_str(), nullptr, nullptr},
+        {"open-escape-short", false, false, true, 200.0, 30000, 400.0, 300.0,
+         ProdGeom::Tall, short_path.c_str(), nullptr, nullptr},
+        {"open-work-cpulimit", true, false, false, 1000.0, 180000, 0, 0,
+         ProdGeom::Default, open_path.c_str(), nullptr, nullptr},
+        {"open-work-tall-cpulimit", true, false, false, 1000.0, 180000, 0, 0,
+         ProdGeom::Tall, open_path.c_str(), nullptr, nullptr},
+        {"open-work-resize-cpulimit", true, false, false, 1000.0, 180000, 0, 0,
+         ProdGeom::ResizeLoad, open_path.c_str(), nullptr, nullptr},
+        {"open-short-cpulimit", true, false, false, 1000.0, 240000, 0, 0,
+         ProdGeom::Default, short_path.c_str(), nullptr, nullptr},
+        {"open-short-tall-cpulimit", true, false, false, 1000.0, 240000, 0, 0,
+         ProdGeom::Tall, short_path.c_str(), nullptr, nullptr},
+        {"open-escape-cpulimit", true, false, true, 1000.0, 90000, 400.0, 300.0,
+         ProdGeom::Default, open_path.c_str(), nullptr, nullptr},
+        {"open-escape-short-cpulimit", true, false, true, 1000.0, 120000, 600.0,
+         400.0, ProdGeom::Default, short_path.c_str(), nullptr, nullptr},
+        {"replace-work-default", false, true, false, 200.0, 180000, 0, 0,
+         ProdGeom::Default, replace_path.c_str(), "line ", "row "},
+        {"replace-work-tall", false, true, false, 200.0, 180000, 0, 0,
+         ProdGeom::Tall, replace_path.c_str(), "line ", "row "},
+        {"replace-work-max", false, true, false, 200.0, 180000, 0, 0,
+         ProdGeom::Maximize, replace_path.c_str(), "line ", "row "},
+        {"replace-work-resize", false, true, false, 200.0, 180000, 0, 0,
+         ProdGeom::ResizeApply, replace_path.c_str(), "line ", "row "},
+        {"replace-short-default", false, true, false, 200.0, 300000, 0, 0,
+         ProdGeom::Default, short_path.c_str(), "row", "ROW"},
+        {"replace-short-tall", false, true, false, 200.0, 300000, 0, 0,
+         ProdGeom::Tall, short_path.c_str(), "row", "ROW"},
+        {"replace-short-resize", false, true, false, 200.0, 300000, 0, 0,
+         ProdGeom::ResizeApply, short_path.c_str(), "row", "ROW"},
+        {"replace-escape-work", false, true, true, 200.0, 90000, 1000.0, 900.0,
+         ProdGeom::Default, replace_path.c_str(), "line ", "row "},
+        {"replace-work-cpulimit", true, true, false, 1000.0, 300000, 0, 0,
+         ProdGeom::Default, replace_path.c_str(), "line ", "row "},
+        {"replace-work-tall-cpulimit", true, true, false, 1000.0, 300000, 0, 0,
+         ProdGeom::Tall, replace_path.c_str(), "line ", "row "},
+        {"replace-work-resize-cpulimit", true, true, false, 1000.0, 300000, 0, 0,
+         ProdGeom::ResizeApply, replace_path.c_str(), "line ", "row "},
+        {"replace-short-cpulimit", true, true, false, 1000.0, 420000, 0, 0,
+         ProdGeom::Default, short_path.c_str(), "row", "ROW"},
+        {"replace-short-tall-cpulimit", true, true, false, 1000.0, 420000, 0, 0,
+         ProdGeom::Tall, short_path.c_str(), "row", "ROW"},
+        {"replace-escape-cpulimit", true, true, true, 1000.0, 240000, 1000.0,
+         900.0, ProdGeom::Default, replace_path.c_str(), "line ", "row "},
     };
 
+    const char* only = g_getenv("LUNDUKE_EDIT_PROD_FILTER");
     for (const Leg& leg : legs) {
+      if (only != nullptr && std::strstr(leg.name, only) == nullptr) {
+        continue;
+      }
       if (leg.throttle && !have_cpulimit) {
         expect(false, "production stall test requires /usr/bin/cpulimit");
         std::cout << "production " << leg.name << " cpulimit missing\n";
@@ -5672,21 +5904,28 @@ struct EditChecks {
         probe.close();
         continue;
       }
-      const ProdStats stats =
-          watch_production(probe, pid, base, leg.replace, leg.cancel,
-                           leg.gap_limit, leg.deadline_ms, leg.escape_after_ms);
+      const ProdStats stats = watch_production(
+          probe, pid, base, leg.replace, leg.cancel, leg.gap_limit,
+          leg.deadline_ms, leg.escape_after_ms, leg.geom, leg.needle,
+          leg.replacement);
       stop_production(pid);
       wait_for_editor_gone(probe);
       probe.close();
       std::cout << "production " << leg.name << " map_ms=" << stats.map_ms
                 << " done_ms=" << stats.done_ms
                 << " max_gap_ms=" << stats.max_gap_ms
+                << " gap_at_ms=" << stats.gap_at_ms
+                << " gap_after_keys=" << stats.gap_after_keys
+                << " gap_after_undo=" << stats.gap_after_undo
                 << " replace_gap_ms=" << stats.replace_gap_ms
                 << " pings=" << stats.pings << " titled=" << stats.titled
                 << " dirty=" << stats.dirty << " escaped=" << stats.escaped
                 << " escape_at_ms=" << stats.escape_at_ms
+                << " honor_ms=" << stats.honor_ms
+                << " honored=" << stats.honored
                 << " undo_ok=" << stats.undo_ok << "\n";
-      expect(stats.mapped && stats.map_ms >= 0 && stats.map_ms < 5000,
+      expect(stats.mapped && stats.map_ms >= 0 &&
+                 stats.map_ms < (leg.throttle ? 15000.0 : 5000.0),
              "production window maps");
       expect(stats.pings > 0 && stats.max_gap_ms <= leg.gap_limit,
              "production main loop stays inside the stall bound");
@@ -5698,6 +5937,10 @@ struct EditChecks {
         expect(stats.escaped && stats.escape_at_ms >= leg.escape_min_ms,
                "Escape during open is pressed while the file is still loading");
         expect(!stats.titled, "Escape during open cancels before the file loads");
+        if (!leg.throttle) {
+          expect(stats.honored && stats.honor_ms >= 0 && stats.honor_ms <= 300.0,
+                 "Escape during open is honored within 300 ms");
+        }
       }
       if (leg.replace && !leg.cancel) {
         expect(stats.dirty, "Replace All marks the buffer dirty");
@@ -5725,6 +5968,9 @@ struct EditChecks {
     // Before this process registers org.lunduke.LundukeEdit. The production
     // binary is a single instance and would otherwise hand the file here.
     test_production_responsiveness(dir);
+    if (g_getenv("LUNDUKE_EDIT_PRODUCTION_ONLY") != nullptr) {
+      return failures;
+    }
 
     // A face left by an earlier run must not become this process's default.
     const std::string font_path = font_config_path();

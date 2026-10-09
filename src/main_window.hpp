@@ -259,11 +259,10 @@ private:
   void set_replace_progress(int pct);
   bool literal_replace_possible(const FindOptions& opts,
                                 const std::string& hay) const;
-  // Store real heights for the visible lines before GtkSourceView draws.
-  // Unmeasured lines report a height of 0, and the source view then walks
-  // get_line_yrange to the end of the buffer. gtk_text_layout_validate is
-  // pixel-budgeted; get_line_yrange and get_iter_location do not mark a
-  // line valid.
+  // Store real heights for every line a paint can ask about.
+  // Unmeasured lines report a height of 0, and GtkSourceView then walks
+  // to the end of the buffer. The pixel cache also draws about half a
+  // screen past the allocation, so the budget follows the window size.
   void prevalidate_viewport();
   bool on_text_view_draw(const Cairo::RefPtr<Cairo::Context>& cr);
   void reveal_loaded_view();
@@ -347,9 +346,14 @@ private:
     bool commit_parked{false};
     bool commit_applied{false};
     bool commit_keep{false};
+    // The undo warning was already shown from the worst-case size, so
+    // the counting pass must not ask again.
+    bool huge_confirmed{false};
     int commit_off{0};
     std::size_t commit_byte{0};
     std::vector<char> commit_kinds;
+    bool commit_lines_noted{false};
+    std::size_t commit_line_at{0};
   };
 
   struct LoadState;
@@ -373,6 +377,12 @@ private:
   void on_load_chunk(const std::shared_ptr<LoadState>& state,
                      const Glib::RefPtr<Gio::AsyncResult>& result);
   bool on_load_idle(const std::shared_ptr<LoadState>& state);
+  // Each returns true when this idle should run again.
+  bool slice_load_decode(const std::shared_ptr<LoadState>& state, gint64 t0);
+  bool slice_load_insert(const std::shared_ptr<LoadState>& state, gint64 t0);
+  bool slice_load_tag(const std::shared_ptr<LoadState>& state, gint64 t0);
+  bool slice_load_lines(const std::shared_ptr<LoadState>& state, gint64 t0);
+  bool slice_load_drain(const std::shared_ptr<LoadState>& state, gint64 t0);
   bool commit_loaded_text(const std::shared_ptr<LoadState>& state);
 
   Application& app_;
@@ -391,6 +401,28 @@ private:
   bool layout_guard_{false};
   // gtk_text_layout_validate emits changed, which can re-enter draw.
   bool validating_layout_{false};
+  // How far gtk_text_layout_validate has been asked to measure since the
+  // first line last had no stored height. Not the layout's own height:
+  // get_line_at_y clamps to that and reports a measured line for a y that
+  // is still unmeasured.
+  int validated_through_px_{0};
+  // Replace All's commit rewrites the document off-screen. Status and the
+  // byte count stay put until the swap finishes.
+  bool bytes_frozen_{false};
+  // A large Replace All is one undo step, but replaying that step in one
+  // call freezes the main loop. The old span is restored in idle slices.
+  bool bulk_undo_armed_{false};
+  bool bulk_undo_running_{false};
+  bool bulk_undo_erased_{false};
+  bool bulk_undo_was_clean_{false};
+  int bulk_undo_start_{0};
+  int bulk_undo_end_{0};
+  std::size_t bulk_undo_at_{0};
+  std::string bulk_undo_old_;
+  sigc::connection bulk_undo_idle_;
+  void start_bulk_undo();
+  bool pump_bulk_undo();
+  void finish_bulk_undo();
   bool follow_caret_{false};
   bool adjusting_scroll_{false};
   int follow_caret_spins_{0};
