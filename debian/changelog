@@ -1,3 +1,9 @@
+lunduke-edit (0.9.1-1) unstable; urgency=medium
+
+  * Version bump for LCOS 0.9.1 (testing and bug-fix release). No functional changes.
+
+ -- Phil <phil@brushpad.local>  Fri, 09 Oct 2026 19:00:00 +0000
+
 lunduke-edit (0.9-11) unstable; urgency=medium
 
   * Replace All is one step in the normal undo and redo history. Typing
