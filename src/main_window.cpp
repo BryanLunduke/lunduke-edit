@@ -970,17 +970,7 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   find_tag_->property_background() = "#c4d8f0";
   long_hidden_tag_ = buf->create_tag("lunduke-long-line-hide");
   long_hidden_tag_->property_invisible() = true;
-
-  // gtkmm's connect() defaults to after=true. insert-text and delete-range
-  // run their default handlers first in that case, so "changed" updates the
-  // status before the cache moves and delete-range has already removed the
-  // text we need to measure. Run these before the default handlers.
-  buf->signal_insert().connect(
-      sigc::mem_fun(*this, &MainWindow::on_text_inserted), false);
-  buf->signal_insert().connect(
-      sigc::mem_fun(*this, &MainWindow::on_font_tag_inserted), true);
-  buf->signal_erase().connect(
-      sigc::mem_fun(*this, &MainWindow::on_text_erased), false);
+  connect_document_signals();
 
   build_ui();
   build_menus();
@@ -1001,19 +991,6 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   text_view_.set_auto_indent(false);
   text_view_.set_highlight_current_line(false);
 
-  buf->signal_changed().connect(
-      sigc::mem_fun(*this, &MainWindow::on_buffer_changed));
-  buf->signal_modified_changed().connect(
-      sigc::mem_fun(*this, &MainWindow::on_modified_changed));
-  buf->signal_mark_set().connect(
-      sigc::mem_fun(*this, &MainWindow::on_cursor_moved));
-  // Insert and delete move the cursor without mark-set. The property
-  // notifies for those, and for undo, paste, and Replace.
-  buf->property_cursor_position().signal_changed().connect([this]() {
-    if (!seeding_) {
-      update_cursor_status();
-    }
-  });
   text_view_.signal_draw().connect(
       sigc::mem_fun(*this, &MainWindow::on_text_view_draw), false);
   // Before GtkSourceView's binding. A grouped undo of a multi-megabyte
@@ -1040,11 +1017,6 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   // Undo/redo menu sensitivity must track GtkSourceView undo-manager state.
   // signal_changed() alone is unreliable (keyboard undo via View bindings,
   // and can-undo often notifies after changed). Use property notify + menu map.
-  buf->property_can_undo().signal_changed().connect(
-      sigc::mem_fun(*this, &MainWindow::update_undo_redo_sensitivity));
-  buf->property_can_redo().signal_changed().connect(
-      sigc::mem_fun(*this, &MainWindow::update_undo_redo_sensitivity));
-
   // The document starts as UTF-8. Only the "open next file" radios follow
   // the inherited charset, so a new window does not claim to be Latin-1.
   seeding_ = true;
@@ -1074,84 +1046,6 @@ MainWindow::MainWindow(Application& app) : app_(app) {
       sigc::mem_fun(*this, &MainWindow::on_text_button_press), false);
   text_view_.signal_button_release_event().connect(
       sigc::mem_fun(*this, &MainWindow::on_text_button_release), false);
-  buf->signal_begin_user_action().connect([this]() {
-    in_user_action_ = true;
-    ending_snapshotted_ = false;
-  });
-  buf->signal_end_user_action().connect([this]() {
-    in_user_action_ = false;
-    ending_snapshotted_ = false;
-  });
-  // Before the default handler mutates the buffer, remember which ending
-  // snapshot undo/redo should restore. After it, install that snapshot.
-  // Live insert/erase tracking is skipped while ending_restore_ is set.
-  buf->signal_undo().connect(
-      [this]() {
-        // No snapshot: let insert/erase tracking follow the undo. Setting
-        // ending_restore_ without a snapshot would skip that tracking and
-        // then discard the per-line endings.
-        if (!buffer() || !buffer()->can_undo() || source_lines_.empty() ||
-            ending_undo_.empty()) {
-          return;
-        }
-        ending_restore_ = true;
-        ending_redo_.push_back(ending_kinds());
-        pending_kinds_ = ending_undo_.back();
-        ending_undo_.pop_back();
-        have_pending_kinds_ = true;
-      },
-      false);
-  buf->signal_undo().connect(
-      [this]() {
-        if (!ending_restore_) {
-          return;
-        }
-        if (have_pending_kinds_) {
-          apply_ending_kinds(pending_kinds_);
-          have_pending_kinds_ = false;
-        }
-        ending_restore_ = false;
-        if (auto live = buffer()) {
-          if (!source_lines_.empty() &&
-              static_cast<int>(source_lines_.size()) != live->get_line_count()) {
-            source_lines_.clear();
-            clear_ending_history();
-          }
-        }
-      },
-      true);
-  buf->signal_redo().connect(
-      [this]() {
-        if (!buffer() || !buffer()->can_redo() || source_lines_.empty() ||
-            ending_redo_.empty()) {
-          return;
-        }
-        ending_restore_ = true;
-        ending_undo_.push_back(ending_kinds());
-        pending_kinds_ = ending_redo_.back();
-        ending_redo_.pop_back();
-        have_pending_kinds_ = true;
-      },
-      false);
-  buf->signal_redo().connect(
-      [this]() {
-        if (!ending_restore_) {
-          return;
-        }
-        if (have_pending_kinds_) {
-          apply_ending_kinds(pending_kinds_);
-          have_pending_kinds_ = false;
-        }
-        ending_restore_ = false;
-        if (auto live = buffer()) {
-          if (!source_lines_.empty() &&
-              static_cast<int>(source_lines_.size()) != live->get_line_count()) {
-            source_lines_.clear();
-            clear_ending_history();
-          }
-        }
-      },
-      true);
   text_view_.signal_drag_data_received().connect(
       sigc::mem_fun(*this, &MainWindow::on_drag_data_received), false);
   // File drops reuse File → Open. Text drags keep the view's own targets.
@@ -1287,7 +1181,246 @@ MainWindow::~MainWindow() {
   loading_ = false;
   find_idle_.disconnect();
   caret_reveal_idle_.disconnect();
+  source_feature_idle_.disconnect();
+  discard_commit_swap();
+  disconnect_document_signals();
   end_find_user_action();
+}
+
+void MainWindow::disconnect_document_signals() {
+  for (auto& conn : doc_conns_) {
+    conn.disconnect();
+  }
+  doc_conns_.clear();
+}
+
+void MainWindow::release_document_marks() {
+  sel_only_start_mark_.reset();
+  sel_only_end_mark_.reset();
+  sel_only_range_valid_ = false;
+  extend_anchor_mark_.reset();
+  extend_anchor_valid_ = false;
+  last_match_start_.reset();
+  last_match_end_.reset();
+  last_match_valid_ = false;
+}
+
+void MainWindow::connect_document_signals() {
+  auto buf = doc_buffer_;
+  if (!buf) {
+    return;
+  }
+  disconnect_document_signals();
+  // gtkmm's connect() defaults to after=true. insert-text and delete-range
+  // run their default handlers first in that case, so "changed" updates the
+  // status before the cache moves and delete-range has already removed the
+  // text we need to measure. Run these before the default handlers.
+  doc_conns_.push_back(buf->signal_insert().connect(
+      sigc::mem_fun(*this, &MainWindow::on_text_inserted), false));
+  doc_conns_.push_back(buf->signal_insert().connect(
+      sigc::mem_fun(*this, &MainWindow::on_font_tag_inserted), true));
+  doc_conns_.push_back(buf->signal_erase().connect(
+      sigc::mem_fun(*this, &MainWindow::on_text_erased), false));
+  doc_conns_.push_back(buf->signal_changed().connect(
+      sigc::mem_fun(*this, &MainWindow::on_buffer_changed)));
+  doc_conns_.push_back(buf->signal_modified_changed().connect(
+      sigc::mem_fun(*this, &MainWindow::on_modified_changed)));
+  doc_conns_.push_back(buf->signal_mark_set().connect(
+      sigc::mem_fun(*this, &MainWindow::on_cursor_moved)));
+  // Insert and delete move the cursor without mark-set. The property
+  // notifies for those, and for undo, paste, and Replace.
+  doc_conns_.push_back(buf->property_cursor_position().signal_changed().connect(
+      [this]() {
+        if (!seeding_) {
+          update_cursor_status();
+        }
+      }));
+  doc_conns_.push_back(buf->property_can_undo().signal_changed().connect(
+      sigc::mem_fun(*this, &MainWindow::update_undo_redo_sensitivity)));
+  doc_conns_.push_back(buf->property_can_redo().signal_changed().connect(
+      sigc::mem_fun(*this, &MainWindow::update_undo_redo_sensitivity)));
+  doc_conns_.push_back(buf->signal_begin_user_action().connect([this]() {
+    in_user_action_ = true;
+    ending_snapshotted_ = false;
+  }));
+  doc_conns_.push_back(buf->signal_end_user_action().connect([this]() {
+    in_user_action_ = false;
+    ending_snapshotted_ = false;
+  }));
+  // Before the default handler mutates the buffer, remember which ending
+  // snapshot undo/redo should restore. After it, install that snapshot.
+  // Live insert/erase tracking is skipped while ending_restore_ is set.
+  doc_conns_.push_back(buf->signal_undo().connect(
+      [this]() {
+        if (!buffer() || !buffer()->can_undo() || source_lines_.empty() ||
+            ending_undo_.empty()) {
+          return;
+        }
+        ending_restore_ = true;
+        ending_redo_.push_back(ending_kinds());
+        pending_kinds_ = ending_undo_.back();
+        ending_undo_.pop_back();
+        have_pending_kinds_ = true;
+      },
+      false));
+  doc_conns_.push_back(buf->signal_undo().connect(
+      [this]() {
+        if (!ending_restore_) {
+          return;
+        }
+        if (have_pending_kinds_) {
+          apply_ending_kinds(pending_kinds_);
+          have_pending_kinds_ = false;
+        }
+        ending_restore_ = false;
+        if (auto live = buffer()) {
+          if (!source_lines_.empty() &&
+              static_cast<int>(source_lines_.size()) != live->get_line_count()) {
+            source_lines_.clear();
+            clear_ending_history();
+          }
+        }
+      },
+      true));
+  doc_conns_.push_back(buf->signal_redo().connect(
+      [this]() {
+        if (!buffer() || !buffer()->can_redo() || source_lines_.empty() ||
+            ending_redo_.empty()) {
+          return;
+        }
+        ending_restore_ = true;
+        ending_undo_.push_back(ending_kinds());
+        pending_kinds_ = ending_redo_.back();
+        ending_redo_.pop_back();
+        have_pending_kinds_ = true;
+      },
+      false));
+  doc_conns_.push_back(buf->signal_redo().connect(
+      [this]() {
+        if (!ending_restore_) {
+          return;
+        }
+        if (have_pending_kinds_) {
+          apply_ending_kinds(pending_kinds_);
+          have_pending_kinds_ = false;
+        }
+        ending_restore_ = false;
+        if (auto live = buffer()) {
+          if (!source_lines_.empty() &&
+              static_cast<int>(source_lines_.size()) != live->get_line_count()) {
+            source_lines_.clear();
+            clear_ending_history();
+          }
+        }
+      },
+      true));
+}
+
+void MainWindow::adopt_document_buffer(const Glib::RefPtr<Gsv::Buffer>& neu) {
+  if (!neu || neu == doc_buffer_) {
+    return;
+  }
+  disconnect_document_signals();
+  release_document_marks();
+  find_tag_.reset();
+  long_hidden_tag_.reset();
+  font_tag_.reset();
+  doc_buffer_ = neu;
+  if (!view_parked_) {
+    text_view_.set_buffer(doc_buffer_);
+  }
+  auto table = doc_buffer_->get_tag_table();
+  auto take = [&](const char* name) {
+    if (!table) {
+      return Glib::RefPtr<Gtk::TextTag>();
+    }
+    return table->lookup(name);
+  };
+  find_tag_ = take("lunduke-find-hit");
+  if (!find_tag_) {
+    find_tag_ = doc_buffer_->create_tag("lunduke-find-hit");
+    find_tag_->property_background() = "#c4d8f0";
+  }
+  long_hidden_tag_ = take("lunduke-long-line-hide");
+  if (!long_hidden_tag_) {
+    long_hidden_tag_ = doc_buffer_->create_tag("lunduke-long-line-hide");
+    long_hidden_tag_->property_invisible() = true;
+  }
+  font_tag_ = take("lunduke-editor-font");
+  if (!font_tag_) {
+    font_tag_ = doc_buffer_->create_tag("lunduke-editor-font");
+    font_tag_->property_font_desc() = font_desc_;
+  }
+  connect_document_signals();
+}
+
+void MainWindow::suspend_source_features() {
+  if (!doc_buffer_ || source_features_suspended_) {
+    return;
+  }
+  saved_highlight_syntax_ = doc_buffer_->get_highlight_syntax();
+  saved_highlight_brackets_ = doc_buffer_->get_highlight_matching_brackets();
+  doc_buffer_->set_highlight_syntax(false);
+  doc_buffer_->set_highlight_matching_brackets(false);
+  if (find_highlights_on_) {
+    clear_find_highlights();
+    find_highlights_on_ = false;
+  }
+  source_features_suspended_ = true;
+}
+
+void MainWindow::restore_source_features() {
+  source_feature_idle_.disconnect();
+  if (doc_buffer_) {
+    doc_buffer_->set_highlight_syntax(saved_highlight_syntax_);
+    doc_buffer_->set_highlight_matching_brackets(saved_highlight_brackets_);
+  }
+  source_features_suspended_ = false;
+}
+
+void MainWindow::discard_commit_swap() {
+  if (commit_swap_buffer_ && commit_swap_undo_open_) {
+    try {
+      commit_swap_buffer_->end_not_undoable_action();
+    } catch (...) {
+    }
+  }
+  commit_swap_undo_open_ = false;
+  commit_swap_font_.reset();
+  commit_swap_buffer_.reset();
+}
+
+bool MainWindow::insert_commit_piece(const Glib::ustring& piece) {
+  if (!commit_swap_buffer_ || piece.empty()) {
+    return true;
+  }
+  const char* data = piece.data();
+  const std::size_t bytes = piece.bytes();
+  for (std::size_t i = 0; i < bytes; ++i) {
+    if (data[i] == '\n') {
+      find_scan_.commit_run = 0;
+    } else if (++find_scan_.commit_run >=
+               static_cast<std::size_t>(kLongLineChars)) {
+      find_scan_.commit_saw_long = true;
+    }
+  }
+  try {
+    commit_swap_buffer_->insert(commit_swap_buffer_->end(), piece);
+  } catch (const std::bad_alloc&) {
+    return false;
+  }
+  if (commit_swap_font_) {
+    const bool modified = commit_swap_buffer_->get_modified();
+    auto end = commit_swap_buffer_->end();
+    auto start = end;
+    if (start.backward_chars(static_cast<int>(piece.length()))) {
+      commit_swap_buffer_->apply_tag(commit_swap_font_, start, end);
+    }
+    if (commit_swap_buffer_->get_modified() != modified) {
+      commit_swap_buffer_->set_modified(modified);
+    }
+  }
+  return true;
 }
 
 Glib::RefPtr<Gsv::Buffer> MainWindow::buffer() {
@@ -3231,7 +3364,7 @@ bool MainWindow::on_focus_in_event(GdkEventFocus* event) {
 void MainWindow::update_undo_redo_sensitivity() {
   auto buf = buffer();
   if (undo_item_) {
-    undo_item_->set_sensitive(buf && buf->can_undo());
+    undo_item_->set_sensitive(bulk_undo_armed_ || (buf && buf->can_undo()));
   }
   if (redo_item_) {
     redo_item_->set_sensitive(buf && buf->can_redo());
@@ -3835,9 +3968,14 @@ void MainWindow::start_bulk_undo() {
   }
   bytes_frozen_ = true;
   ending_restore_ = true;
-  try {
-    buf->begin_not_undoable_action();
-  } catch (...) {
+  // A swapped Replace All keeps the previous buffer. Putting it back is
+  // the undo; the attached buffer is not erased in slices.
+  if (!bulk_undo_buffer_) {
+    bulk_undo_blocked_ = true;
+    try {
+      buf->begin_not_undoable_action();
+    } catch (...) {
+    }
   }
   bulk_undo_idle_ = Glib::signal_idle().connect(
       sigc::mem_fun(*this, &MainWindow::pump_bulk_undo), kResponsivePriority);
@@ -3846,6 +3984,25 @@ void MainWindow::start_bulk_undo() {
 bool MainWindow::pump_bulk_undo() {
   auto buf = buffer();
   if (!buf || !bulk_undo_running_) {
+    finish_bulk_undo();
+    return false;
+  }
+  if (bulk_undo_buffer_) {
+    const auto restored = bulk_undo_buffer_;
+    bulk_undo_buffer_.reset();
+    adopt_document_buffer(restored);
+    utf8_bytes_ = bulk_undo_utf8_;
+    newline_count_ = bulk_undo_newlines_;
+    if (bulk_undo_had_lines_) {
+      apply_ending_kinds(bulk_undo_kinds_);
+    } else {
+      source_lines_.clear();
+    }
+    ending_undo_ = std::move(bulk_undo_ending_undo_);
+    ending_redo_ = std::move(bulk_undo_ending_redo_);
+    bulk_undo_kinds_.clear();
+    bulk_undo_kinds_.shrink_to_fit();
+    ending_restore_ = false;
     finish_bulk_undo();
     return false;
   }
@@ -3902,9 +4059,12 @@ bool MainWindow::pump_bulk_undo() {
 void MainWindow::finish_bulk_undo() {
   auto buf = buffer();
   if (buf) {
-    try {
-      buf->end_not_undoable_action();
-    } catch (...) {
+    if (bulk_undo_blocked_) {
+      try {
+        buf->end_not_undoable_action();
+      } catch (...) {
+      }
+      bulk_undo_blocked_ = false;
     }
     const int levels = buf->get_max_undo_levels();
     buf->set_max_undo_levels(0);
@@ -3933,6 +4093,7 @@ void MainWindow::finish_bulk_undo() {
     unpark_document_view();
   }
   bytes_frozen_ = false;
+  restore_source_features();
   refresh_dirty_from_buffer();
   update_undo_redo_sensitivity();
   update_status();
@@ -5113,6 +5274,11 @@ void MainWindow::end_find_user_action() {
 }
 
 void MainWindow::cancel_find_scan() {
+  // A commit that has not swapped buffers has not touched the document.
+  // Drop the detached copy instead of undoing a half-applied erase.
+  if (!find_scan_.commit_swapped) {
+    discard_commit_swap();
+  }
   const bool rollback = (find_scan_.user_action_open || find_scan_.commit_applied) &&
                         find_scan_.kind == FindScan::Kind::ReplaceAll;
   const bool parked = find_scan_.commit_parked;
@@ -5166,6 +5332,9 @@ void MainWindow::cancel_find_scan() {
   // Drop "Replacing…" now that the scan is idle. A sliced restore is
   // still parked and still frozen, so this publishes "Restoring…" and
   // not a star.
+  if (!find_scan_.commit_swapped || !find_scan_.active) {
+    restore_source_features();
+  }
   update_title();
   update_undo_redo_sensitivity();
 }
@@ -5212,6 +5381,12 @@ void MainWindow::finish_find_scan(bool show_result) {
   if (find_scan_.finishing) {
     return;
   }
+  if (!find_scan_.commit_swapped) {
+    discard_commit_swap();
+    if (source_features_suspended_) {
+      restore_source_features();
+    }
+  }
   find_scan_.finishing = true;
   find_idle_.disconnect();
   end_find_user_action();
@@ -5240,6 +5415,9 @@ void MainWindow::finish_find_scan(bool show_result) {
 
   find_scan_.active = false;
   find_scan_.dlg = nullptr;
+  // The result dialog runs its own loop. Drop "Replacing… 100%" before
+  // that loop, so the title is the document name while it is open.
+  update_title();
 
   if (show_result && !cancelled && dlg != nullptr && !test_mode()) {
     if (kind == FindScan::Kind::FindAll) {
@@ -5680,8 +5858,8 @@ bool MainWindow::pump_replace() {
 }
 
 bool MainWindow::pump_replace_commit() {
-  auto buf = buffer();
-  if (!buf) {
+  auto live = buffer();
+  if (!live) {
     finish_find_scan(false);
     return false;
   }
@@ -5690,6 +5868,10 @@ bool MainWindow::pump_replace_commit() {
     return false;
   }
   const gint64 slice_start = g_get_monotonic_time();
+  auto expired = [&](bool did) {
+    return did && g_get_monotonic_time() - slice_start > kReplaceSliceUs;
+  };
+
   if (!find_scan_.commit_started) {
     find_scan_.commit_started = true;
     const int span = find_scan_.replace_end - find_scan_.replace_start;
@@ -5699,8 +5881,20 @@ bool MainWindow::pump_replace_commit() {
       park_document_view();
       find_scan_.commit_parked = true;
     }
-    const int old_nl =
-        static_cast<int>(count_newlines(find_scan_.hay.data(), find_scan_.hay.size()));
+    // Remember the document we will put back on Undo, before line notes
+    // rewrite the per-line endings.
+    bulk_undo_was_clean_ = !live->get_modified();
+    bulk_undo_utf8_ = utf8_bytes_;
+    bulk_undo_newlines_ = newline_count_;
+    bulk_undo_had_lines_ = !source_lines_.empty();
+    bulk_undo_kinds_.clear();
+    if (bulk_undo_had_lines_) {
+      bulk_undo_kinds_ = ending_kinds();
+    }
+    bulk_undo_ending_undo_ = ending_undo_;
+    bulk_undo_ending_redo_ = ending_redo_;
+    const int old_nl = static_cast<int>(
+        count_newlines(find_scan_.hay.data(), find_scan_.hay.size()));
     const int new_nl = static_cast<int>(
         count_newlines(find_scan_.built.data(), find_scan_.built.size()));
     find_scan_.commit_keep = !source_lines_.empty() && old_nl == new_nl;
@@ -5712,70 +5906,106 @@ bool MainWindow::pump_replace_commit() {
       source_lines_.clear();
       clear_ending_history();
     }
-    buf->begin_user_action();
-    find_scan_.user_action_open = true;
-    find_scan_.commit_applied = true;
-    find_scan_.commit_off = find_scan_.replace_end;
+    // Highlighting, bracket matching, and search tags stay off while the
+    // replacement is built and swapped. They come back on a later idle.
+    suspend_source_features();
+    commit_swap_buffer_ = Gsv::Buffer::create();
+    commit_swap_buffer_->set_highlight_syntax(false);
+    commit_swap_buffer_->set_highlight_matching_brackets(false);
+    commit_swap_buffer_->set_max_undo_levels(0);
+    try {
+      commit_swap_buffer_->begin_not_undoable_action();
+      commit_swap_undo_open_ = true;
+    } catch (const std::bad_alloc&) {
+      finish_find_scan(false);
+      return false;
+    }
+    commit_swap_font_ = commit_swap_buffer_->create_tag("lunduke-editor-font");
+    commit_swap_font_->property_font_desc() = font_desc_;
+    find_scan_.commit_prefix_off = 0;
+    find_scan_.commit_suffix_off = find_scan_.replace_end;
     find_scan_.commit_byte = 0;
-    bulk_undo_was_clean_ = !buf->get_modified();
-    // The view is parked on the scratch buffer. Freeze the status so
-    // the slices do not flash an empty document or a partial size.
+    find_scan_.commit_run = 0;
+    find_scan_.commit_saw_long = false;
     bytes_frozen_ = true;
     set_replace_progress(96);
   }
 
-  auto slice_expired = [&](bool did_work) {
-    return did_work &&
-           g_get_monotonic_time() - slice_start > kReplaceSliceUs;
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  auto hook_pause = [&](const char* phase) {
+    if (find_scan_.commit_hook_paused) {
+      return false;
+    }
+    const char* step = g_getenv("LUNDUKE_EDIT_TEST_COMMIT_STEP");
+    if (step == nullptr || std::strcmp(step, phase) != 0) {
+      return false;
+    }
+    find_scan_.commit_hook_paused = true;
+    return true;
   };
+#endif
 
+  // The attached GtkSourceBuffer is not edited here. delete-range on it
+  // runs GtkSourceUndoManagerDefault::delete_range_cb, which copies the
+  // slice with gtk_text_buffer_get_slice, and then the btree delete in
+  // gtk_source_buffer_real_delete_range. One 1,024-character erase of a
+  // 12 MB buffer has taken about 1.9 s of CPU. The pieces below go into
+  // a detached buffer with highlighting, brackets, and undo recording
+  // off, and each piece stops on the wall clock.
   if (!find_scan_.commit_erased) {
-    const int target = find_scan_.replace_start;
-    bool erased_any = false;
-    while (find_scan_.commit_off > target) {
-      if (slice_expired(erased_any)) {
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+    if (hook_pause("erase")) {
+      set_replace_progress(96);
+      return true;
+    }
+#endif
+    bool did = false;
+    while (find_scan_.commit_prefix_off < find_scan_.replace_start) {
+      if (expired(did)) {
         set_replace_progress(96);
         return true;
       }
-      const int slice = std::min(1024, find_scan_.commit_off - target);
-      const int from = find_scan_.commit_off - slice;
-      buf->erase(buf->get_iter_at_offset(from),
-                 buf->get_iter_at_offset(find_scan_.commit_off));
-      find_scan_.commit_off = from;
-      erased_any = true;
-#ifdef LUNDUKE_EDIT_TEST_HOOKS
-      // One erase, then yield, so a behavior test can cancel mid-swap.
-      // Absent from the production binary.
-      if (const char* step = g_getenv("LUNDUKE_EDIT_TEST_COMMIT_STEP")) {
-        if (std::strcmp(step, "erase") == 0) {
-          set_replace_progress(96);
-          return true;
-        }
+      const int n =
+          std::min(2048, find_scan_.replace_start - find_scan_.commit_prefix_off);
+      const auto slice =
+          live->get_iter_at_offset(find_scan_.commit_prefix_off)
+              .get_text(live->get_iter_at_offset(find_scan_.commit_prefix_off + n));
+      if (!insert_commit_piece(slice)) {
+        finish_find_scan(false);
+        return false;
       }
-#endif
+      find_scan_.commit_prefix_bytes += slice.bytes();
+      find_scan_.commit_prefix_nl += count_newlines(slice.data(), slice.bytes());
+      find_scan_.commit_prefix_off += n;
+      did = true;
     }
     find_scan_.commit_erased = true;
-    find_scan_.commit_off = find_scan_.replace_start;
-    find_scan_.commit_byte = 0;
-    if (slice_expired(erased_any)) {
+    find_scan_.commit_hook_paused = false;
+    if (expired(did)) {
       set_replace_progress(97);
       return true;
     }
   }
 
   if (!find_scan_.commit_inserted) {
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+    if (hook_pause("insert")) {
+      set_replace_progress(97);
+      return true;
+    }
+#endif
+    bool did = false;
     const std::string& built = find_scan_.built;
-    bool inserted_any = false;
     while (find_scan_.commit_byte < built.size()) {
-      if (slice_expired(inserted_any)) {
+      if (expired(did)) {
         const int pct =
             97 + static_cast<int>((find_scan_.commit_byte * 2) /
                                   std::max<std::size_t>(built.size(), 1));
         set_replace_progress(std::min(pct, 99));
         return true;
       }
-      std::size_t n =
-          std::min<std::size_t>(4u * 1024u, built.size() - find_scan_.commit_byte);
+      std::size_t n = std::min<std::size_t>(
+          4u * 1024u, built.size() - find_scan_.commit_byte);
       while (n > 0 && find_scan_.commit_byte + n < built.size() &&
              (static_cast<unsigned char>(built[find_scan_.commit_byte + n]) &
               0xC0) == 0x80) {
@@ -5786,24 +6016,35 @@ bool MainWindow::pump_replace_commit() {
       }
       const Glib::ustring piece(built.data() + find_scan_.commit_byte,
                                 built.data() + find_scan_.commit_byte + n);
-      buf->insert(buf->get_iter_at_offset(find_scan_.commit_off), piece);
-      find_scan_.commit_off += static_cast<int>(piece.length());
-      find_scan_.commit_byte += n;
-      inserted_any = true;
-#ifdef LUNDUKE_EDIT_TEST_HOOKS
-      if (const char* step = g_getenv("LUNDUKE_EDIT_TEST_COMMIT_STEP")) {
-        if (std::strcmp(step, "insert") == 0) {
-          const int pct =
-              97 + static_cast<int>((find_scan_.commit_byte * 2) /
-                                    std::max<std::size_t>(built.size(), 1));
-          set_replace_progress(std::min(pct, 99));
-          return true;
-        }
+      if (!insert_commit_piece(piece)) {
+        finish_find_scan(false);
+        return false;
       }
-#endif
+      find_scan_.commit_byte += n;
+      did = true;
+    }
+    const int doc_end = live->get_char_count();
+    while (find_scan_.commit_suffix_off < doc_end) {
+      if (expired(did)) {
+        set_replace_progress(99);
+        return true;
+      }
+      const int n = std::min(2048, doc_end - find_scan_.commit_suffix_off);
+      const auto slice =
+          live->get_iter_at_offset(find_scan_.commit_suffix_off)
+              .get_text(live->get_iter_at_offset(find_scan_.commit_suffix_off + n));
+      if (!insert_commit_piece(slice)) {
+        finish_find_scan(false);
+        return false;
+      }
+      find_scan_.commit_suffix_bytes += slice.bytes();
+      find_scan_.commit_suffix_nl += count_newlines(slice.data(), slice.bytes());
+      find_scan_.commit_suffix_off += n;
+      did = true;
     }
     find_scan_.commit_inserted = true;
-    if (slice_expired(inserted_any)) {
+    find_scan_.commit_hook_paused = false;
+    if (expired(did)) {
       set_replace_progress(99);
       return true;
     }
@@ -5812,7 +6053,7 @@ bool MainWindow::pump_replace_commit() {
   if (!find_scan_.commit_lines_noted) {
     const bool keep =
         find_scan_.commit_keep &&
-        static_cast<int>(find_scan_.commit_kinds.size()) == buf->get_line_count();
+        static_cast<int>(find_scan_.commit_kinds.size()) == live->get_line_count();
     if (!keep) {
       if (!source_lines_.empty()) {
         source_lines_.clear();
@@ -5832,7 +6073,8 @@ bool MainWindow::pump_replace_commit() {
           return true;
         }
         const std::size_t end = std::min(
-            kinds.size(), find_scan_.commit_line_at + static_cast<std::size_t>(8192));
+            kinds.size(),
+            find_scan_.commit_line_at + static_cast<std::size_t>(8192));
         for (; find_scan_.commit_line_at < end; ++find_scan_.commit_line_at) {
           SourceLine line;
           line.kind = kinds[find_scan_.commit_line_at];
@@ -5854,18 +6096,72 @@ bool MainWindow::pump_replace_commit() {
         source_lines_.push_back(std::move(phantom));
       }
       find_scan_.commit_lines_noted = true;
-      if (slice_expired(noted)) {
+      if (expired(noted)) {
         set_replace_progress(99);
         return true;
       }
     }
   }
 
+  if (!find_scan_.commit_swapped) {
+    if (!commit_swap_buffer_) {
+      finish_find_scan(false);
+      return false;
+    }
+    if (commit_swap_undo_open_) {
+      try {
+        commit_swap_buffer_->end_not_undoable_action();
+      } catch (...) {
+      }
+      commit_swap_undo_open_ = false;
+    }
+    commit_swap_buffer_->set_max_undo_levels(100);
+    // One grouped undo record so the buffer reports can-undo. Ctrl+Z
+    // restores the previous document buffer instead of replaying this.
+    const int before = commit_swap_buffer_->get_char_count();
+    commit_swap_buffer_->begin_user_action();
+    commit_swap_buffer_->insert(commit_swap_buffer_->end(), " ");
+    {
+      auto end = commit_swap_buffer_->end();
+      auto start = end;
+      if (start.backward_char()) {
+        commit_swap_buffer_->erase(start, end);
+      }
+    }
+    commit_swap_buffer_->end_user_action();
+    if (commit_swap_buffer_->get_char_count() != before) {
+      finish_find_scan(false);
+      return false;
+    }
+    auto previous = doc_buffer_;
+    seeding_ = true;
+    adopt_document_buffer(commit_swap_buffer_);
+    commit_swap_buffer_.reset();
+    commit_swap_font_.reset();
+    if (auto neu = buffer()) {
+      const int caret = std::min(find_scan_.replace_start, neu->get_char_count());
+      neu->place_cursor(neu->get_iter_at_offset(caret));
+    }
+    seeding_ = false;
+    find_scan_.commit_swapped = true;
+    utf8_bytes_ = find_scan_.commit_prefix_bytes + find_scan_.built.size() +
+                  find_scan_.commit_suffix_bytes;
+    newline_count_ =
+        find_scan_.commit_prefix_nl +
+        count_newlines(find_scan_.built.data(), find_scan_.built.size()) +
+        find_scan_.commit_suffix_nl;
+    if (find_scan_.commit_saw_long) {
+      note_line_length(kLongLineChars);
+      force_wrap_off();
+    }
+    bulk_undo_buffer_ = previous;
+    bulk_undo_old_.clear();
+    bulk_undo_old_.shrink_to_fit();
+    bulk_undo_start_ = find_scan_.replace_start;
+    bulk_undo_armed_ = true;
+  }
+
   ending_restore_ = false;
-  end_find_user_action();
-  set_replace_progress(100);
-  const int caret = std::min(find_scan_.replace_start, buf->get_char_count());
-  buf->place_cursor(buf->get_iter_at_offset(caret));
   // Unpark while the status is still held, so the attach cannot publish
   // a cleared label or a size from a buffer the user has not seen yet.
   if (find_scan_.commit_parked && view_parked_) {
@@ -5874,15 +6170,17 @@ bool MainWindow::pump_replace_commit() {
   bytes_frozen_ = false;
   find_scan_.commit_parked = false;
   find_scan_.commit_applied = false;
-  // Replaying this user action is one multi-hundred-millisecond call.
-  // Keep the old span and restore it in slices when Undo is pressed.
-  if (find_scan_.hay.size() >= 32u * 1024u) {
-    bulk_undo_old_ = std::move(find_scan_.hay);
-    bulk_undo_start_ = find_scan_.replace_start;
-    bulk_undo_end_ = find_scan_.commit_off;
-    bulk_undo_armed_ = true;
-  }
   clear_find_highlights();
+  if (find_scan_.commit_saw_long) {
+    sync_long_line_window();
+  }
+  if (source_feature_idle_.empty()) {
+    source_feature_idle_ = Glib::signal_idle().connect([this]() {
+      restore_source_features();
+      return false;
+    });
+  }
+  set_replace_progress(100);
   update_undo_redo_sensitivity();
   refresh_dirty_from_buffer();
   update_status();
