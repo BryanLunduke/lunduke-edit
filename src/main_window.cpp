@@ -33,6 +33,38 @@
 #include <gdk/gdkx.h>
 #endif
 
+// GtkTextViewPrivate::layout is the first field in GTK 3.24. The public
+// scroll-to-iter path only measures a couple of screens around the caret's
+// current y, and unmeasured lines report a height of 0, so that y collapses
+// to the top of the buffer. gtk_text_layout_validate is the same call GTK's
+// incremental validator uses: it stores a real height on each line.
+extern "C" {
+typedef struct _GtkTextLayout GtkTextLayout;
+GType gtk_text_layout_get_type(void);
+gboolean gtk_text_layout_is_valid(GtkTextLayout* layout);
+void gtk_text_layout_validate(GtkTextLayout* layout, gint max_pixels);
+}
+
+namespace {
+
+GtkTextLayout* text_view_layout(Gtk::TextView& view) {
+  GtkTextView* tv = GTK_TEXT_VIEW(view.gobj());
+  if (tv == nullptr || tv->priv == nullptr) {
+    return nullptr;
+  }
+  struct LayoutSlot {
+    GtkTextLayout* layout;
+  };
+  auto* layout = reinterpret_cast<LayoutSlot*>(tv->priv)->layout;
+  if (layout == nullptr ||
+      !G_TYPE_CHECK_INSTANCE_TYPE(layout, gtk_text_layout_get_type())) {
+    return nullptr;
+  }
+  return layout;
+}
+
+}  // namespace
+
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -106,6 +138,17 @@ constexpr gsize kLoadReadBytes = 256u * 1024u;
 constexpr int kFindSliceChars = 64 * 1024;
 constexpr int kDefaultMaxFindHits = 10000;
 constexpr int kDefaultFindChunk = 200;
+// Wall-clock budget for one Replace All idle. Short enough that a
+// quarter-speed CPU still returns to the main loop inside half a second.
+constexpr gint64 kReplaceSliceUs = 25 * 1000;
+// Yield at least this often so a fast file still posts progress and
+// returns to the main loop. The time budget above still applies.
+constexpr int kReplaceSliceBytes = 256 * 1024;
+// GTK validates the text layout at priority 125 and keeps that idle
+// until every line is measured, which starves a default idle. 121 is
+// after redraw (120) and before that validator, so a slice cannot be
+// stuck behind a full-file measure and a paint is not delayed by it.
+constexpr int kResponsivePriority = 121;
 constexpr std::size_t kDefaultHugeUndoBytes = 8u * 1024u * 1024u;
 
 std::size_t max_open_bytes() {
@@ -959,6 +1002,15 @@ MainWindow::MainWindow(Application& app) : app_(app) {
       sigc::mem_fun(*this, &MainWindow::on_modified_changed));
   buf->signal_mark_set().connect(
       sigc::mem_fun(*this, &MainWindow::on_cursor_moved));
+  // Insert and delete move the cursor without mark-set. The property
+  // notifies for those, and for undo, paste, and Replace.
+  buf->property_cursor_position().signal_changed().connect([this]() {
+    if (!seeding_) {
+      update_cursor_status();
+    }
+  });
+  text_view_.signal_draw().connect(
+      sigc::mem_fun(*this, &MainWindow::on_text_view_draw), false);
   // Undo/redo menu sensitivity must track GtkSourceView undo-manager state.
   // signal_changed() alone is unreliable (keyboard undo via View bindings,
   // and can-undo often notifies after changed). Use property notify + menu map.
@@ -1149,6 +1201,9 @@ struct MainWindow::LoadState {
   Phase phase{Phase::Read};
   bool decoded{false};
   bool inserted{false};
+  bool revealed{false};
+  std::size_t file_size{0};
+  int progress{0};
   Glib::ustring text;
   std::vector<char> kinds;
   NewlineStyle newlines{NewlineStyle::Lf};
@@ -1184,6 +1239,7 @@ MainWindow::~MainWindow() {
   }
   loading_ = false;
   find_idle_.disconnect();
+  caret_reveal_idle_.disconnect();
   end_find_user_action();
 }
 
@@ -1214,14 +1270,289 @@ void MainWindow::unpark_document_view() {
   if (!view_parked_) {
     return;
   }
+  const int lines = doc_buffer_ ? doc_buffer_->get_line_count() : 0;
+  // Arm before set_buffer. Attaching can expose synchronously, and that
+  // paint has to measure the screen before it walks lines.
+  if (lines > 400) {
+    layout_guard_ = true;
+  }
   if (doc_buffer_) {
     text_view_.set_buffer(doc_buffer_);
   }
   view_parked_ = false;
+  if (doc_buffer_) {
+    auto iter = doc_buffer_->get_iter_at_mark(doc_buffer_->get_insert());
+    if (iter.is_start()) {
+      if (auto vadj = text_view_.get_vadjustment()) {
+        vadj->set_value(0);
+      }
+    }
+  }
+  if (layout_guard_) {
+    prevalidate_viewport();
+  }
   if (gutter_) {
     gutter_->follow_view_adjustment();
     gutter_->refresh();
   }
+}
+
+void MainWindow::prevalidate_viewport() {
+  auto buf = text_view_.get_buffer();
+  if (!buf || buf->begin() == buf->end()) {
+    return;
+  }
+  int widget_h = text_view_.get_allocated_height();
+  if (widget_h < 64) {
+    widget_h = 400;
+  }
+  const int target = widget_h * 2;
+  Gtk::TextIter iter = buf->begin();
+  Gdk::Rectangle vis;
+  text_view_.get_visible_rect(vis);
+  int line_top = 0;
+  text_view_.get_line_at_y(iter, vis.get_y(), line_top);
+  if (iter.get_line() > 2) {
+    iter.backward_lines(2);
+  }
+  int covered = 0;
+  int base_y = -1;
+  for (int guard = 0; guard < 800 && !iter.is_end(); ++guard) {
+    int y = 0;
+    int height = 0;
+    text_view_.get_line_yrange(iter, y, height);
+    if (height <= 0) {
+      Gdk::Rectangle loc;
+      text_view_.get_iter_location(iter, loc);
+      y = loc.get_y();
+      height = std::max(loc.get_height(), 1);
+    }
+    if (base_y < 0) {
+      base_y = y;
+    }
+    covered = (y - base_y) + std::max(height, 1);
+    if (covered >= target) {
+      break;
+    }
+    if (!iter.forward_line()) {
+      break;
+    }
+  }
+}
+
+bool MainWindow::on_text_view_draw(const Cairo::RefPtr<Cairo::Context>&) {
+  auto buf = text_view_.get_buffer();
+  bool need = layout_guard_ || loading_;
+  if (!need && buf && buf->get_line_count() > 400) {
+    Gdk::Rectangle vis;
+    text_view_.get_visible_rect(vis);
+    Gtk::TextIter edge = buf->begin();
+    int line_top = 0;
+    const int bottom = vis.get_y() + std::max(vis.get_height(), 1) - 1;
+    text_view_.get_line_at_y(edge, std::max(bottom, 0), line_top);
+    int y = 0;
+    int height = 0;
+    text_view_.get_line_yrange(edge, y, height);
+    need = height <= 0;
+  }
+  if (need) {
+    prevalidate_viewport();
+    layout_guard_ = false;
+  }
+  return false;
+}
+
+bool MainWindow::layout_gap_before(int line, int& last_good_line) {
+  auto buf = text_view_.get_buffer();
+  if (!buf) {
+    return false;
+  }
+  const int lines = buf->get_line_count();
+  if (lines < 800 || line < 2) {
+    return false;
+  }
+  const int capped = std::min(line, lines - 1);
+  auto height_at = [&](int at) {
+    int y = 0;
+    int height = 0;
+    text_view_.get_line_yrange(buf->get_iter_at_line(std::max(0, at)), y,
+                               height);
+    return height;
+  };
+  if (height_at(capped / 2) > 0 && height_at(capped) > 0) {
+    return false;
+  }
+  int lo = 0;
+  int hi = capped;
+  while (lo + 1 < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (height_at(mid) > 0) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  last_good_line = lo;
+  return height_at(std::min(lo + 1, capped)) <= 0;
+}
+
+void MainWindow::on_scroll_value_changed() {
+  if (adjusting_scroll_ || view_parked_ || loading_ || seeding_) {
+    return;
+  }
+  auto buf = text_view_.get_buffer();
+  auto vadj = text_view_.get_vadjustment();
+  if (!buf || !vadj) {
+    return;
+  }
+  int last_good = 0;
+  if (!layout_gap_before(buf->get_line_count() - 1, last_good)) {
+    return;
+  }
+  int y = 0;
+  int height = 0;
+  text_view_.get_line_yrange(buf->get_iter_at_line(last_good), y, height);
+  const double page = vadj->get_page_size();
+  double max_safe = static_cast<double>(y + std::max(height, 0)) - page;
+  if (max_safe < 0) {
+    max_safe = 0;
+  }
+  if (vadj->get_value() > max_safe + 2.0) {
+    adjusting_scroll_ = true;
+    vadj->set_value(max_safe);
+    adjusting_scroll_ = false;
+    note_caret_for_reveal();
+  }
+}
+
+void MainWindow::note_caret_for_reveal() {
+  if (adjusting_scroll_ || view_parked_ || loading_ || seeding_) {
+    return;
+  }
+  follow_caret_ = true;
+  follow_caret_spins_ = 0;
+  follow_line_ = 0;
+  follow_caret_upper_ = -1;
+  if (!caret_reveal_idle_.connected()) {
+    caret_reveal_idle_ = Glib::signal_timeout().connect(
+        sigc::mem_fun(*this, &MainWindow::reveal_caret_idle), 15,
+        kResponsivePriority);
+  }
+}
+
+bool MainWindow::caret_line_visible() {
+  auto buf = text_view_.get_buffer();
+  if (!buf) {
+    return false;
+  }
+  auto caret = buf->get_iter_at_mark(buf->get_insert());
+  int y = 0;
+  int height = 0;
+  text_view_.get_line_yrange(caret, y, height);
+  if (height <= 0) {
+    return false;
+  }
+  // Unmeasured lines report a height of 0, so the caret's y collapses
+  // into the top of the buffer and looks on-screen. A line halfway to
+  // the caret has to have a real height before this y means anything.
+  const int caret_line = caret.get_line();
+  if (caret_line > 400) {
+    int mid_y = 0;
+    int mid_h = 0;
+    text_view_.get_line_yrange(buf->get_iter_at_line(caret_line / 2), mid_y,
+                               mid_h);
+    if (mid_h <= 0) {
+      return false;
+    }
+  }
+  Gdk::Rectangle vis;
+  text_view_.get_visible_rect(vis);
+  Gtk::TextIter top_iter;
+  int top_line_y = 0;
+  text_view_.get_line_at_y(top_iter, std::max(vis.get_y(), 0), top_line_y);
+  // Pixel y can still sit inside the top screen while the caret is
+  // hundreds of thousands of lines below. Trust the line numbers.
+  if (caret_line > top_iter.get_line() + 120) {
+    return false;
+  }
+  const int top = vis.get_y();
+  const int bottom = top + vis.get_height();
+  return y < bottom && (y + height) > top;
+}
+
+bool MainWindow::reveal_caret_idle() {
+  if (!follow_caret_ || view_parked_ || loading_ || seeding_) {
+    follow_caret_ = false;
+    return false;
+  }
+  auto buf = text_view_.get_buffer();
+  if (!buf || buf->begin() == buf->end()) {
+    follow_caret_ = false;
+    return false;
+  }
+  if (++follow_caret_spins_ > 20000) {
+    follow_caret_ = false;
+    return false;
+  }
+  const int caret_line =
+      buf->get_iter_at_mark(buf->get_insert()).get_line();
+  const int last_line = std::max(0, buf->get_line_count() - 1);
+  const int goal = std::min(caret_line, last_line);
+  // get_iter_location only fills GTK's one-line display cache. The stored
+  // line height stays 0, the caret's y collapses into the top screen, and
+  // a scroll lands tens of thousands of lines short. validate() writes the
+  // height onto the line, which is what a later scroll needs.
+  if (GtkTextLayout* layout = text_view_layout(text_view_)) {
+    if (!gtk_text_layout_is_valid(layout)) {
+      const gint64 t0 = g_get_monotonic_time();
+      do {
+        gtk_text_layout_validate(layout, 4000);
+      } while (!gtk_text_layout_is_valid(layout) &&
+               g_get_monotonic_time() - t0 < 25000);
+    }
+  }
+  int measured_through = 0;
+  const bool caught_up = !layout_gap_before(goal, measured_through);
+  auto vadj = text_view_.get_vadjustment();
+  const double upper = vadj ? vadj->get_upper() : 0;
+  if (caught_up && vadj && !caret_line_visible()) {
+    GtkTextView* tv = GTK_TEXT_VIEW(text_view_.gobj());
+    GtkTextLayout* layout = text_view_layout(text_view_);
+    if (layout != nullptr && gtk_text_layout_is_valid(layout)) {
+      // Layout is complete, so this scrolls with real coordinates
+      // instead of queueing a pending scroll against a collapsed y.
+      adjusting_scroll_ = true;
+      gtk_text_view_scroll_mark_onscreen(
+          tv, gtk_text_buffer_get_insert(GTK_TEXT_BUFFER(buf->gobj())));
+      adjusting_scroll_ = false;
+    } else {
+      auto caret = buf->get_iter_at_mark(buf->get_insert());
+      int y = 0;
+      int height = 0;
+      text_view_.get_line_yrange(caret, y, height);
+      const double page = vadj->get_page_size();
+      double target = static_cast<double>(y + std::max(height, 0)) - page;
+      if (target < vadj->get_lower()) {
+        target = vadj->get_lower();
+      }
+      const double max_value =
+          std::max(vadj->get_lower(), vadj->get_upper() - page);
+      if (target > max_value) {
+        target = max_value;
+      }
+      adjusting_scroll_ = true;
+      vadj->set_value(target);
+      adjusting_scroll_ = false;
+    }
+  }
+  const bool stable = follow_caret_upper_ >= 0 &&
+                      std::abs(upper - follow_caret_upper_) < 1.0;
+  follow_caret_upper_ = vadj ? vadj->get_upper() : upper;
+  if (caught_up && caret_line_visible() && stable) {
+    follow_caret_ = false;
+    return false;
+  }
+  return true;
 }
 
 void MainWindow::build_ui() {
@@ -1236,6 +1567,10 @@ void MainWindow::build_ui() {
   // Packing into the scrolled window replaces the text view's vadjustment.
   // Rebind the gutter to the adjustment that actually scrolls.
   gutter_->follow_view_adjustment();
+  if (auto vadj = text_view_.get_vadjustment()) {
+    vadj->signal_value_changed().connect(
+        sigc::mem_fun(*this, &MainWindow::on_scroll_value_changed));
+  }
   editor_row_.pack_start(scrolled_, Gtk::PACK_EXPAND_WIDGET);
   root_.pack_start(editor_row_, Gtk::PACK_EXPAND_WIDGET);
 
@@ -1775,23 +2110,51 @@ void MainWindow::end_load_chrome() {
   if (status_find_.get_text().find("Opening") == 0) {
     set_find_count(-1, false);
   }
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr) {
+    g_print("ARGV_READY\n");
+    fflush(stdout);
+  }
+#endif
+}
+
+void MainWindow::note_load_progress(int pct) {
+  if (!load_) {
+    return;
+  }
+  if (pct < 0) {
+    pct = 0;
+  }
+  if (pct > 99) {
+    pct = 99;
+  }
+  if (pct < load_->progress) {
+    return;
+  }
+  load_->progress = pct;
+  update_load_status();
 }
 
 void MainWindow::update_load_status() {
   if (!load_) {
     return;
   }
-  Glib::ustring text = "Opening " + load_->base_name + "…";
-  if (load_->phase == LoadState::Phase::Read && !load_->raw.empty()) {
-    text += " " + format_bytes(load_->raw.size());
-  } else if (load_->phase == LoadState::Phase::Insert &&
-             load_->expected_chars > 0) {
-    const int pct =
-        (load_->insert_at * 100) / std::max(1, load_->expected_chars);
-    text += " " + std::to_string(pct) + "%";
-  }
+  const Glib::ustring text = "Opening " + load_->base_name + "… " +
+                             std::to_string(load_->progress) + "%";
   status_find_.set_text(text);
   status_find_frame_.show();
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr) {
+    g_print("ARGV_PROGRESS %d\n", load_->progress);
+    fflush(stdout);
+  }
+#endif
+}
+
+void MainWindow::reveal_loaded_view() {
+  // The caret is placed at the start before this runs, so the first
+  // paint measures the top of the file rather than the last line.
+  unpark_document_view();
 }
 
 void MainWindow::pump_async_load() {
@@ -1968,6 +2331,9 @@ bool MainWindow::start_async_load(const std::string& path) {
   state->allow_grow = allow_grow;
   state->active = true;
   state->base_name = Glib::path_get_basename(path);
+  if (st.st_size > 0) {
+    state->file_size = static_cast<std::size_t>(st.st_size);
+  }
   try {
     if (st.st_size > 0) {
       auto hint = static_cast<std::size_t>(st.st_size);
@@ -2049,12 +2415,14 @@ void MainWindow::on_load_chunk(const std::shared_ptr<LoadState>& state,
       bytes ? static_cast<const char*>(bytes->get_data(n)) : nullptr;
   if (n == 0 || data == nullptr) {
     state->phase = LoadState::Phase::Insert;
-    state->idle = Glib::signal_idle().connect([state]() {
-      if (!state->window) {
-        return false;
-      }
-      return state->window->on_load_idle(state);
-    });
+    state->idle = Glib::signal_idle().connect(
+        [state]() {
+          if (!state->window) {
+            return false;
+          }
+          return state->window->on_load_idle(state);
+        },
+        kResponsivePriority);
     return;
   }
   if (n > state->max_bytes || state->raw.size() > state->max_bytes - n) {
@@ -2095,7 +2463,17 @@ void MainWindow::on_load_chunk(const std::shared_ptr<LoadState>& state,
     fail_async_load(state, "Not enough memory to open this file.", state->path);
     return;
   }
-  update_load_status();
+  if (state->file_size > 0) {
+    int pct = static_cast<int>((state->raw.size() * 80) / state->file_size);
+    if (pct > 80) {
+      pct = 80;
+    }
+    note_load_progress(pct);
+  } else if (!state->raw.empty()) {
+    note_load_progress(10);
+  } else {
+    update_load_status();
+  }
   schedule_load_read(state);
 }
 
@@ -2152,7 +2530,7 @@ bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
     state->expected_chars = static_cast<int>(state->text.length());
     state->decoded = true;
     state->phase = LoadState::Phase::Insert;
-    update_load_status();
+    note_load_progress(88);
     // The window is already mapped. Return so expose and Escape run
     // before the buffer replace.
     return true;
@@ -2184,15 +2562,15 @@ bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
       return false;
     }
     state->inserted = true;
+    note_load_progress(94);
     if (buf->get_char_count() != state->expected_chars) {
       const std::string why =
           "This file contains a null byte and cannot be opened as text.";
       fail_async_load(state, why, state->path);
       return false;
     }
-    update_load_status();
-    // Let Escape land before commit. set_text does not return to the
-    // main loop on its own.
+    // Let Escape land before the view is attached. set_text does not
+    // return to the main loop on its own.
     return true;
   }
 
@@ -2200,6 +2578,26 @@ bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
     const std::string why =
         "This file contains a null byte and cannot be opened as text.";
     fail_async_load(state, why, state->path);
+    return false;
+  }
+
+  // Attach the buffer and yield before publishing the path. The expose
+  // that follows only shapes the screen prevalidate_viewport measured,
+  // and Escape in that gap still restores the previous text.
+  if (!state->revealed) {
+    if (auto buf = buffer()) {
+      buf->place_cursor(buf->begin());
+    }
+    // Tag while the view is still parked. Doing it after reattach
+    // invalidates every line and the next paint shapes the whole file.
+    apply_editor_font_tag();
+    note_load_progress(96);
+    reveal_loaded_view();
+    state->revealed = true;
+    return true;
+  }
+  if (state->cancel) {
+    abort_async_load(state);
     return false;
   }
   if (!commit_loaded_text(state)) {
@@ -2239,7 +2637,6 @@ bool MainWindow::commit_loaded_text(const std::shared_ptr<LoadState>& state) {
     }
     seeding_ = false;
     long_line_present_ = state->long_line;
-    apply_editor_font_tag();
     sync_encoding_radios();
     buf->place_cursor(buf->begin());
     if (state->long_line) {
@@ -2266,6 +2663,11 @@ void MainWindow::restore_buffer_after_failed_load(
     const Glib::ustring& previous_text, bool previous_modified,
     const std::string& previous_encoding, NewlineStyle previous_newlines) {
   auto buf = buffer();
+  const bool heavy =
+      buf && buf->get_line_count() > 2000 && !view_parked_;
+  if (heavy) {
+    park_document_view();
+  }
   seeding_ = true;
   try {
     if (buf) {
@@ -2291,6 +2693,9 @@ void MainWindow::restore_buffer_after_failed_load(
   long_window_line_ = -1;
   apply_editor_font_tag();
   sync_long_line_window();
+  if (heavy) {
+    unpark_document_view();
+  }
 }
 
 Glib::ustring MainWindow::current_basename() const {
@@ -2480,6 +2885,7 @@ void MainWindow::on_buffer_changed() {
   }
   set_find_count(-1, false);
   update_bytes_status();
+  update_cursor_status();
   sync_long_line_window();
   if (text_view_.get_wrap_mode() != Gtk::WRAP_NONE) {
     auto buf = text_view_.get_buffer();
@@ -2579,6 +2985,9 @@ void MainWindow::on_cursor_moved(
   if (mark == buffer()->get_insert()) {
     update_cursor_status();
     sync_long_line_window();
+    if (!view_parked_ && !loading_) {
+      note_caret_for_reveal();
+    }
   }
 }
 
@@ -2971,6 +3380,11 @@ bool MainWindow::on_delete_event(GdkEventAny* /*event*/) {
 }
 
 bool MainWindow::on_key_press_event(GdkEventKey* event) {
+  if (event != nullptr && event->keyval == GDK_KEY_Escape &&
+      find_scan_.active && find_scan_.kind == FindScan::Kind::ReplaceAll) {
+    cancel_find_scan();
+    return true;
+  }
   if (loading_ && load_ && event != nullptr && event->keyval == GDK_KEY_Escape) {
     load_->cancel = true;
     if (load_->cancellable) {
@@ -3283,6 +3697,13 @@ void MainWindow::open_dropped_uris(const std::vector<Glib::ustring>& uris) {
 void MainWindow::on_drag_data_received(
     const Glib::RefPtr<Gdk::DragContext>& context, int /*x*/, int /*y*/,
     const Gtk::SelectionData& data, guint /*info*/, guint time) {
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  if (g_getenv("LUNDUKE_EDIT_TEST_DND_CHILD") != nullptr) {
+    g_print("DND_RECEIVED view type=%s len=%d\n", data.get_data_type().c_str(),
+            data.get_length());
+    fflush(stdout);
+  }
+#endif
   if (selection_is_uri_list(data)) {
     g_signal_stop_emission_by_name(text_view_.gobj(), "drag-data-received");
     if (context && gdk_drag_context_get_protocol(context->gobj()) !=
@@ -3304,6 +3725,13 @@ void MainWindow::on_drag_data_received(
 void MainWindow::on_window_drag_data_received(
     const Glib::RefPtr<Gdk::DragContext>& context, int /*x*/, int /*y*/,
     const Gtk::SelectionData& data, guint /*info*/, guint time) {
+#ifdef LUNDUKE_EDIT_TEST_HOOKS
+  if (g_getenv("LUNDUKE_EDIT_TEST_DND_CHILD") != nullptr) {
+    g_print("DND_RECEIVED window type=%s len=%d\n",
+            data.get_data_type().c_str(), data.get_length());
+    fflush(stdout);
+  }
+#endif
   if (!selection_is_uri_list(data)) {
     return;
   }
@@ -4187,6 +4615,9 @@ void MainWindow::cancel_find_scan() {
   find_scan_.active = false;
   find_scan_.dlg = nullptr;
   find_scan_.finishing = false;
+  if (status_find_.get_text().find("Replacing") == 0) {
+    set_find_count(-1, false);
+  }
   update_undo_redo_sensitivity();
 }
 
@@ -4251,6 +4682,10 @@ void MainWindow::finish_find_scan(bool show_result) {
   }
   if (kind == FindScan::Kind::FindAll) {
     set_find_count(count, capped);
+  } else if (kind == FindScan::Kind::ReplaceAll) {
+    // "Replacing… N%" belongs to the scan. The result dialog, if any,
+    // names the count; the status slot goes back to empty.
+    set_find_count(-1, false);
   }
 
   find_scan_.active = false;
@@ -4514,7 +4949,8 @@ bool MainWindow::pump_replace() {
             return false;
           }
           find_idle_ = Glib::signal_idle().connect(
-              sigc::mem_fun(*this, &MainWindow::on_find_idle));
+              sigc::mem_fun(*this, &MainWindow::on_find_idle),
+              kResponsivePriority);
           return false;
         }
         return true;
@@ -4532,7 +4968,8 @@ bool MainWindow::pump_replace() {
           return false;
         }
         find_idle_ = Glib::signal_idle().connect(
-            sigc::mem_fun(*this, &MainWindow::on_find_idle));
+            sigc::mem_fun(*this, &MainWindow::on_find_idle),
+            kResponsivePriority);
         return false;
       }
       Gtk::TextIter next = buf->get_iter_at_offset(me);
@@ -4548,10 +4985,24 @@ bool MainWindow::pump_replace() {
     return true;
   }
 
-  // Collect every hit before touching the buffer. The first idle must not
-  // edit, so Cancel after it leaves the text alone. The commit is one
-  // erase and one insert, which is one undo step.
-  if (!find_scan_.collected) {
+  // Nothing is written into the buffer until the replacement text is
+  // finished. Cancel before that leaves the document unchanged. The
+  // commit itself is one erase and one insert, which is one undo step.
+  const gint64 slice_start = g_get_monotonic_time();
+  if (!find_scan_.mode_chosen) {
+    Gtk::TextIter range_begin, range_end;
+    if (!get_search_bounds(find_scan_.opts, range_begin, range_end)) {
+      finish_find_scan(true);
+      return false;
+    }
+    find_scan_.mode_chosen = true;
+    find_scan_.replace_start = range_begin.get_offset();
+    find_scan_.replace_end = range_end.get_offset();
+    find_scan_.literal = !find_scan_.opts.entire_word;
+    set_replace_progress(0);
+  }
+
+  if (!find_scan_.literal && !find_scan_.collected) {
     if (!find_scan_.started) {
       Gtk::TextIter range_begin, range_end;
       if (!get_search_bounds(find_scan_.opts, range_begin, range_end)) {
@@ -4593,45 +5044,273 @@ bool MainWindow::pump_replace() {
     return true;
   }
 
-  const int count = static_cast<int>(find_scan_.hits.size());
-  find_scan_.count = count;
+  if (find_scan_.cancel) {
+    finish_find_scan(false);
+    return false;
+  }
+  if (!find_scan_.extracted) {
+    if (!extract_replace_text(slice_start)) {
+      return find_scan_.active;
+    }
+  }
+  if (find_scan_.cancel) {
+    finish_find_scan(false);
+    return false;
+  }
+  if (!find_scan_.build_done) {
+    // A non-ASCII case fold, or Match Entire Words, needs the hits the
+    // iterator search already collected. Everything else is one byte scan.
+    const bool byte_scan =
+        find_scan_.literal &&
+        literal_replace_possible(find_scan_.opts, find_scan_.hay) &&
+        find_scan_.hits.empty();
+    const bool done = byte_scan ? build_literal_replacement(slice_start)
+                                : build_hit_replacement(slice_start);
+    if (!done) {
+      return find_scan_.active;
+    }
+    // The text is ready. Yield once so Cancel, Escape, and a progress
+    // paint run before the buffer changes. The next idle commits.
+    return true;
+  }
+  if (find_scan_.cancel) {
+    finish_find_scan(false);
+    return false;
+  }
+
+  const int count = find_scan_.count;
   if (count > 0) {
-    const Glib::ustring whole = buf->get_text();
-    const Glib::ustring& repl = find_scan_.opts.replace_with;
-    Glib::ustring neu;
-    int cursor = find_scan_.replace_start;
-    const int end = find_scan_.replace_end;
-    neu.reserve(static_cast<std::size_t>(std::max(0, end - cursor)) +
-                static_cast<std::size_t>(count) * repl.length());
-    for (const auto& hit : find_scan_.hits) {
-      if (hit.first > cursor) {
-        neu.append(whole.substr(
-            static_cast<Glib::ustring::size_type>(cursor),
-            static_cast<Glib::ustring::size_type>(hit.first - cursor)));
-      }
-      neu.append(repl);
-      cursor = hit.second;
-    }
-    if (cursor < end) {
-      neu.append(whole.substr(
-          static_cast<Glib::ustring::size_type>(cursor),
-          static_cast<Glib::ustring::size_type>(end - cursor)));
-    }
-    apply_bulk_replace(find_scan_.replace_start, end, neu);
+    set_replace_progress(100);
+    apply_bulk_replace(find_scan_.replace_start, find_scan_.replace_end,
+                       Glib::ustring(find_scan_.built));
   }
   find_scan_.hits.clear();
+  find_scan_.hay.clear();
+  find_scan_.folded_hay.clear();
+  find_scan_.built.clear();
   finish_find_scan(true);
   return false;
+}
+
+bool MainWindow::extract_replace_text(gint64 slice_start_us) {
+  auto buf = buffer();
+  if (!buf) {
+    finish_find_scan(false);
+    return false;
+  }
+  if (!find_scan_.extract_started) {
+    find_scan_.extract_started = true;
+    find_scan_.extract_off = find_scan_.replace_start;
+    find_scan_.hay.clear();
+    const int span = std::max(0, find_scan_.replace_end - find_scan_.replace_start);
+    find_scan_.hay.reserve(static_cast<std::size_t>(span));
+  }
+  const int end = find_scan_.replace_end;
+  int produced = 0;
+  while (find_scan_.extract_off < end) {
+    if (produced >= kReplaceSliceBytes ||
+        (produced > 0 &&
+         g_get_monotonic_time() - slice_start_us > kReplaceSliceUs)) {
+      const int span = std::max(1, end - find_scan_.replace_start);
+      const int done = find_scan_.extract_off - find_scan_.replace_start;
+      set_replace_progress((done * 30) / span);
+      return false;
+    }
+    const int next = std::min(end, find_scan_.extract_off + 8192);
+    const auto slice = buf->get_iter_at_offset(find_scan_.extract_off)
+                           .get_text(buf->get_iter_at_offset(next));
+    find_scan_.hay.append(slice.data(), slice.bytes());
+    produced += next - find_scan_.extract_off;
+    find_scan_.extract_off = next;
+  }
+  find_scan_.extracted = true;
+  set_replace_progress(30);
+  return true;
+}
+
+bool MainWindow::literal_replace_possible(const FindOptions& opts,
+                                          const std::string& hay) const {
+  if (opts.entire_word) {
+    return false;
+  }
+  if (opts.case_sensitive) {
+    return true;
+  }
+  auto ascii = [](const char* data, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+      if (static_cast<unsigned char>(data[i]) >= 128) {
+        return false;
+      }
+    }
+    return true;
+  };
+  return ascii(hay.data(), hay.size()) &&
+         ascii(opts.search_for.data(), opts.search_for.bytes()) &&
+         ascii(opts.replace_with.data(), opts.replace_with.bytes());
+}
+
+bool MainWindow::build_literal_replacement(gint64 slice_start_us) {
+  if (find_scan_.needle.empty() && find_scan_.scan_at == 0 &&
+      find_scan_.built.empty()) {
+    find_scan_.needle.assign(find_scan_.opts.search_for.data(),
+                             find_scan_.opts.search_for.bytes());
+    find_scan_.replacement.assign(find_scan_.opts.replace_with.data(),
+                                  find_scan_.opts.replace_with.bytes());
+    find_scan_.built.clear();
+    find_scan_.built.reserve(find_scan_.hay.size() +
+                             find_scan_.replacement.size());
+    find_scan_.count = 0;
+    find_scan_.scan_at = 0;
+    if (!find_scan_.opts.case_sensitive) {
+      find_scan_.folded_hay.resize(find_scan_.hay.size());
+      for (std::size_t i = 0; i < find_scan_.hay.size(); ++i) {
+        find_scan_.folded_hay[i] =
+            static_cast<char>(g_ascii_tolower(find_scan_.hay[i]));
+      }
+      find_scan_.folded_needle.resize(find_scan_.needle.size());
+      for (std::size_t i = 0; i < find_scan_.needle.size(); ++i) {
+        find_scan_.folded_needle[i] =
+            static_cast<char>(g_ascii_tolower(find_scan_.needle[i]));
+      }
+    }
+  }
+  if (find_scan_.needle.empty()) {
+    find_scan_.built = find_scan_.hay;
+    find_scan_.count = 0;
+    find_scan_.build_done = true;
+    return true;
+  }
+  const std::string& hay = find_scan_.hay;
+  const std::string& scan_hay =
+      find_scan_.opts.case_sensitive ? hay : find_scan_.folded_hay;
+  const std::string& scan_needle =
+      find_scan_.opts.case_sensitive ? find_scan_.needle
+                                    : find_scan_.folded_needle;
+  const std::size_t slice_from = find_scan_.scan_at;
+  while (find_scan_.scan_at <= hay.size()) {
+    const std::size_t scanned = find_scan_.scan_at - slice_from;
+    if (find_scan_.scan_at < hay.size() &&
+        (scanned >= static_cast<std::size_t>(kReplaceSliceBytes) ||
+         (scanned > 0 &&
+          g_get_monotonic_time() - slice_start_us > kReplaceSliceUs))) {
+      const int pct =
+          30 + static_cast<int>((find_scan_.scan_at * 65) /
+                                std::max<std::size_t>(hay.size(), 1));
+      set_replace_progress(pct);
+      return false;
+    }
+    const std::size_t found = scan_hay.find(scan_needle, find_scan_.scan_at);
+    if (found == std::string::npos) {
+      find_scan_.built.append(hay, find_scan_.scan_at, std::string::npos);
+      find_scan_.scan_at = hay.size();
+      break;
+    }
+    find_scan_.built.append(hay, find_scan_.scan_at, found - find_scan_.scan_at);
+    find_scan_.built.append(find_scan_.replacement);
+    find_scan_.scan_at = found + find_scan_.needle.size();
+    ++find_scan_.count;
+    if (find_scan_.needle.empty()) {
+      break;
+    }
+  }
+  find_scan_.build_done = true;
+  set_replace_progress(95);
+  return true;
+}
+
+bool MainWindow::build_hit_replacement(gint64 slice_start_us) {
+  if (find_scan_.hits.empty()) {
+    find_scan_.built.clear();
+    find_scan_.count = 0;
+    find_scan_.build_done = true;
+    return true;
+  }
+  if (find_scan_.replacement.empty() && find_scan_.byte_at == 0 &&
+      find_scan_.char_at == 0 && find_scan_.built.empty()) {
+    find_scan_.replacement.assign(find_scan_.opts.replace_with.data(),
+                                  find_scan_.opts.replace_with.bytes());
+    find_scan_.char_at = find_scan_.replace_start;
+    find_scan_.byte_at = 0;
+    find_scan_.hit_i = 0;
+    find_scan_.count = 0;
+    find_scan_.built.reserve(find_scan_.hay.size() +
+                             find_scan_.hits.size() *
+                                 find_scan_.replacement.size());
+  }
+  const std::string& hay = find_scan_.hay;
+  const char* const base = hay.data();
+  const std::size_t slice_from = find_scan_.byte_at;
+  while (find_scan_.hit_i < find_scan_.hits.size()) {
+    const std::size_t scanned = find_scan_.byte_at - slice_from;
+    if (scanned >= static_cast<std::size_t>(kReplaceSliceBytes) ||
+        (scanned > 0 &&
+         g_get_monotonic_time() - slice_start_us > kReplaceSliceUs)) {
+      const int pct =
+          30 + static_cast<int>((find_scan_.hit_i * 65) /
+                                std::max<std::size_t>(find_scan_.hits.size(), 1));
+      set_replace_progress(pct);
+      return false;
+    }
+    const auto& hit = find_scan_.hits[find_scan_.hit_i];
+    if (hit.first > find_scan_.char_at) {
+      const char* from = base + find_scan_.byte_at;
+      const char* to =
+          g_utf8_offset_to_pointer(from, hit.first - find_scan_.char_at);
+      find_scan_.built.append(from, static_cast<std::size_t>(to - from));
+      find_scan_.byte_at = static_cast<std::size_t>(to - base);
+      find_scan_.char_at = hit.first;
+    }
+    find_scan_.built.append(find_scan_.replacement);
+    if (hit.second > find_scan_.char_at) {
+      const char* from = base + find_scan_.byte_at;
+      const char* to =
+          g_utf8_offset_to_pointer(from, hit.second - find_scan_.char_at);
+      find_scan_.byte_at = static_cast<std::size_t>(to - base);
+      find_scan_.char_at = hit.second;
+    }
+    ++find_scan_.count;
+    ++find_scan_.hit_i;
+  }
+  if (find_scan_.char_at < find_scan_.replace_end) {
+    const char* from = base + find_scan_.byte_at;
+    const char* to = g_utf8_offset_to_pointer(
+        from, find_scan_.replace_end - find_scan_.char_at);
+    find_scan_.built.append(from, static_cast<std::size_t>(to - from));
+    find_scan_.char_at = find_scan_.replace_end;
+  }
+  find_scan_.build_done = true;
+  set_replace_progress(95);
+  return true;
+}
+
+void MainWindow::set_replace_progress(int pct) {
+  if (pct < 0) {
+    pct = 0;
+  }
+  if (pct > 100) {
+    pct = 100;
+  }
+  if (pct == find_scan_.progress_pct) {
+    return;
+  }
+  find_scan_.progress_pct = pct;
+  status_find_.set_text("Replacing… " + std::to_string(pct) + "%");
+  status_find_frame_.show();
 }
 
 bool MainWindow::on_find_idle() {
   if (!find_scan_.active || find_scan_.finishing) {
     return false;
   }
-  if (find_scan_.kind == FindScan::Kind::ReplaceAll) {
-    return pump_replace();
+  const gint64 t0 = g_get_monotonic_time();
+  const bool again = find_scan_.kind == FindScan::Kind::ReplaceAll
+                         ? pump_replace()
+                         : pump_find_highlight();
+  const gint64 dt = g_get_monotonic_time() - t0;
+  if (dt > find_scan_.max_slice_us) {
+    find_scan_.max_slice_us = dt;
   }
-  return pump_find_highlight();
+  return again;
 }
 
 void MainWindow::start_find_all(const FindOptions& opts, FindReplaceDialog* dlg) {
@@ -4646,7 +5325,7 @@ void MainWindow::start_find_all(const FindOptions& opts, FindReplaceDialog* dlg)
     return;
   }
   find_idle_ = Glib::signal_idle().connect(
-      sigc::mem_fun(*this, &MainWindow::on_find_idle));
+      sigc::mem_fun(*this, &MainWindow::on_find_idle), kResponsivePriority);
 }
 
 void MainWindow::start_replace_all(const FindOptions& opts,
@@ -4670,7 +5349,7 @@ void MainWindow::start_replace_all(const FindOptions& opts,
       limit > 0 && per > 0 && max_matches > limit / per;
   find_scan_.counting = maybe_huge;
   find_idle_ = Glib::signal_idle().connect(
-      sigc::mem_fun(*this, &MainWindow::on_find_idle));
+      sigc::mem_fun(*this, &MainWindow::on_find_idle), kResponsivePriority);
 }
 
 void MainWindow::highlight_all_matches(const FindOptions& opts) {
@@ -4839,24 +5518,37 @@ int MainWindow::replace_all(const FindOptions& opts) {
     return 0;
   }
 
-  Glib::ustring neu;
-  neu.reserve(static_cast<std::size_t>(std::max(0, end - start)) +
-              hits.size() * opts.replace_with.length());
+  // Character offsets, walked forward once. substr() would rescan from
+  // the start of the buffer on every hit.
+  const char* const base = whole.data();
+  const char* const range = g_utf8_offset_to_pointer(base, start);
+  std::string out;
+  out.reserve(static_cast<std::size_t>(std::max(0, end - start)) +
+              hits.size() * opts.replace_with.bytes());
+  std::size_t byte_at = static_cast<std::size_t>(range - base);
   int at = start;
   for (const auto& hit : hits) {
     if (hit.start_off > at) {
-      neu.append(whole.substr(
-          static_cast<Glib::ustring::size_type>(at),
-          static_cast<Glib::ustring::size_type>(hit.start_off - at)));
+      const char* from = base + byte_at;
+      const char* to = g_utf8_offset_to_pointer(from, hit.start_off - at);
+      out.append(from, static_cast<std::size_t>(to - from));
+      byte_at = static_cast<std::size_t>(to - base);
+      at = hit.start_off;
     }
-    neu.append(opts.replace_with);
-    at = hit.end_off;
+    out.append(opts.replace_with.data(), opts.replace_with.bytes());
+    if (hit.end_off > at) {
+      const char* from = base + byte_at;
+      const char* to = g_utf8_offset_to_pointer(from, hit.end_off - at);
+      byte_at = static_cast<std::size_t>(to - base);
+      at = hit.end_off;
+    }
   }
   if (at < end) {
-    neu.append(whole.substr(static_cast<Glib::ustring::size_type>(at),
-                            static_cast<Glib::ustring::size_type>(end - at)));
+    const char* from = base + byte_at;
+    const char* to = g_utf8_offset_to_pointer(from, end - at);
+    out.append(from, static_cast<std::size_t>(to - from));
   }
-  apply_bulk_replace(start, end, neu);
+  apply_bulk_replace(start, end, Glib::ustring(out));
   return static_cast<int>(hits.size());
 }
 
@@ -4876,6 +5568,16 @@ bool MainWindow::apply_bulk_replace(int start_off, int end_off,
     snapshot_endings();
     kinds = ending_kinds();
   }
+  // A large replace on the attached view makes the next paint shape
+  // every line. Detach for the edit, then measure one screen on the way
+  // back. The caret stays at the start of the replaced span so that
+  // screen is the top of the edit, not the end of the file.
+  const bool park =
+      !view_parked_ &&
+      ((end_off - start_off) > 4000 || neu.bytes() > 4000);
+  if (park) {
+    park_document_view();
+  }
   buf->begin_user_action();
   const bool saved_restore = ending_restore_;
   if (keep) {
@@ -4885,6 +5587,11 @@ bool MainWindow::apply_bulk_replace(int start_off, int end_off,
   buf->insert(buf->get_iter_at_offset(start_off), neu);
   ending_restore_ = saved_restore;
   buf->end_user_action();
+  if (park) {
+    const int caret = std::min(start_off, buf->get_char_count());
+    buf->place_cursor(buf->get_iter_at_offset(caret));
+    unpark_document_view();
+  }
   if (keep && static_cast<int>(kinds.size()) == buf->get_line_count()) {
     remember_source_lines(buf->get_text(), kinds);
   } else if (!source_lines_.empty()) {

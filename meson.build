@@ -51,7 +51,15 @@ edit_behavior_tests = executable(
   include_directories: lunduke_edit_inc,
 )
 
-test('behavior', edit_behavior_tests, timeout: 300)
+# Drag source for the XDND test. Not installed.
+edit_dnd_source = executable(
+  'edit-dnd-source',
+  files('tests/dnd_source.cpp'),
+  dependencies: [gtkmm_dep, x11_dep],
+  install: false,
+)
+
+test('behavior', edit_behavior_tests, timeout: 600)
 
 check_production_binary = find_program('tests/check-production-binary.sh')
 test(

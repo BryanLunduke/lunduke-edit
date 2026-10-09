@@ -250,6 +250,24 @@ private:
   bool on_find_idle();
   bool pump_find_highlight();
   bool pump_replace();
+  bool extract_replace_text(gint64 slice_start_us);
+  bool build_literal_replacement(gint64 slice_start_us);
+  bool build_hit_replacement(gint64 slice_start_us);
+  void set_replace_progress(int pct);
+  bool literal_replace_possible(const FindOptions& opts,
+                                const std::string& hay) const;
+  // Shape one screen of lines before the first paint. Unmeasured lines
+  // report a height of 0, and both GtkTextView and GtkSourceView then
+  // treat the rest of the buffer as inside the clip.
+  void prevalidate_viewport();
+  bool on_text_view_draw(const Cairo::RefPtr<Cairo::Context>& cr);
+  void reveal_loaded_view();
+  void note_load_progress(int pct);
+  void note_caret_for_reveal();
+  bool reveal_caret_idle();
+  bool caret_line_visible();
+  void on_scroll_value_changed();
+  bool layout_gap_before(int line, int& last_good_line);
   SearchStep step_search(bool backward, int& cursor_off, int& match_start,
                          int& match_end);
   void finish_find_scan(bool show_result);
@@ -289,11 +307,33 @@ private:
     std::size_t undo_bytes{0};
     int slice_steps{0};
     FindReplaceDialog* dlg{nullptr};
-    // Replace All collects hits, then commits them as one buffer edit.
+    // Replace All builds the new text off to the side, in idle slices,
+    // and commits it as one buffer edit. Cancel before that commit leaves
+    // the buffer unchanged.
     bool collected{false};
+    bool mode_chosen{false};
+    bool literal{false};
+    bool extract_started{false};
+    bool extracted{false};
+    // Distinct from the string `built`. The flag is set only after the
+    // replacement text is complete and ready to commit.
+    bool build_done{false};
     std::vector<std::pair<int, int>> hits;
     int replace_start{0};
     int replace_end{0};
+    int extract_off{0};
+    std::string hay;
+    std::string folded_hay;
+    std::string needle;
+    std::string folded_needle;
+    std::string replacement;
+    std::string built;
+    std::size_t scan_at{0};
+    std::size_t hit_i{0};
+    std::size_t byte_at{0};
+    int char_at{0};
+    int progress_pct{-1};
+    gint64 max_slice_us{0};
   };
 
   struct LoadState;
@@ -330,6 +370,15 @@ private:
   Glib::RefPtr<Gsv::Buffer> doc_buffer_;
   Glib::RefPtr<Gsv::Buffer> scratch_buffer_;
   bool view_parked_{false};
+  // The next expose of a just-attached large buffer must measure the
+  // visible lines before GtkSourceView walks them.
+  bool layout_guard_{false};
+  bool follow_caret_{false};
+  bool adjusting_scroll_{false};
+  int follow_caret_spins_{0};
+  int follow_line_{0};
+  double follow_caret_upper_{-1};
+  sigc::connection caret_reveal_idle_;
   LineGutter* gutter_{nullptr};
 
   Gtk::Box status_box_{Gtk::ORIENTATION_HORIZONTAL, 0};

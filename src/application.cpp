@@ -93,7 +93,9 @@ Gio::ApplicationFlags application_flags() {
 #ifdef LUNDUKE_EDIT_TEST_HOOKS
   // The behaviour suite already owns this application id. The command-line
   // open child has to load the file itself, not hand it to that process.
-  if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr) {
+  if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr ||
+      g_getenv("LUNDUKE_EDIT_TEST_REPLACE_CHILD") != nullptr ||
+      g_getenv("LUNDUKE_EDIT_TEST_DND_CHILD") != nullptr) {
     flags |= Gio::APPLICATION_NON_UNIQUE;
   }
 #endif

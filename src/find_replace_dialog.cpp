@@ -2,6 +2,7 @@
 
 #include "find_replace_dialog.hpp"
 
+#include <gdk/gdkkeysyms.h>
 #include <gtkmm/box.h>
 #include <gtkmm/label.h>
 #include <gtkmm/sizegroup.h>
@@ -169,6 +170,18 @@ FindReplaceDialog::FindReplaceDialog(Gtk::Window& parent,
   cancel_btn_->signal_clicked().connect([this]() {
     response(Gtk::RESPONSE_CANCEL);
   });
+  // The Cancel button is not a dialog action button, so Escape is not
+  // bound for us. A replace in progress has to see it: hiding runs the
+  // window's hide handler, which cancels the scan.
+  signal_key_press_event().connect(
+      [this](GdkEventKey* event) {
+        if (event != nullptr && event->keyval == GDK_KEY_Escape) {
+          response(Gtk::RESPONSE_CANCEL);
+          return true;
+        }
+        return false;
+      },
+      false);
 
   find_btn_->set_can_default(true);
   set_default(*find_btn_);

@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
@@ -3683,6 +3684,12 @@ struct EditChecks {
     bool escape{false};
     bool saw_window{false};
     bool sent_escape{false};
+    bool loaded{false};
+    bool end_sent{false};
+    bool end_done{false};
+    int end_spins{0};
+    bool burn{false};
+    gint64 last_tick{0};
   };
 
   static gboolean argv_child_escape_idle(gpointer data) {
@@ -3732,6 +3739,12 @@ struct EditChecks {
 
   static gboolean argv_child_watch(gpointer data) {
     auto* state = static_cast<ArgvChildState*>(data);
+    const gint64 now = g_get_monotonic_time();
+    if (state->last_tick == 0 || now - state->last_tick >= 100000) {
+      g_print("ARGV_TICK\n");
+      fflush(stdout);
+      state->last_tick = now;
+    }
     int windows = 0;
     for (auto* window : state->app->get_windows()) {
       auto* main = dynamic_cast<MainWindow*>(window);
@@ -3740,13 +3753,73 @@ struct EditChecks {
       }
       ++windows;
       state->saw_window = true;
-      if (!main->loading_ && main->file_path_ == state->path &&
-          main->get_mapped()) {
+      if (main->loading_ || main->file_path_ != state->path ||
+          !main->get_mapped()) {
+        continue;
+      }
+      if (!state->loaded) {
+        state->loaded = true;
         g_print("ARGV_LOADED chars=%d\n", main->buffer()->get_char_count());
         fflush(stdout);
+      }
+      if (state->escape) {
         state->app->quit();
         return G_SOURCE_REMOVE;
       }
+      if (!state->end_done && g_getenv("LUNDUKE_EDIT_TEST_ARGV_END") != nullptr) {
+        if (!state->end_sent) {
+          state->end_sent = true;
+          g_signal_emit_by_name(main->text_view_.gobj(), "move-cursor",
+                                GTK_MOVEMENT_BUFFER_ENDS, 1, FALSE);
+          return G_SOURCE_CONTINUE;
+        }
+        ++state->end_spins;
+        // Validating a million lines is sliced so the window stays
+        // responsive. 4000 ticks was not always enough for that.
+        if (main->follow_caret_ && state->end_spins < 8000) {
+          return G_SOURCE_CONTINUE;
+        }
+        auto buf = main->buffer();
+        auto caret = buf->get_iter_at_mark(buf->get_insert());
+        int y = 0;
+        int height = 0;
+        main->text_view_.get_line_yrange(caret, y, height);
+        Gdk::Rectangle vis;
+        main->text_view_.get_visible_rect(vis);
+        const bool visible = height > 0 && y < vis.get_y() + vis.get_height() &&
+                             (y + height) > vis.get_y();
+        Gtk::TextIter top = buf->begin();
+        int line_top = 0;
+        main->text_view_.get_line_at_y(top, vis.get_y(), line_top);
+        g_print("ARGV_END visible=%d caret=%d top=%d\n", visible ? 1 : 0,
+                caret.get_line() + 1, top.get_line() + 1);
+        fflush(stdout);
+        state->end_done = true;
+      }
+      if (state->burn) {
+        struct rusage before {};
+        getrusage(RUSAGE_SELF, &before);
+        const gint64 t0 = g_get_monotonic_time();
+        volatile std::uint32_t x = 1;
+        while (g_get_monotonic_time() - t0 < 1500000) {
+          x = x * 1664525u + 1013904223u;
+        }
+        struct rusage after {};
+        getrusage(RUSAGE_SELF, &after);
+        const auto usec = [](const timeval& tv) {
+          return tv.tv_sec * 1000000L + tv.tv_usec;
+        };
+        g_print("ARGV_BURN user=%ld sys=%ld wall=%ld\n",
+                usec(after.ru_utime) - usec(before.ru_utime),
+                usec(after.ru_stime) - usec(before.ru_stime),
+                g_get_monotonic_time() - t0);
+        fflush(stdout);
+        if (x == 0) {
+          g_print("ARGV_BURN_SINK\n");
+        }
+      }
+      state->app->quit();
+      return G_SOURCE_REMOVE;
     }
     if (state->saw_window && windows == 0) {
       g_print("ARGV_CANCELLED\n");
@@ -3779,6 +3852,7 @@ struct EditChecks {
     state->app = app.get();
     state->path = argv[1];
     state->escape = g_getenv("LUNDUKE_EDIT_TEST_ARGV_ESCAPE") != nullptr;
+    state->burn = g_getenv("LUNDUKE_EDIT_TEST_ARGV_BURN") != nullptr;
     if (state->escape) {
       // A high-priority idle runs inside present(), before the window can
       // accept a key, and one dropped Escape used to count as sent.
@@ -3786,7 +3860,7 @@ struct EditChecks {
     }
     g_timeout_add(20, argv_child_watch, state);
     // Give up rather than hang the suite if the load never finishes.
-    g_timeout_add(90000, +[](gpointer data) -> gboolean {
+    g_timeout_add(300000, +[](gpointer data) -> gboolean {
       auto* app = static_cast<Application*>(data);
       g_print("ARGV_TIMEOUT\n");
       fflush(stdout);
@@ -3807,6 +3881,19 @@ struct EditChecks {
     bool loaded{false};
     bool cancelled{false};
     int chars{0};
+    double ready_ms{-1};
+    double max_gap_ms{0};
+    int progress_min{1000};
+    int progress_max{-1};
+    int progress_values{0};
+    bool end_checked{false};
+    bool end_visible{false};
+    int end_caret{0};
+    int end_top{0};
+    bool burned{false};
+    long burn_user{0};
+    long burn_sys{0};
+    long burn_wall{0};
     std::string throttle;
     std::string output;
   };
@@ -3847,17 +3934,101 @@ struct EditChecks {
     }
   }
 
+  static void note_argv_line(ArgvRun& result, const std::string& line,
+                             gint64 start, gint64& gap_last, bool& gap_open) {
+    const gint64 now = g_get_monotonic_time();
+    const bool timed = line == "ARGV_TICK" ||
+                       line.compare(0, 14, "ARGV_PROGRESS ") == 0 ||
+                       line == "ARGV_READY" ||
+                       line.compare(0, 12, "ARGV_LOADED ") == 0;
+    if (timed && gap_open && !result.loaded && gap_last > 0) {
+      const double gap = static_cast<double>(now - gap_last) / 1000.0;
+      if (gap > result.max_gap_ms) {
+        result.max_gap_ms = gap;
+      }
+    }
+    if (timed) {
+      gap_last = now;
+    }
+    if (line.compare(0, 12, "ARGV_MAPPED ") == 0 && result.map_ms < 0) {
+      unsigned long xid = 0;
+      int watch = 0;
+      int viewable = 0;
+      char status_text[512];
+      status_text[0] = '\0';
+      if (std::sscanf(line.c_str(),
+                      "ARGV_MAPPED xid=%lu watch=%d viewable=%d status=%511[^\n]",
+                      &xid, &watch, &viewable, status_text) >= 3) {
+        result.map_ms = static_cast<double>(now - start) / 1000.0;
+        result.watch = watch != 0;
+        result.viewable = viewable != 0;
+        result.opening = std::string(status_text).find("Opening") !=
+                         std::string::npos;
+        gap_open = true;
+        gap_last = now;
+        if (!result.viewable) {
+          for (int attempt = 0; attempt < 10 && !result.viewable; ++attempt) {
+            result.viewable = xid_is_viewable(xid);
+            if (!result.viewable) {
+              g_usleep(20 * 1000);
+            }
+          }
+        } else {
+          result.viewable = result.viewable || xid_is_viewable(xid);
+        }
+      }
+    } else if (line.compare(0, 14, "ARGV_PROGRESS ") == 0) {
+      int pct = 0;
+      if (std::sscanf(line.c_str(), "ARGV_PROGRESS %d", &pct) == 1) {
+        ++result.progress_values;
+        if (pct < result.progress_min) {
+          result.progress_min = pct;
+        }
+        if (pct > result.progress_max) {
+          result.progress_max = pct;
+        }
+      }
+    } else if (line == "ARGV_READY") {
+      if (result.ready_ms < 0) {
+        result.ready_ms = static_cast<double>(now - start) / 1000.0;
+      }
+    } else if (line.compare(0, 12, "ARGV_LOADED ") == 0) {
+      result.loaded = true;
+      result.load_ms = static_cast<double>(now - start) / 1000.0;
+      std::sscanf(line.c_str(), "ARGV_LOADED chars=%d", &result.chars);
+    } else if (line == "ARGV_CANCELLED") {
+      result.cancelled = true;
+      result.load_ms = static_cast<double>(now - start) / 1000.0;
+    } else if (line.compare(0, 9, "ARGV_END ") == 0) {
+      int visible = 0;
+      result.end_checked = true;
+      std::sscanf(line.c_str(), "ARGV_END visible=%d caret=%d top=%d", &visible,
+                  &result.end_caret, &result.end_top);
+      result.end_visible = visible != 0;
+    } else if (line.compare(0, 10, "ARGV_BURN ") == 0) {
+      result.burned = true;
+      std::sscanf(line.c_str(), "ARGV_BURN user=%ld sys=%ld wall=%ld",
+                  &result.burn_user, &result.burn_sys, &result.burn_wall);
+    }
+  }
+
   static ArgvRun run_argv_file(const std::string& path, bool throttle,
-                               bool escape, int deadline_ms) {
+                               bool escape, int deadline_ms, bool burn = false,
+                               bool ctrl_end = false) {
     ArgvRun result;
     const bool have_taskset = access("/usr/bin/taskset", X_OK) == 0;
     const bool have_cpulimit = access("/usr/bin/cpulimit", X_OK) == 0;
-    if (throttle && have_taskset && have_cpulimit) {
+    if (throttle && !have_cpulimit) {
+      result.throttle = "cpulimit missing";
+      result.output =
+          "cpulimit is required for the throttled test and was not found "
+          "at /usr/bin/cpulimit; refusing to fall back\n";
+      return result;
+    }
+    if (throttle && have_taskset) {
       result.throttle = "taskset -c 0 + cpulimit -c 1 -l 25";
-    } else if (throttle && have_taskset) {
-      result.throttle = "taskset -c 0 (cpulimit unavailable)";
     } else if (throttle) {
-      result.throttle = "unconstrained (taskset and cpulimit unavailable)";
+      result.throttle = "cpulimit -c 1 -l 25";
     } else {
       result.throttle = "unthrottled";
     }
@@ -3887,14 +4058,24 @@ struct EditChecks {
       } else {
         unsetenv("LUNDUKE_EDIT_TEST_ARGV_ESCAPE");
       }
+      if (burn) {
+        setenv("LUNDUKE_EDIT_TEST_ARGV_BURN", "1", 1);
+      } else {
+        unsetenv("LUNDUKE_EDIT_TEST_ARGV_BURN");
+      }
+      if (ctrl_end) {
+        setenv("LUNDUKE_EDIT_TEST_ARGV_END", "1", 1);
+      } else {
+        unsetenv("LUNDUKE_EDIT_TEST_ARGV_END");
+      }
       const char* bin = argv0.c_str();
-      if (throttle && have_taskset && have_cpulimit) {
+      if (throttle && have_taskset) {
         execl("/usr/bin/taskset", "taskset", "-c", "0", "/usr/bin/cpulimit",
               "-f", "-q", "-c", "1", "-l", "25", "--", bin, path.c_str(),
               static_cast<char*>(nullptr));
-      } else if (throttle && have_taskset) {
-        execl("/usr/bin/taskset", "taskset", "-c", "0", bin, path.c_str(),
-              static_cast<char*>(nullptr));
+      } else if (throttle) {
+        execl("/usr/bin/cpulimit", "cpulimit", "-f", "-q", "-c", "1", "-l",
+              "25", "--", bin, path.c_str(), static_cast<char*>(nullptr));
       } else {
         execl(bin, bin, path.c_str(), static_cast<char*>(nullptr));
       }
@@ -3906,6 +4087,8 @@ struct EditChecks {
     std::string pending;
     bool child_done = false;
     int status = -1;
+    gint64 gap_last = 0;
+    bool gap_open = false;
     while (!child_done) {
       const gint64 now = g_get_monotonic_time();
       if ((now - start) / 1000 > deadline_ms) {
@@ -3929,46 +4112,7 @@ struct EditChecks {
         pending.erase(0, nl + 1);
         result.output += line;
         result.output += '\n';
-        if (line.compare(0, 12, "ARGV_MAPPED ") == 0 && result.map_ms < 0) {
-          unsigned long xid = 0;
-          int watch = 0;
-          int viewable = 0;
-          char status_text[512];
-          status_text[0] = '\0';
-          if (std::sscanf(line.c_str(),
-                          "ARGV_MAPPED xid=%lu watch=%d viewable=%d status=%511[^\n]",
-                          &xid, &watch, &viewable, status_text) >= 3) {
-            result.map_ms = static_cast<double>(g_get_monotonic_time() - start) /
-                            1000.0;
-            result.watch = watch != 0;
-            result.viewable = viewable != 0;
-            result.opening = std::string(status_text).find("Opening") !=
-                             std::string::npos;
-            // Escape can unmap the window before a later xwininfo. The
-            // child's viewable flag is from the map. Confirm with the X
-            // server while the window is still up.
-            if (!result.viewable) {
-              for (int attempt = 0; attempt < 10 && !result.viewable;
-                   ++attempt) {
-                result.viewable = xid_is_viewable(xid);
-                if (!result.viewable) {
-                  g_usleep(20 * 1000);
-                }
-              }
-            } else {
-              result.viewable = result.viewable || xid_is_viewable(xid);
-            }
-          }
-        } else if (line.compare(0, 12, "ARGV_LOADED ") == 0) {
-          result.loaded = true;
-          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
-                           1000.0;
-          std::sscanf(line.c_str(), "ARGV_LOADED chars=%d", &result.chars);
-        } else if (line == "ARGV_CANCELLED") {
-          result.cancelled = true;
-          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
-                           1000.0;
-        }
+        note_argv_line(result, line, start, gap_last, gap_open);
       }
       int st = 0;
       const pid_t got = waitpid(pid, &st, WNOHANG);
@@ -4004,22 +4148,7 @@ struct EditChecks {
       pending.erase(0, nl + 1);
       result.output += line;
       result.output += '\n';
-      if (line == "ARGV_CANCELLED") {
-        result.cancelled = true;
-        if (result.load_ms < 0) {
-          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
-                           1000.0;
-        }
-      } else if (line.compare(0, 12, "ARGV_LOADED ") == 0) {
-        result.loaded = true;
-        if (result.load_ms < 0) {
-          result.load_ms = static_cast<double>(g_get_monotonic_time() - start) /
-                           1000.0;
-        }
-        std::sscanf(line.c_str(), "ARGV_LOADED chars=%d", &result.chars);
-      } else if (line.compare(0, 11, "ARGV_ESCAPE") == 0) {
-        // Recorded in the log via result.output.
-      }
+      note_argv_line(result, line, start, gap_last, gap_open);
     }
     close(fds[0]);
     result.status = status;
@@ -4043,13 +4172,18 @@ struct EditChecks {
     }
     expect(read_bytes(path).size() == 12000000, "argv fixture is 12000000 bytes");
 
-    const ArgvRun plain = run_argv_file(path, false, false, 30000);
+    const ArgvRun plain = run_argv_file(path, false, false, 240000, false, true);
     std::cout << "argv unthrottled map_ms=" << plain.map_ms
-              << " load_ms=" << plain.load_ms << " chars=" << plain.chars
+              << " ready_ms=" << plain.ready_ms << " load_ms=" << plain.load_ms
+              << " gap_ms=" << plain.max_gap_ms
+              << " progress=" << plain.progress_min << ".." << plain.progress_max
+              << " steps=" << plain.progress_values << " chars=" << plain.chars
+              << " end_visible=" << plain.end_visible
+              << " caret=" << plain.end_caret << " top=" << plain.end_top
               << " opening=" << plain.opening << " watch=" << plain.watch
               << " viewable=" << plain.viewable << " status=" << plain.status
               << "\n";
-    if (!plain.loaded) {
+    if (!plain.loaded || !plain.end_visible) {
       std::cerr << plain.output;
     }
     expect(plain.ok && plain.loaded, "unthrottled argv open loads the file");
@@ -4058,22 +4192,52 @@ struct EditChecks {
            "unthrottled argv open maps the window quickly");
     expect(plain.opening, "unthrottled argv open shows Opening");
     expect(plain.watch, "unthrottled argv open shows the busy cursor");
+    expect(plain.ready_ms >= plain.map_ms && plain.ready_ms < 15000,
+           "unthrottled open clears Opening without a long freeze");
+    expect(plain.progress_values >= 2 && plain.progress_max > plain.progress_min &&
+               plain.progress_max > 0,
+           "unthrottled open progress advances");
+    expect(plain.max_gap_ms < 800, "unthrottled open keeps the main loop moving");
+    expect(plain.end_checked && plain.end_visible,
+           "Ctrl+End scrolls the caret on screen after a large open");
+    expect(plain.end_caret > 1000 && plain.end_top + 80 >= plain.end_caret,
+           "Ctrl+End view is the last lines, not the middle of the file");
 
-    const ArgvRun slow = run_argv_file(path, true, false, 60000);
+    const ArgvRun slow = run_argv_file(path, true, false, 120000, true, false);
+    const double burn_cpu = static_cast<double>(slow.burn_user + slow.burn_sys);
+    const double burn_ratio =
+        slow.burn_wall > 0 ? burn_cpu / static_cast<double>(slow.burn_wall) : 1.0;
     std::cout << "argv throttled (" << slow.throttle << ") map_ms="
-              << slow.map_ms << " load_ms=" << slow.load_ms
-              << " chars=" << slow.chars << " opening=" << slow.opening
-              << " watch=" << slow.watch << " viewable=" << slow.viewable
-              << "\n";
-    if (!slow.loaded) {
+              << slow.map_ms << " ready_ms=" << slow.ready_ms
+              << " load_ms=" << slow.load_ms << " gap_ms=" << slow.max_gap_ms
+              << " progress=" << slow.progress_min << ".." << slow.progress_max
+              << " steps=" << slow.progress_values << " chars=" << slow.chars
+              << " opening=" << slow.opening << " watch=" << slow.watch
+              << " viewable=" << slow.viewable << " burn_user=" << slow.burn_user
+              << " burn_sys=" << slow.burn_sys << " burn_wall=" << slow.burn_wall
+              << " burn_ratio=" << burn_ratio << "\n";
+    if (!slow.loaded || !slow.burned || burn_ratio > 0.50) {
       std::cerr << slow.output;
     }
+    expect(slow.throttle.find("cpulimit") != std::string::npos &&
+               slow.throttle.find("unavailable") == std::string::npos &&
+               slow.throttle.find("missing") == std::string::npos,
+           "throttled argv open uses cpulimit and does not fall back");
     expect(slow.ok && slow.loaded, "throttled argv open loads the file");
     expect(slow.chars == 12000000, "throttled argv open keeps every character");
     expect(slow.viewable && slow.map_ms >= 0 && slow.map_ms < 4000,
            "throttled argv open maps the window within a few seconds");
     expect(slow.opening, "throttled argv open shows Opening when the window maps");
     expect(slow.watch, "throttled argv open shows the busy cursor");
+    expect(slow.ready_ms >= slow.map_ms, "throttled open reports Opening cleared");
+    expect(slow.progress_values >= 2 && slow.progress_max > slow.progress_min &&
+               slow.progress_max > 0,
+           "throttled open progress advances");
+    expect(slow.max_gap_ms < 2000,
+           "throttled open does not freeze the main loop for seconds");
+    expect(slow.burned && slow.burn_wall >= 1000000, "throttle burn ran");
+    expect(burn_ratio <= 0.50,
+           "cpulimit -l 25 holds the child near a quarter of one CPU");
 
     const ArgvRun esc = run_argv_file(path, true, true, 30000);
     std::cout << "argv escape (" << esc.throttle << ") map_ms=" << esc.map_ms
@@ -4088,6 +4252,778 @@ struct EditChecks {
     expect(esc.cancelled && !esc.loaded, "escape cancels the argv open");
     expect(esc.ok, "escape cancel exits cleanly");
     std::cout << "argv-large end\n";
+  }
+
+  static std::string make_replace_fixture(const std::string& path) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const char piece[] = "line dog sit quick ipsum fox value line\n";
+    const std::size_t piece_n = sizeof piece - 1;
+    std::size_t total = 0;
+    while (total < 1000000) {
+      out.write(piece, static_cast<std::streamsize>(piece_n));
+      total += piece_n;
+    }
+    return path;
+  }
+
+  struct LoopGap {
+    MainWindow* window{nullptr};
+    gint64 last{0};
+    gint64 max_gap{0};
+    int progress_n{0};
+    int last_pct{-1};
+  };
+
+  static gboolean loop_gap_cb(gpointer data) {
+    auto* gap = static_cast<LoopGap*>(data);
+    const gint64 now = g_get_monotonic_time();
+    if (gap->last > 0) {
+      gap->max_gap = std::max(gap->max_gap, now - gap->last);
+    }
+    gap->last = now;
+    if (gap->window->find_scan_.active &&
+        gap->window->find_scan_.progress_pct != gap->last_pct &&
+        gap->window->find_scan_.progress_pct >= 0) {
+      gap->last_pct = gap->window->find_scan_.progress_pct;
+      ++gap->progress_n;
+    }
+    return G_SOURCE_CONTINUE;
+  }
+
+  static void test_round7_status_and_replace(MainWindow& w, const std::string& dir) {
+    std::cout << "round7 status begin\n";
+    w.buffer()->set_text("");
+    w.buffer()->place_cursor(w.buffer()->begin());
+    expect(w.status_pos_.get_text() == "Ln 1, Col 1",
+           "an empty buffer reports Ln 1, Col 1");
+    w.buffer()->insert_at_cursor("Zab");
+    expect(w.status_pos_.get_text() == "Ln 1, Col 4",
+           "typing updates the status column");
+    w.buffer()->insert_at_cursor("\n");
+    expect(w.status_pos_.get_text() == "Ln 2, Col 1",
+           "Return updates the status line");
+    w.buffer()->insert_at_cursor("q");
+    expect(w.status_pos_.get_text() == "Ln 2, Col 2",
+           "typing after Return updates the column");
+    w.on_undo();
+    expect(w.buffer()->get_text() == "Zab\n", "undo removes the typed character");
+    expect(w.status_pos_.get_text() == "Ln 2, Col 1", "undo updates Ln/Col");
+    w.insert_pasted_text("xyz");
+    expect(w.status_pos_.get_text() == "Ln 2, Col 4", "paste updates Ln/Col");
+    FindOptions one;
+    one.search_for = "Zab";
+    one.replace_with = "Q";
+    one.case_sensitive = true;
+    expect(w.replace_all(one) == 1, "a single replace hits");
+    {
+      auto iter = w.buffer()->get_iter_at_mark(w.buffer()->get_insert());
+      const std::string want =
+          "Ln " + std::to_string(iter.get_line() + 1) + ", Col " +
+          std::to_string(w.display_column_at(iter));
+      expect(w.status_pos_.get_text() == want, "Replace updates Ln/Col");
+    }
+
+    std::cout << "round7 replace begin\n";
+    const std::string path = make_replace_fixture(dir + "/replace-1mb.txt");
+    w.buffer()->set_text("");
+    w.buffer()->set_modified(false);
+    expect(w.open_file(path), "1MB replace fixture opens");
+    const Glib::ustring original = w.buffer()->get_text();
+    expect(original.bytes() >= 1000000, "replace fixture is at least 1MB");
+
+    FindOptions opts;
+    opts.search_for = "line ";
+    opts.replace_with = "row ";
+    opts.case_sensitive = false;
+    opts.wrap_around = true;
+
+    LoopGap gap;
+    gap.window = &w;
+    const guint timer =
+        g_timeout_add_full(G_PRIORITY_DEFAULT, 1, loop_gap_cb, &gap, nullptr);
+    w.start_replace_all(opts, nullptr);
+    bool cancelled = false;
+    int progress_steps = 0;
+    int last_pct = -1;
+    gint64 loop_last = g_get_monotonic_time();
+    gint64 loop_gap = 0;
+    for (int i = 0; i < 200000 && w.find_scan_.active; ++i) {
+      g_main_context_iteration(nullptr, false);
+      const gint64 now = g_get_monotonic_time();
+      loop_gap = std::max(loop_gap, now - loop_last);
+      loop_last = now;
+      if (w.find_scan_.progress_pct >= 0 &&
+          w.find_scan_.progress_pct != last_pct) {
+        last_pct = w.find_scan_.progress_pct;
+        ++progress_steps;
+      }
+      if (!cancelled && progress_steps >= 2 && w.find_scan_.progress_pct > 0) {
+        GdkEventKey key {};
+        key.type = GDK_KEY_PRESS;
+        key.keyval = GDK_KEY_Escape;
+        expect(w.on_key_press_event(&key), "Escape cancels Replace All");
+        cancelled = true;
+      }
+    }
+    g_source_remove(timer);
+    const gint64 cancel_gap = std::max(gap.max_gap, loop_gap);
+    std::cout << "round7 cancel gap_us=" << cancel_gap
+              << " progress_steps=" << progress_steps
+              << " slice_us=" << w.find_scan_.max_slice_us << "\n";
+    expect(cancelled, "Replace All reported progress before cancel");
+    expect(progress_steps >= 2, "Replace All updates progress more than once");
+    expect(cancel_gap < 500000, "Replace All returns to the main loop");
+    expect(w.find_scan_.max_slice_us < 500000, "Replace All slices stay short");
+    expect(!w.find_scan_.active, "cancelled Replace All is idle");
+    expect(w.buffer()->get_text() == original,
+           "cancel leaves the buffer unchanged");
+    expect(w.status_find_.get_text().find("Replacing") == std::string::npos,
+           "cancel clears the Replacing status");
+
+    FindReplaceDialog dlg(w, opts);
+    dlg.signal_hide().connect([&w]() { w.on_find_dialog_hidden(); });
+    dlg.show();
+    gtk_widget_realize(GTK_WIDGET(dlg.gobj()));
+    flush_ui();
+    w.start_replace_all(opts, &dlg);
+    bool dialog_cancel = false;
+    for (int i = 0; i < 200000 && w.find_scan_.active; ++i) {
+      g_main_context_iteration(nullptr, false);
+      if (!dialog_cancel && w.find_scan_.progress_pct >= 30 && dlg.get_window()) {
+        GdkEvent* event = gdk_event_new(GDK_KEY_PRESS);
+        event->key.window =
+            GDK_WINDOW(g_object_ref(dlg.get_window()->gobj()));
+        event->key.keyval = GDK_KEY_Escape;
+        event->key.time = GDK_CURRENT_TIME;
+        gtk_widget_event(GTK_WIDGET(dlg.gobj()), event);
+        gdk_event_free(event);
+        dialog_cancel = true;
+      }
+    }
+    expect(dialog_cancel && !w.find_scan_.active,
+           "Escape in the Find dialog cancels Replace All");
+    expect(w.buffer()->get_text() == original,
+           "dialog Escape leaves the buffer unchanged");
+
+    gap = LoopGap{};
+    gap.window = &w;
+    const guint timer2 =
+        g_timeout_add_full(G_PRIORITY_DEFAULT, 1, loop_gap_cb, &gap, nullptr);
+    const gint64 started = g_get_monotonic_time();
+    w.start_replace_all(opts, nullptr);
+    int done_steps = 0;
+    int done_pct = -1;
+    gint64 done_last = g_get_monotonic_time();
+    gint64 done_gap = 0;
+    for (int i = 0; i < 200000 && w.find_scan_.active; ++i) {
+      g_main_context_iteration(nullptr, false);
+      const gint64 now = g_get_monotonic_time();
+      done_gap = std::max(done_gap, now - done_last);
+      done_last = now;
+      if (w.find_scan_.progress_pct >= 0 &&
+          w.find_scan_.progress_pct != done_pct) {
+        done_pct = w.find_scan_.progress_pct;
+        ++done_steps;
+      }
+    }
+    g_source_remove(timer2);
+    const gint64 replace_us = g_get_monotonic_time() - started;
+    const gint64 replace_gap = std::max(gap.max_gap, done_gap);
+    std::cout << "round7 replace_us=" << replace_us
+              << " gap_us=" << replace_gap
+              << " progress_steps=" << done_steps
+              << " slice_us=" << w.find_scan_.max_slice_us << "\n";
+    expect(!w.find_scan_.active, "Replace All finishes");
+    expect(w.buffer()->get_text() != original, "Replace All changes the text");
+    expect(w.buffer()->get_text().find("line ") == Glib::ustring::npos,
+           "Replace All replaces every line ");
+    expect(done_steps >= 2, "a finished Replace All posted progress");
+    expect(replace_gap < 500000, "a finished Replace All stays responsive");
+    expect(w.find_scan_.max_slice_us < 500000, "the commit slice stays short");
+    expect(w.buffer()->can_undo(), "Replace All is one undo step");
+    w.on_undo();
+    expect(w.buffer()->get_text() == original, "one undo restores Replace All");
+    expect(!w.buffer()->can_undo(), "Replace All did not push a second undo");
+    {
+      auto iter = w.buffer()->get_iter_at_mark(w.buffer()->get_insert());
+      const std::string want =
+          "Ln " + std::to_string(iter.get_line() + 1) + ", Col " +
+          std::to_string(w.display_column_at(iter));
+      expect(w.status_pos_.get_text() == want,
+             "Ln/Col matches the caret after undo of Replace All");
+    }
+    std::cout << "round7 replace end\n";
+  }
+
+  struct ToolRun {
+    int status{-1};
+    bool ok{false};
+    std::string output;
+  };
+
+  static ToolRun run_tool(const std::vector<std::string>& args, bool throttle,
+                          const std::vector<std::pair<std::string, std::string>>& env,
+                          int deadline_ms) {
+    ToolRun result;
+    const bool have_taskset = access("/usr/bin/taskset", X_OK) == 0;
+    const bool have_cpulimit = access("/usr/bin/cpulimit", X_OK) == 0;
+    if (throttle && !have_cpulimit) {
+      result.output =
+          "cpulimit is required for the throttled test and was not found "
+          "at /usr/bin/cpulimit; refusing to fall back\n";
+      return result;
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+      result.output = "pipe failed\n";
+      return result;
+    }
+    const gint64 start = g_get_monotonic_time();
+    const pid_t pid = fork();
+    if (pid < 0) {
+      close(fds[0]);
+      close(fds[1]);
+      result.output = "fork failed\n";
+      return result;
+    }
+    if (pid == 0) {
+      setpgid(0, 0);
+      dup2(fds[1], STDOUT_FILENO);
+      close(fds[0]);
+      close(fds[1]);
+      unset_inherited_test_env();
+      for (const auto& item : env) {
+        setenv(item.first.c_str(), item.second.c_str(), 1);
+      }
+      std::vector<char*> argv;
+      std::vector<std::string> storage;
+      if (throttle && have_taskset) {
+        storage.push_back("taskset");
+        storage.push_back("-c");
+        storage.push_back("0");
+        storage.push_back("/usr/bin/cpulimit");
+        storage.push_back("-f");
+        storage.push_back("-q");
+        storage.push_back("-c");
+        storage.push_back("1");
+        storage.push_back("-l");
+        storage.push_back("25");
+        storage.push_back("--");
+      } else if (throttle) {
+        storage.push_back("cpulimit");
+        storage.push_back("-f");
+        storage.push_back("-q");
+        storage.push_back("-c");
+        storage.push_back("1");
+        storage.push_back("-l");
+        storage.push_back("25");
+        storage.push_back("--");
+      }
+      storage.insert(storage.end(), args.begin(), args.end());
+      for (auto& s : storage) {
+        argv.push_back(s.data());
+      }
+      argv.push_back(nullptr);
+      if (throttle && have_taskset) {
+        execv("/usr/bin/taskset", argv.data());
+      } else if (throttle) {
+        execv("/usr/bin/cpulimit", argv.data());
+      } else {
+        execv(args[0].c_str(), argv.data());
+      }
+      _exit(127);
+    }
+    setpgid(pid, pid);
+    close(fds[1]);
+    std::string pending;
+    bool child_done = false;
+    int status = -1;
+    while (!child_done) {
+      if ((g_get_monotonic_time() - start) / 1000 > deadline_ms) {
+        kill(-pid, SIGKILL);
+        result.output += "\nPARENT_TIMEOUT\n";
+      }
+      pollfd pfd {};
+      pfd.fd = fds[0];
+      pfd.events = POLLIN;
+      poll(&pfd, 1, 100);
+      if (pfd.revents & (POLLIN | POLLHUP)) {
+        char buf[1024];
+        const ssize_t n = read(fds[0], buf, sizeof buf);
+        if (n > 0) {
+          pending.append(buf, static_cast<std::size_t>(n));
+        }
+      }
+      int st = 0;
+      const pid_t got = waitpid(pid, &st, WNOHANG);
+      if (got == pid) {
+        status = st;
+        child_done = true;
+      } else if ((g_get_monotonic_time() - start) / 1000 > deadline_ms) {
+        kill(-pid, SIGKILL);
+        waitpid(pid, &st, 0);
+        status = st;
+        child_done = true;
+      }
+      if (child_done) {
+        const int flags = fcntl(fds[0], F_GETFL, 0);
+        if (flags >= 0) {
+          fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
+        }
+        while (true) {
+          char buf[1024];
+          const ssize_t n = read(fds[0], buf, sizeof buf);
+          if (n <= 0) {
+            break;
+          }
+          pending.append(buf, static_cast<std::size_t>(n));
+        }
+      }
+    }
+    close(fds[0]);
+    result.output = pending;
+    result.status = status;
+    result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return result;
+  }
+
+  static int run_replace_child(int argc, char** argv) {
+    if (argc < 2) {
+      std::cerr << "replace child needs a file\n";
+      return 2;
+    }
+    const char* display = g_getenv("DISPLAY");
+    if (display == nullptr || display[0] == '\0') {
+      std::cerr << "GUI tests require a display; refusing to skip\n";
+      return 1;
+    }
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    g_setenv("LUNDUKE_EDIT_TEST", "1", TRUE);
+    if (g_getenv("GDK_BACKEND") == nullptr) {
+      g_setenv("GDK_BACKEND", "x11", FALSE);
+    }
+    Gsv::init();
+    auto app = Application::create();
+    if (!app->register_application()) {
+      std::cerr << "replace child could not register\n";
+      return 1;
+    }
+    auto* w = app->create_window();
+    w->present();
+    flush_ui();
+    if (!w->open_file(argv[1])) {
+      g_print("REPLACE_FAIL open\n");
+      return 1;
+    }
+    const Glib::ustring original = w->buffer()->get_text();
+    const bool cancel = g_getenv("LUNDUKE_EDIT_TEST_REPLACE_CANCEL") != nullptr;
+    // Let cpulimit finish punishing the open burst before the gap is measured.
+    g_usleep(1500 * 1000);
+    LoopGap gap;
+    gap.window = w;
+    const guint timer =
+        g_timeout_add_full(G_PRIORITY_DEFAULT, 5, loop_gap_cb, &gap, nullptr);
+    FindOptions opts;
+    opts.search_for = "line ";
+    opts.replace_with = "row ";
+    opts.case_sensitive = false;
+    w->start_replace_all(opts, nullptr);
+    bool sent_cancel = false;
+    int progress_steps = 0;
+    int last_pct = -1;
+    for (int i = 0; i < 400000 && w->find_scan_.active; ++i) {
+      g_main_context_iteration(nullptr, false);
+      if (w->find_scan_.progress_pct >= 0 &&
+          w->find_scan_.progress_pct != last_pct) {
+        last_pct = w->find_scan_.progress_pct;
+        ++progress_steps;
+      }
+      if (cancel && !sent_cancel && progress_steps >= 2 &&
+          w->find_scan_.progress_pct > 0) {
+        GdkEventKey key {};
+        key.type = GDK_KEY_PRESS;
+        key.keyval = GDK_KEY_Escape;
+        w->on_key_press_event(&key);
+        sent_cancel = true;
+      }
+    }
+    g_source_remove(timer);
+    g_print("REPLACE_GAP %ld\n", static_cast<long>(std::max(gap.max_gap, static_cast<gint64>(0))));
+    g_print("REPLACE_SLICE %ld\n", static_cast<long>(w->find_scan_.max_slice_us));
+    g_print("REPLACE_PROGRESS %d\n", progress_steps);
+    if (cancel) {
+      g_print("REPLACE_UNCHANGED %d\n",
+              w->buffer()->get_text() == original ? 1 : 0);
+    } else {
+      const bool changed = w->buffer()->get_text() != original;
+      w->on_undo();
+      const bool restored = w->buffer()->get_text() == original;
+      const bool single = !w->buffer()->can_undo();
+      g_print("REPLACE_UNDO %d\n", (changed && restored && single) ? 1 : 0);
+    }
+    struct rusage before {};
+    getrusage(RUSAGE_SELF, &before);
+    const gint64 t0 = g_get_monotonic_time();
+    volatile std::uint32_t x = 1;
+    while (g_get_monotonic_time() - t0 < 1200000) {
+      x = x * 1664525u + 1013904223u;
+    }
+    struct rusage after {};
+    getrusage(RUSAGE_SELF, &after);
+    const auto usec = [](const timeval& tv) {
+      return static_cast<long>(tv.tv_sec * 1000000L + tv.tv_usec);
+    };
+    g_print("REPLACE_BURN user=%ld sys=%ld wall=%ld\n",
+            usec(after.ru_utime) - usec(before.ru_utime),
+            usec(after.ru_stime) - usec(before.ru_stime),
+            static_cast<long>(g_get_monotonic_time() - t0));
+    if (x == 0) {
+      g_print("REPLACE_BURN_SINK\n");
+    }
+    fflush(stdout);
+    return 0;
+  }
+
+  static long field_long(const std::string& text, const char* key) {
+    const std::string needle = std::string(key) + " ";
+    const auto at = text.find(needle);
+    if (at == std::string::npos) {
+      return -1;
+    }
+    return std::strtol(text.c_str() + at + needle.size(), nullptr, 10);
+  }
+
+  static void test_throttled_replace(const std::string& dir) {
+    std::cout << "round7 throttled replace begin\n";
+    if (argv0.empty()) {
+      expect(false, "replace throttle test knows its executable");
+      return;
+    }
+    const std::string path = make_replace_fixture(dir + "/replace-throttle.txt");
+    const std::vector<std::pair<std::string, std::string>> base_env = {
+        {"LUNDUKE_EDIT_TEST_REPLACE_CHILD", "1"},
+        {"LUNDUKE_EDIT_TEST", "1"},
+    };
+    auto full_env = base_env;
+    const ToolRun full =
+        run_tool({argv0, path}, true, full_env, 90000);
+    const long gap = field_long(full.output, "REPLACE_GAP");
+    const long slice = field_long(full.output, "REPLACE_SLICE");
+    const long progress = field_long(full.output, "REPLACE_PROGRESS");
+    const long undo = field_long(full.output, "REPLACE_UNDO");
+    const long burn_user = field_long(full.output, "user=");
+    // REPLACE_BURN user= is not "user=" at the start of a token search that
+    // might hit something else. Parse the burn line directly.
+    long b_user = -1, b_sys = -1, b_wall = -1;
+    const auto burn_at = full.output.find("REPLACE_BURN ");
+    if (burn_at != std::string::npos) {
+      std::sscanf(full.output.c_str() + burn_at,
+                  "REPLACE_BURN user=%ld sys=%ld wall=%ld", &b_user, &b_sys,
+                  &b_wall);
+    }
+    const double ratio =
+        b_wall > 0 ? static_cast<double>(b_user + b_sys) / static_cast<double>(b_wall)
+                   : 1.0;
+    std::cout << "round7 throttled replace gap_us=" << gap
+              << " slice_us=" << slice << " progress=" << progress
+              << " undo=" << undo << " burn_ratio=" << ratio << "\n";
+    if (!full.ok || gap < 0 || gap >= 800000 || undo != 1 || ratio > 0.55) {
+      std::cerr << full.output;
+    }
+    expect(full.ok, "throttled Replace All child exits cleanly");
+    expect(gap >= 0 && gap < 2000000,
+           "throttled Replace All is not stuck for seconds");
+    // cpulimit stops the process inside a slice, so the slice's wall time
+    // includes that stop. The unthrottled run asserts the 500 ms budget.
+    expect(slice >= 0 && slice < 1500000,
+           "throttled Replace All slice is not a multi-second stall");
+    expect(progress >= 2, "throttled Replace All posts progress");
+    expect(undo == 1, "throttled Replace All is one undo of the original");
+    expect(b_wall >= 1000000 && ratio <= 0.55,
+           "throttled Replace All is really under cpulimit -l 25");
+
+    auto cancel_env = base_env;
+    cancel_env.push_back({"LUNDUKE_EDIT_TEST_REPLACE_CANCEL", "1"});
+    const ToolRun cancelled = run_tool({argv0, path}, true, cancel_env, 90000);
+    const long unchanged = field_long(cancelled.output, "REPLACE_UNCHANGED");
+    const long cancel_gap = field_long(cancelled.output, "REPLACE_GAP");
+    std::cout << "round7 throttled cancel unchanged=" << unchanged
+              << " gap_us=" << cancel_gap << "\n";
+    if (unchanged != 1) {
+      std::cerr << cancelled.output;
+    }
+    expect(cancelled.ok && unchanged == 1,
+           "throttled Replace All cancel leaves the buffer unchanged");
+    expect(cancel_gap >= 0 && cancel_gap < 2000000,
+           "throttled cancel is not stuck for seconds");
+    std::cout << "round7 throttled replace end\n";
+    (void)burn_user;
+  }
+
+  static int run_dnd_child(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    const char* display = g_getenv("DISPLAY");
+    if (display == nullptr || display[0] == '\0') {
+      std::cerr << "GUI tests require a display; refusing to skip\n";
+      return 1;
+    }
+    const char* want = g_getenv("LUNDUKE_EDIT_TEST_DND_PATH");
+    if (want == nullptr || want[0] == '\0') {
+      std::cerr << "dnd child needs a path\n";
+      return 2;
+    }
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    g_print("DND_CHILD_UP\n");
+    fflush(stdout);
+    g_setenv("LUNDUKE_EDIT_TEST", "1", TRUE);
+    if (g_getenv("GDK_BACKEND") == nullptr) {
+      g_setenv("GDK_BACKEND", "x11", FALSE);
+    }
+    Gsv::init();
+    auto app = Application::create();
+    struct DndWait {
+      Application* app;
+      std::string path;
+      bool printed{false};
+    };
+    auto* wait = new DndWait{app.get(), want, false};
+    g_timeout_add(50, +[](gpointer data) -> gboolean {
+      auto* state = static_cast<DndWait*>(data);
+      MainWindow* window = nullptr;
+      for (auto* candidate : state->app->get_windows()) {
+        window = dynamic_cast<MainWindow*>(candidate);
+        if (window != nullptr) {
+          break;
+        }
+      }
+      if (window == nullptr) {
+        return G_SOURCE_CONTINUE;
+      }
+      window->set_default_size(720, 480);
+      if (!state->printed && window->get_mapped() && window->get_window()) {
+        const unsigned long xid =
+            gdk_x11_window_get_xid(window->get_window()->gobj());
+        g_print("DND_EDIT xid=%lu\n", xid);
+        fflush(stdout);
+        state->printed = true;
+      }
+      if (window->file_path_ == state->path &&
+          window->buffer()->get_char_count() > 0) {
+        g_print("DND_OPENED\n");
+        fflush(stdout);
+        state->app->quit();
+        return G_SOURCE_REMOVE;
+      }
+      return G_SOURCE_CONTINUE;
+    }, wait);
+    g_timeout_add(20000, +[](gpointer data) -> gboolean {
+      auto* state = static_cast<DndWait*>(data);
+      g_print("DND_TIMEOUT\n");
+      fflush(stdout);
+      state->app->quit();
+      return G_SOURCE_REMOVE;
+    }, wait);
+    return app->run(argc, argv);
+  }
+
+  static std::string dnd_helper_path() {
+    const auto slash = argv0.find_last_of('/');
+    if (slash == std::string::npos) {
+      return "edit-dnd-source";
+    }
+    return argv0.substr(0, slash + 1) + "edit-dnd-source";
+  }
+
+  static bool command_ok(const std::string& cmd) {
+    const int rc = std::system(cmd.c_str());
+    return rc == 0;
+  }
+
+  static void test_xdnd(const std::string& dir) {
+    std::cout << "round7 xdnd begin\n";
+    if (access("/usr/bin/xdotool", X_OK) != 0 ||
+        access("/usr/bin/xfwm4", X_OK) != 0) {
+      expect(false, "XDND test needs xdotool and xfwm4 on PATH");
+      return;
+    }
+    const std::string helper = dnd_helper_path();
+    if (access(helper.c_str(), X_OK) != 0) {
+      expect(false, "XDND drag source was built next to the test binary");
+      return;
+    }
+    const std::string path = dir + "/xdnd-drop.txt";
+    write_bytes(path, "dropped file content\n");
+    // pgrep would see an xfwm4 on some other DISPLAY and skip this one.
+    // Start a manager here and wait until this screen advertises it.
+    if (std::system("xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1") !=
+        0) {
+      const pid_t wm = fork();
+      if (wm == 0) {
+        int fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) {
+          dup2(fd, STDOUT_FILENO);
+          dup2(fd, STDERR_FILENO);
+          if (fd > 2) {
+            close(fd);
+          }
+        }
+        execl("/usr/bin/xfwm4", "xfwm4", "--replace", static_cast<char*>(nullptr));
+        _exit(127);
+      }
+      for (int i = 0; i < 80; ++i) {
+        if (std::system(
+                "xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1") == 0) {
+          break;
+        }
+        g_usleep(50 * 1000);
+      }
+    }
+    expect(std::system(
+               "xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1") == 0,
+           "a window manager is running on this display for XDND");
+
+    bool opened = false;
+    for (int attempt = 0; attempt < 3 && !opened; ++attempt) {
+      const ToolRun editor = [&]() {
+        // The editor is started below together with the source; this
+        // placeholder keeps the attempt loop readable.
+        return ToolRun{};
+      }();
+      (void)editor;
+      int edit_fds[2];
+      int src_fds[2];
+      if (pipe(edit_fds) != 0 || pipe(src_fds) != 0) {
+        expect(false, "XDND pipes");
+        return;
+      }
+      const pid_t edit_pid = fork();
+      if (edit_pid == 0) {
+        dup2(edit_fds[1], STDOUT_FILENO);
+        dup2(edit_fds[1], STDERR_FILENO);
+        close(edit_fds[0]);
+        close(edit_fds[1]);
+        close(src_fds[0]);
+        close(src_fds[1]);
+        unset_inherited_test_env();
+        setenv("LUNDUKE_EDIT_TEST_DND_CHILD", "1", 1);
+        setenv("LUNDUKE_EDIT_TEST_DND_PATH", path.c_str(), 1);
+        setenv("LUNDUKE_EDIT_TEST", "1", 1);
+        // xdotool injects core XTest events. GTK3 listens to XInput2
+        // unless this is set, and those drags never reach the dest.
+        setenv("GDK_CORE_DEVICE_EVENTS", "1", 1);
+        execl(argv0.c_str(), argv0.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+      }
+      const pid_t src_pid = fork();
+      if (src_pid == 0) {
+        dup2(src_fds[1], STDOUT_FILENO);
+        dup2(src_fds[1], STDERR_FILENO);
+        close(src_fds[0]);
+        close(src_fds[1]);
+        close(edit_fds[0]);
+        close(edit_fds[1]);
+        setenv("DND_SOURCE_PATH", path.c_str(), 1);
+        setenv("GDK_CORE_DEVICE_EVENTS", "1", 1);
+        setenv("GDK_BACKEND", "x11", 1);
+        execl(helper.c_str(), helper.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+      }
+      close(edit_fds[1]);
+      close(src_fds[1]);
+      unsigned long edit_xid = 0;
+      unsigned long src_xid = 0;
+      std::string edit_pending;
+      std::string src_pending;
+      std::string edit_log;
+      std::string src_log;
+      bool edit_done = false;
+      const gint64 start = g_get_monotonic_time();
+      bool dragged = false;
+      while (!edit_done && (g_get_monotonic_time() - start) / 1000 < 20000) {
+        pollfd pfds[2];
+        pfds[0].fd = edit_fds[0];
+        pfds[0].events = POLLIN;
+        pfds[1].fd = src_fds[0];
+        pfds[1].events = POLLIN;
+        poll(pfds, 2, 100);
+        auto slurp = [](int fd, std::string& pending) {
+          char buf[512];
+          const ssize_t n = read(fd, buf, sizeof buf);
+          if (n > 0) {
+            pending.append(buf, static_cast<std::size_t>(n));
+          }
+        };
+        if (pfds[0].revents & (POLLIN | POLLHUP)) {
+          slurp(edit_fds[0], edit_pending);
+        }
+        if (pfds[1].revents & (POLLIN | POLLHUP)) {
+          slurp(src_fds[0], src_pending);
+        }
+        auto take_lines = [](std::string& pending, std::string& log,
+                             const char* key, unsigned long& xid) {
+          bool opened_now = false;
+          std::size_t nl = 0;
+          while ((nl = pending.find('\n')) != std::string::npos) {
+            const std::string line = pending.substr(0, nl);
+            pending.erase(0, nl + 1);
+            log += line;
+            log += '\n';
+            if (line.compare(0, std::strlen(key), key) == 0) {
+              std::sscanf(line.c_str() + std::strlen(key), "%lu", &xid);
+            }
+            if (line == "DND_OPENED") {
+              opened_now = true;
+            }
+          }
+          return opened_now;
+        };
+        if (take_lines(edit_pending, edit_log, "DND_EDIT xid=", edit_xid)) {
+          opened = true;
+          break;
+        }
+        take_lines(src_pending, src_log, "DND_READY xid=", src_xid);
+        if (!dragged && edit_xid != 0 && src_xid != 0) {
+          dragged = true;
+          command_ok("xdotool windowmove " + std::to_string(src_xid) + " 40 60");
+          command_ok("xdotool windowmove " + std::to_string(edit_xid) +
+                     " 420 60");
+          command_ok("xdotool windowraise " + std::to_string(edit_xid));
+          command_ok("xdotool windowraise " + std::to_string(src_xid));
+          g_usleep(200 * 1000);
+          command_ok("xdotool mousemove --window " + std::to_string(src_xid) +
+                     " 80 50");
+          g_usleep(100 * 1000);
+          command_ok("xdotool mousedown 1");
+          g_usleep(50 * 1000);
+          for (int step = 0; step < 8; ++step) {
+            command_ok("xdotool mousemove_relative --sync 6 0");
+            g_usleep(30 * 1000);
+          }
+          for (int step = 0; step < 25; ++step) {
+            command_ok("xdotool mousemove_relative --sync 16 4");
+            g_usleep(30 * 1000);
+          }
+          command_ok("xdotool mousemove --window " + std::to_string(edit_xid) +
+                     " --sync 200 180");
+          g_usleep(300 * 1000);
+          command_ok("xdotool mouseup 1");
+          g_usleep(500 * 1000);
+        }
+      }
+      kill(edit_pid, SIGKILL);
+      kill(src_pid, SIGKILL);
+      waitpid(edit_pid, nullptr, 0);
+      waitpid(src_pid, nullptr, 0);
+      close(edit_fds[0]);
+      close(src_fds[0]);
+      if (!opened) {
+        std::cerr << "xdnd attempt " << attempt << " edit=[" << edit_log
+                  << "] src=[" << src_log << "]\n";
+      }
+    }
+    expect(opened, "a real XDND text/uri-list drop opens the file");
+    std::cout << "round7 xdnd end\n";
   }
 
   static int run() {
@@ -4127,7 +5063,10 @@ struct EditChecks {
     test_round4(*app.get(), *w, dir, startup_face);
     test_round5(*app.get(), *w, dir);
     test_round6(*app.get(), *w, dir);
+    test_round7_status_and_replace(*w, dir);
     test_argv_large_open(dir);
+    test_throttled_replace(dir);
+    test_xdnd(dir);
 
     if (!font_path.empty()) {
       if (saved_font.empty()) {
@@ -4159,6 +5098,12 @@ std::string EditChecks::argv0;
 
 int main(int argc, char** argv) {
   lundukeedit::EditChecks::argv0 = (argc > 0 && argv[0] != nullptr) ? argv[0] : "";
+  if (g_getenv("LUNDUKE_EDIT_TEST_REPLACE_CHILD") != nullptr) {
+    return lundukeedit::EditChecks::run_replace_child(argc, argv);
+  }
+  if (g_getenv("LUNDUKE_EDIT_TEST_DND_CHILD") != nullptr) {
+    return lundukeedit::EditChecks::run_dnd_child(argc, argv);
+  }
   if (g_getenv("LUNDUKE_EDIT_TEST_ARGV_CHILD") != nullptr) {
     return lundukeedit::EditChecks::run_argv_child(argc, argv);
   }
