@@ -74,6 +74,7 @@ GtkTextLayout* text_view_layout(Gtk::TextView& view) {
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <exception>
 #include <fstream>
 #include <utility>
@@ -138,9 +139,13 @@ constexpr gsize kLoadReadBytes = 256u * 1024u;
 constexpr int kFindSliceChars = 64 * 1024;
 constexpr int kDefaultMaxFindHits = 10000;
 constexpr int kDefaultFindChunk = 200;
-// Wall-clock budget for one Replace All idle. Short enough that a
-// quarter-speed CPU still returns to the main loop inside half a second.
-constexpr gint64 kReplaceSliceUs = 25 * 1000;
+// Wall-clock budget for one idle slice. g_get_monotonic_time keeps
+// advancing while cpulimit has the process stopped, so a slice that
+// runs for a quarter of a second of CPU becomes a one-second stall.
+// Twelve milliseconds of wall time stays inside the unthrottled gap
+// and cannot be stretched to a full second at 25% CPU.
+constexpr gint64 kReplaceSliceUs = 12 * 1000;
+constexpr gint64 kLoadSliceUs = 12 * 1000;
 // Yield at least this often so a fast file still posts progress and
 // returns to the main loop. The time budget above still applies.
 constexpr int kReplaceSliceBytes = 256 * 1024;
@@ -1011,6 +1016,27 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   });
   text_view_.signal_draw().connect(
       sigc::mem_fun(*this, &MainWindow::on_text_view_draw), false);
+  // Before GtkSourceView's binding. A grouped undo of a multi-megabyte
+  // Replace All is one stack entry and one long replay; handle that
+  // entry here so the replay can yield.
+  text_view_.signal_key_press_event().connect([this](GdkEventKey* event) {
+    if (event == nullptr || !bulk_undo_armed_) {
+      return false;
+    }
+    const guint mods = event->state & gtk_accelerator_get_default_mod_mask();
+    const bool undo_key =
+        (mods & GDK_CONTROL_MASK) != 0 && (mods & GDK_SHIFT_MASK) == 0 &&
+        (event->keyval == GDK_KEY_z || event->keyval == GDK_KEY_Z);
+    if (!undo_key) {
+      return false;
+    }
+    start_bulk_undo();
+    return true;
+  }, false);
+  // A resize does not run GTK's first-validate idle again. Measure the
+  // new height here, before the expose that follows size-allocate.
+  text_view_.signal_size_allocate().connect_notify(
+      [this](Gtk::Allocation&) { prevalidate_viewport(); });
   // Undo/redo menu sensitivity must track GtkSourceView undo-manager state.
   // signal_changed() alone is unreliable (keyboard undo via View bindings,
   // and can-undo often notifies after changed). Use property notify + menu map.
@@ -1212,6 +1238,27 @@ struct MainWindow::LoadState {
   bool long_line{false};
   int insert_at{0};
   int expected_chars{0};
+  bool original_copied{false};
+  bool has_cr{false};
+  bool saw_nul{false};
+  bool saw_long{false};
+  bool norm_done{false};
+  std::size_t norm_at{0};
+  std::string norm_out;
+  std::string norm_cur;
+  std::size_t norm_crlf{0};
+  std::size_t norm_lf{0};
+  std::size_t norm_cr{0};
+  std::size_t norm_run{0};
+  bool text_ready{false};
+  std::size_t insert_byte{0};
+  bool insert_started{false};
+  bool insert_cleared{false};
+  int tag_at{0};
+  bool tagged{false};
+  std::size_t lines_at{0};
+  bool lines_ready{false};
+  bool draining{false};
   Glib::ustring previous_text;
   bool previous_modified{false};
   std::string previous_encoding;
@@ -1303,44 +1350,59 @@ void MainWindow::prevalidate_viewport() {
   }
   auto buf = text_view_.get_buffer();
   if (!buf || buf->begin() == buf->end()) {
+    validated_through_px_ = 0;
     return;
   }
   GtkTextLayout* layout = text_view_layout(text_view_);
-  if (layout == nullptr || gtk_text_layout_is_valid(layout)) {
+  if (layout == nullptr) {
     return;
+  }
+  if (gtk_text_layout_is_valid(layout)) {
+    validated_through_px_ = 1 << 28;
+    return;
+  }
+  // get_line_at_y clamps to the height measured so far, so a line that
+  // still has no height is reported as the last measured one. That made
+  // a window grown past the first allocation skip validation and walk
+  // every remaining line. The first line's own height is the reset.
+  int top_y = 0;
+  int top_height = 0;
+  text_view_.get_line_yrange(buf->begin(), top_y, top_height);
+  if (top_height <= 0) {
+    validated_through_px_ = 0;
   }
   Gdk::Rectangle vis;
   text_view_.get_visible_rect(vis);
-  int screen = vis.get_height();
-  if (screen < 64) {
-    screen = text_view_.get_allocated_height();
-  }
+  const int allocated = text_view_.get_allocated_height();
+  int screen = std::max(vis.get_height(), allocated);
   if (screen < 64) {
     screen = 480;
   }
-  // Validate past the clip. A y that lands exactly on the measured height
-  // makes get_line_at_y fall through to the end iterator, and GtkSourceView
-  // then highlights and walks every line.
-  const int bottom = vis.get_y() + screen;
-  Gtk::TextIter edge = buf->begin();
-  int line_top = 0;
-  text_view_.get_line_at_y(edge, std::max(bottom, 0), line_top);
-  int y = 0;
-  int height = 0;
-  text_view_.get_line_yrange(edge, y, height);
-  const int lines = buf->get_line_count();
-  const bool jumped =
-      lines > 50 && edge.get_line() >= lines - 2 && bottom < 100000;
-  if (height > 0 && !jumped) {
+  // gtk_text_view_size_allocate sets the pixel-cache extra to half the
+  // allocation. The expose clip is about that much taller than the
+  // window, and one unmeasured line makes get_lines walk the buffer.
+  const int extra = screen / 2;
+  const int slack = 512;
+  const int need =
+      std::max(0, vis.get_y()) + screen + extra + slack;
+  if (validated_through_px_ >= need) {
     return;
   }
-  int budget = screen + 256;
-  if (budget > 4000) {
-    budget = 4000;
+  int budget = need - validated_through_px_;
+  // A single call stays on the order of a tall screen. The cap is only
+  // a guard; the need above is what the following paint will touch.
+  if (budget > 16384) {
+    budget = 16384;
   }
   validating_layout_ = true;
   gtk_text_layout_validate(layout, budget);
   validating_layout_ = false;
+  if (gtk_text_layout_is_valid(layout) ||
+      validated_through_px_ > (1 << 28) - budget) {
+    validated_through_px_ = 1 << 28;
+  } else {
+    validated_through_px_ += budget;
+  }
 }
 
 bool MainWindow::on_text_view_draw(const Cairo::RefPtr<Cairo::Context>&) {
@@ -2467,67 +2529,212 @@ void MainWindow::on_load_chunk(const std::shared_ptr<LoadState>& state,
   schedule_load_read(state);
 }
 
-bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
-  if (!state || state->window != this || !state->active) {
-    return false;
+bool MainWindow::slice_load_drain(const std::shared_ptr<LoadState>& state,
+                                  gint64 t0) {
+  state->draining = true;
+  auto buf = buffer();
+  // Freeing a multi-million-line buffer in one erase is itself a stall,
+  // and the ping waiting on this idle would count it. Drop the text in
+  // short pieces while the view stays parked, then restore.
+  if (buf && state->mutated && buf->get_char_count() > 2000 && !view_parked_) {
+    park_document_view();
   }
-  if (state->cancel) {
-    abort_async_load(state);
-    return false;
+  if (buf && state->mutated && buf->get_char_count() > 2048) {
+    bool did = false;
+    while (buf->get_char_count() > 0) {
+      if (did && g_get_monotonic_time() - t0 > kLoadSliceUs) {
+        return true;
+      }
+      const int n = buf->get_char_count();
+      const int slice = std::min(1024, n);
+      buf->erase(buf->get_iter_at_offset(n - slice), buf->get_iter_at_offset(n));
+      did = true;
+    }
   }
-  if (!state->decoded) {
-    try {
+  abort_async_load(state);
+  return false;
+}
+
+bool MainWindow::slice_load_decode(const std::shared_ptr<LoadState>& state,
+                                   gint64 t0) {
+  auto expired = [&]() {
+    return g_get_monotonic_time() - t0 > kLoadSliceUs;
+  };
+  try {
+    if (!state->original_copied) {
       state->original = state->raw;
-      state->newlines = normalize_newlines(state->raw, state->kinds);
+      state->original_copied = true;
+      state->has_cr =
+          std::memchr(state->raw.data(), '\r', state->raw.size()) != nullptr;
+      state->saw_nul =
+          std::memchr(state->raw.data(), '\0', state->raw.size()) != nullptr;
+      if (state->saw_nul) {
+        fail_async_load(
+            state, "This file contains a null byte and cannot be opened as text.",
+            state->path);
+        return false;
+      }
+      state->norm_out.reserve(state->raw.size());
+      state->kinds.reserve(std::min(state->raw.size(), state->raw.size() / 4 + 2));
+      if (expired()) {
+        return true;
+      }
+    }
+    if (!state->norm_done) {
+      const std::string& raw = state->raw;
+      bool did = false;
+      while (state->norm_at < raw.size()) {
+        if (did && expired()) {
+          const std::size_t denom = std::max<std::size_t>(raw.size(), 1);
+          const int pct =
+              80 + static_cast<int>((state->norm_at * 8) / denom);
+          note_load_progress(std::min(pct, 87));
+          return true;
+        }
+        const std::size_t batch =
+            std::min(raw.size(), state->norm_at + static_cast<std::size_t>(16384));
+        if (!state->has_cr) {
+          state->norm_out.append(raw, state->norm_at, batch - state->norm_at);
+          for (std::size_t i = state->norm_at; i < batch; ++i) {
+            if (raw[i] == '\n') {
+              state->kinds.push_back('n');
+              ++state->norm_lf;
+              state->norm_run = 0;
+            } else if (++state->norm_run >=
+                       static_cast<std::size_t>(kLongLineChars)) {
+              state->saw_long = true;
+            }
+          }
+          state->norm_at = batch;
+        } else {
+          while (state->norm_at < batch) {
+            const char c = raw[state->norm_at];
+            if (c == '\r') {
+              if (state->norm_at + 1 < raw.size() &&
+                  raw[state->norm_at + 1] == '\n') {
+                ++state->norm_crlf;
+                state->norm_out.append(state->norm_cur);
+                state->norm_out.push_back('\n');
+                state->kinds.push_back('c');
+                state->norm_cur.clear();
+                state->norm_run = 0;
+                state->norm_at += 2;
+              } else {
+                ++state->norm_cr;
+                state->norm_out.append(state->norm_cur);
+                state->norm_out.push_back('\n');
+                state->kinds.push_back('r');
+                state->norm_cur.clear();
+                state->norm_run = 0;
+                ++state->norm_at;
+              }
+            } else if (c == '\n') {
+              ++state->norm_lf;
+              state->norm_out.append(state->norm_cur);
+              state->norm_out.push_back('\n');
+              state->kinds.push_back('n');
+              state->norm_cur.clear();
+              state->norm_run = 0;
+              ++state->norm_at;
+            } else {
+              state->norm_cur.push_back(c);
+              if (++state->norm_run >=
+                  static_cast<std::size_t>(kLongLineChars)) {
+                state->saw_long = true;
+              }
+              ++state->norm_at;
+            }
+          }
+        }
+        did = true;
+      }
+      if (!state->has_cr) {
+        if (state->norm_out.empty() || state->norm_out.back() != '\n') {
+          if (!state->norm_out.empty()) {
+            state->kinds.push_back(0);
+          }
+        }
+      } else if (!state->norm_cur.empty()) {
+        state->norm_out.append(state->norm_cur);
+        state->kinds.push_back(0);
+        state->norm_cur.clear();
+      }
+      state->newlines = NewlineStyle::Lf;
+      if (state->norm_crlf > 0 && state->norm_crlf >= state->norm_lf &&
+          state->norm_crlf >= state->norm_cr) {
+        state->newlines = NewlineStyle::Crlf;
+      } else if (state->norm_cr > 0 && state->norm_cr > state->norm_lf) {
+        state->newlines = NewlineStyle::Cr;
+      }
+      state->norm_done = true;
+      if (expired()) {
+        return true;
+      }
+    }
+    if (!state->text_ready) {
       if (prefer_utf8_) {
-        if (g_utf8_validate(state->raw.data(),
-                            static_cast<gssize>(state->raw.size()), nullptr)) {
-          state->text = Glib::ustring(state->raw);
+        // ustring's string constructor keeps invalid UTF-8 and does not
+        // throw, so a Latin-1 byte would be inserted as-is and the open
+        // would fail the character-count check.
+        if (g_utf8_validate(state->norm_out.data(),
+                            static_cast<gssize>(state->norm_out.size()),
+                            nullptr)) {
+          state->text = Glib::ustring(state->norm_out);
           state->encoding = "UTF-8";
         } else {
-          state->text = Glib::convert(state->raw, "UTF-8", "ISO-8859-1");
+          state->text = Glib::convert(state->norm_out, "UTF-8", "ISO-8859-1");
           state->encoding = "ISO-8859-1";
         }
       } else {
         const std::string charset =
             open_charset_.empty() ? "ISO-8859-1" : open_charset_;
-        state->text = Glib::convert(state->raw, "UTF-8", charset);
+        const std::string utf8 =
+            Glib::convert(state->norm_out, "UTF-8", charset);
+        state->text = utf8;
         state->encoding = charset;
       }
-    } catch (const Glib::ConvertError& err) {
-      fail_async_load(state, "Encoding error while opening.", err.what());
-      return false;
-    } catch (const std::bad_alloc&) {
-      fail_async_load(state, "Not enough memory to open this file.",
-                      state->path);
-      return false;
+      state->text_ready = true;
+      state->long_line = state->saw_long;
+      state->expected_chars = static_cast<int>(state->text.length());
+      if (text_contains_nul(state->text)) {
+        fail_async_load(
+            state, "This file contains a null byte and cannot be opened as text.",
+            state->path);
+        return false;
+      }
+      auto buf = buffer();
+      state->previous_text = buf ? buf->get_text() : Glib::ustring();
+      state->previous_modified = buf && buf->get_modified();
+      state->previous_encoding = encoding_;
+      state->previous_newlines = newline_style_;
+      state->raw.clear();
+      state->raw.shrink_to_fit();
+      state->norm_out.clear();
+      state->norm_out.shrink_to_fit();
+      state->norm_cur.clear();
+      state->decoded = true;
+      state->phase = LoadState::Phase::Insert;
+      note_load_progress(88);
     }
-    state->raw.clear();
-    state->raw.shrink_to_fit();
-    state->long_line =
-        has_long_line(state->text.data(), state->text.bytes(), kLongLineChars);
-    if (bytes_contain_nul(state->original) || text_contains_nul(state->text)) {
-      const std::string why =
-          "This file contains a null byte and cannot be opened as text.";
-      fail_async_load(state, why, state->path);
-      return false;
-    }
-    auto buf = buffer();
-    state->previous_text = buf->get_text();
-    state->previous_modified = buf->get_modified();
-    state->previous_encoding = encoding_;
-    state->previous_newlines = newline_style_;
-    state->expected_chars = static_cast<int>(state->text.length());
-    state->decoded = true;
-    state->phase = LoadState::Phase::Insert;
-    note_load_progress(88);
-    // The window is already mapped. Return so expose and Escape run
-    // before the buffer replace.
-    return true;
+  } catch (const Glib::ConvertError& err) {
+    fail_async_load(state, "Encoding error while opening.", err.what());
+    return false;
+  } catch (const std::bad_alloc&) {
+    fail_async_load(state, "Not enough memory to open this file.", state->path);
+    return false;
   }
+  // Escape and expose run before the buffer is filled.
+  return true;
+}
 
-  if (!state->inserted) {
-    auto buf = buffer();
+bool MainWindow::slice_load_insert(const std::shared_ptr<LoadState>& state,
+                                   gint64 t0) {
+  auto buf = buffer();
+  if (!buf) {
+    fail_async_load(state, "Not enough memory to open this file.", state->path);
+    return false;
+  }
+  if (!state->insert_started) {
     seeding_ = true;
     encoding_ = state->encoding;
     newline_style_ = state->newlines;
@@ -2537,58 +2744,211 @@ bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
     long_window_end_ = 0;
     clear_document_search_pins();
     clear_find_highlights();
-    // Detach before set_text. Chunked insert on an attached view made
-    // gtk_text_layout_validate shape every line on the main thread, so
-    // argv open never mapped a window on a slow CPU.
+    // Detach before inserting. An attached view shapes every new line
+    // before the next idle, which is the multi-second open stall.
     park_document_view();
     state->mutated = true;
     try {
       buf->begin_not_undoable_action();
       state->undo_open = true;
-      buf->set_text(state->text);
     } catch (const std::bad_alloc&) {
       fail_async_load(state, "Not enough memory to open this file.",
                       state->path);
       return false;
     }
-    state->inserted = true;
-    note_load_progress(94);
-    if (buf->get_char_count() != state->expected_chars) {
-      const std::string why =
-          "This file contains a null byte and cannot be opened as text.";
-      fail_async_load(state, why, state->path);
+    state->insert_started = true;
+  }
+  // The window already holds the previous document. Inserting at the end
+  // would append, and the character-count check would reject the open.
+  // Drop the old text in slices while the view is parked so a large
+  // buffer does not freeze the display before the new file appears.
+  if (!state->insert_cleared) {
+    bool did = false;
+    try {
+      while (buf->get_char_count() > 0) {
+        if (did && g_get_monotonic_time() - t0 > kLoadSliceUs) {
+          note_load_progress(88);
+          return true;
+        }
+        const int n = buf->get_char_count();
+        const int slice = std::min(32 * 1024, n);
+        auto end = buf->end();
+        auto start = end;
+        if (!start.backward_chars(slice)) {
+          start = buf->begin();
+        }
+        buf->erase(start, end);
+        did = true;
+      }
+    } catch (const std::bad_alloc&) {
+      fail_async_load(state, "Not enough memory to open this file.",
+                      state->path);
       return false;
     }
-    // Let Escape land before the view is attached. set_text does not
-    // return to the main loop on its own.
-    return true;
+    state->insert_cleared = true;
   }
-
-  if (buffer() && buffer()->get_char_count() != state->expected_chars) {
-    const std::string why =
-        "This file contains a null byte and cannot be opened as text.";
-    fail_async_load(state, why, state->path);
+  const char* data = state->text.data();
+  const std::size_t total = state->text.bytes();
+  bool did = false;
+  try {
+    while (state->insert_byte < total) {
+      if (did && g_get_monotonic_time() - t0 > kLoadSliceUs) {
+        const int pct =
+            88 + static_cast<int>((state->insert_byte * 6) /
+                                  std::max<std::size_t>(total, 1));
+        note_load_progress(std::min(pct, 93));
+        return true;
+      }
+      std::size_t n = std::min<std::size_t>(32u * 1024u, total - state->insert_byte);
+      while (n > 0 && state->insert_byte + n < total &&
+             (static_cast<unsigned char>(data[state->insert_byte + n]) & 0xC0) ==
+                 0x80) {
+        --n;
+      }
+      if (n == 0) {
+        n = 1;
+      }
+      // ustring(const char*, n) copies n characters, not n bytes, and
+      // reads past the slice when a character is more than one byte.
+      const Glib::ustring piece(data + state->insert_byte,
+                                data + state->insert_byte + n);
+      buf->insert(buf->end(), piece);
+      state->insert_byte += n;
+      did = true;
+    }
+  } catch (const std::bad_alloc&) {
+    fail_async_load(state, "Not enough memory to open this file.", state->path);
+    return false;
+  } catch (const Glib::ConvertError& err) {
+    fail_async_load(state, "Encoding error while opening.", err.what());
     return false;
   }
+  if (buf->get_char_count() != state->expected_chars) {
+    fail_async_load(
+        state, "This file contains a null byte and cannot be opened as text.",
+        state->path);
+    return false;
+  }
+  state->inserted = true;
+  note_load_progress(94);
+  return true;
+}
 
-  // Attach the buffer and yield before publishing the path. The expose
-  // that follows only shapes the screen prevalidate_viewport measured,
-  // and Escape in that gap still restores the previous text.
+bool MainWindow::slice_load_tag(const std::shared_ptr<LoadState>& state,
+                                gint64 t0) {
+  auto buf = buffer();
+  if (!font_tag_ || !buf || buf->begin() == buf->end()) {
+    state->tagged = true;
+    return true;
+  }
+  const int total = buf->get_char_count();
+  bool did = false;
+  while (state->tag_at < total) {
+    if (did && g_get_monotonic_time() - t0 > kLoadSliceUs) {
+      note_load_progress(95);
+      return true;
+    }
+    const int n = std::min(4096, total - state->tag_at);
+    const bool modified = buf->get_modified();
+    buf->apply_tag(font_tag_, buf->get_iter_at_offset(state->tag_at),
+                   buf->get_iter_at_offset(state->tag_at + n));
+    if (buf->get_modified() != modified) {
+      buf->set_modified(modified);
+    }
+    state->tag_at += n;
+    did = true;
+  }
+  state->tagged = true;
+  note_load_progress(95);
+  return true;
+}
+
+bool MainWindow::slice_load_lines(const std::shared_ptr<LoadState>& state,
+                                  gint64 t0) {
+  if (state->kinds.empty()) {
+    if (!state->text.empty()) {
+      remember_source_lines(state->text, state->kinds);
+    }
+    state->lines_ready = true;
+    return true;
+  }
+  if (state->lines_at == 0) {
+    source_lines_.clear();
+    source_lines_.reserve(state->kinds.size() + 1);
+  }
+  bool did = false;
+  while (state->lines_at < state->kinds.size()) {
+    if (did && g_get_monotonic_time() - t0 > kLoadSliceUs) {
+      note_load_progress(96);
+      return true;
+    }
+    const std::size_t end =
+        std::min(state->kinds.size(), state->lines_at + static_cast<std::size_t>(8192));
+    for (; state->lines_at < end; ++state->lines_at) {
+      SourceLine line;
+      line.kind = state->kinds[state->lines_at];
+      source_lines_.push_back(std::move(line));
+    }
+    did = true;
+  }
+  if (!source_lines_.empty() && source_lines_.back().kind != 0) {
+    SourceLine phantom;
+    phantom.kind = 0;
+    source_lines_.push_back(std::move(phantom));
+  }
+  state->lines_ready = true;
+  note_load_progress(96);
+  return true;
+}
+
+bool MainWindow::on_load_idle(const std::shared_ptr<LoadState>& state) {
+  if (!state || state->window != this || !state->active) {
+    return false;
+  }
+  const gint64 t0 = g_get_monotonic_time();
+  // Checked before every phase, including the one that publishes the
+  // filename. A key that arrives during a slice is handled on the next
+  // idle, which is why each slice stays on a short wall-clock budget.
+  if (state->cancel || state->draining) {
+    return slice_load_drain(state, t0);
+  }
+  if (!state->decoded) {
+    return slice_load_decode(state, t0);
+  }
+  if (state->cancel) {
+    return slice_load_drain(state, t0);
+  }
+  if (!state->inserted) {
+    return slice_load_insert(state, t0);
+  }
+  if (state->cancel) {
+    return slice_load_drain(state, t0);
+  }
+  if (!state->tagged) {
+    return slice_load_tag(state, t0);
+  }
+  if (state->cancel) {
+    return slice_load_drain(state, t0);
+  }
+  if (!state->lines_ready) {
+    return slice_load_lines(state, t0);
+  }
+  if (state->cancel) {
+    return slice_load_drain(state, t0);
+  }
+  // Attach after the per-line work. The expose measures the current
+  // window, including one that was resized or maximized while parked.
   if (!state->revealed) {
     if (auto buf = buffer()) {
       buf->place_cursor(buf->begin());
     }
-    // Tag while the view is still parked. Doing it after reattach
-    // invalidates every line and the next paint shapes the whole file.
-    apply_editor_font_tag();
-    note_load_progress(96);
     reveal_loaded_view();
     state->revealed = true;
+    note_load_progress(97);
     return true;
   }
   if (state->cancel) {
-    abort_async_load(state);
-    return false;
+    return slice_load_drain(state, t0);
   }
   if (!commit_loaded_text(state)) {
     fail_async_load(state, "Not enough memory to open this file.", state->path);
@@ -2613,7 +2973,11 @@ bool MainWindow::commit_loaded_text(const std::shared_ptr<LoadState>& state) {
     loaded_bytes_ = std::move(state->original);
     loaded_text_ = state->text;
     loaded_bytes_valid_ = true;
-    remember_source_lines(state->text, state->kinds);
+    // Line kinds are copied in idle slices before the view is attached.
+    // Doing it again here walked every line on the commit idle.
+    if (!state->lines_ready) {
+      remember_source_lines(state->text, state->kinds);
+    }
     state->text.clear();
     clear_ending_history();
     remember_file_identity(state->path);
@@ -2731,6 +3095,9 @@ void MainWindow::sync_overwrite_status() {
 }
 
 void MainWindow::update_bytes_status() {
+  if (bytes_frozen_) {
+    return;
+  }
   status_bytes_.set_text(format_bytes(cached_save_bytes()));
   sync_overwrite_status();
   status_enc_.set_text(encoding_ == "ISO-8859-1" ? "Latin-1" : encoding_);
@@ -2862,9 +3229,11 @@ void MainWindow::update_undo_redo_sensitivity() {
 }
 
 void MainWindow::on_buffer_changed() {
-  // A bulk load replaces the buffer in one set_text. Layout, the long-line
+  // A bulk load replaces the buffer in slices. Layout, the long-line
   // tag, and the status line run once after that, from commit_loaded_text.
-  if (seeding_) {
+  // A Replace All commit also fires this once per slice. Leaving it
+  // connected cleared "Replacing…" and published the half-applied size.
+  if (seeding_ || bytes_frozen_) {
     return;
   }
   // Dirty state follows the undo save point (signal_modified_changed),
@@ -2892,10 +3261,15 @@ void MainWindow::on_buffer_changed() {
   }
 }
 
-void MainWindow::on_modified_changed() { refresh_dirty_from_buffer(); }
+void MainWindow::on_modified_changed() {
+  if (bytes_frozen_) {
+    return;
+  }
+  refresh_dirty_from_buffer();
+}
 
 void MainWindow::refresh_dirty_from_buffer() {
-  if (seeding_) {
+  if (seeding_ || bytes_frozen_) {
     return;
   }
   auto buf = buffer();
@@ -3414,6 +3788,13 @@ bool MainWindow::on_key_release_event(GdkEventKey* event) {
 }
 
 void MainWindow::on_undo() {
+  if (bulk_undo_armed_) {
+    start_bulk_undo();
+    while (bulk_undo_running_) {
+      g_main_context_iteration(nullptr, TRUE);
+    }
+    return;
+  }
   auto buf = buffer();
   if (buf && buf->can_undo()) {
     buf->undo();
@@ -3421,6 +3802,127 @@ void MainWindow::on_undo() {
     update_undo_redo_sensitivity();
     update_status();
   }
+}
+
+void MainWindow::start_bulk_undo() {
+  if (!bulk_undo_armed_ || bulk_undo_running_) {
+    return;
+  }
+  auto buf = buffer();
+  if (!buf) {
+    bulk_undo_armed_ = false;
+    bulk_undo_old_.clear();
+    return;
+  }
+  bulk_undo_running_ = true;
+  bulk_undo_erased_ = false;
+  bulk_undo_at_ = 0;
+  if (bulk_undo_end_ < bulk_undo_start_) {
+    bulk_undo_end_ = bulk_undo_start_;
+  }
+  if (buf->get_line_count() > 400 && !view_parked_) {
+    park_document_view();
+  }
+  bytes_frozen_ = true;
+  ending_restore_ = true;
+  try {
+    buf->begin_not_undoable_action();
+  } catch (...) {
+  }
+  bulk_undo_idle_ = Glib::signal_idle().connect(
+      sigc::mem_fun(*this, &MainWindow::pump_bulk_undo), kResponsivePriority);
+}
+
+bool MainWindow::pump_bulk_undo() {
+  auto buf = buffer();
+  if (!buf || !bulk_undo_running_) {
+    finish_bulk_undo();
+    return false;
+  }
+  const gint64 t0 = g_get_monotonic_time();
+  auto expired = [&](bool did) {
+    return did && g_get_monotonic_time() - t0 > kLoadSliceUs;
+  };
+  if (!bulk_undo_erased_) {
+    bool did = false;
+    while (bulk_undo_end_ > bulk_undo_start_) {
+      if (expired(did)) {
+        return true;
+      }
+      // One GtkTextBuffer erase pays a large fixed cost. A few kilobytes
+      // keeps that cost inside the slice budget; 1024-character erases
+      // made a 12 MB undo take minutes.
+      const int slice = std::min(32 * 1024, bulk_undo_end_ - bulk_undo_start_);
+      const int from = bulk_undo_end_ - slice;
+      buf->erase(buf->get_iter_at_offset(from),
+                 buf->get_iter_at_offset(bulk_undo_end_));
+      bulk_undo_end_ = from;
+      did = true;
+    }
+    bulk_undo_erased_ = true;
+    if (expired(did)) {
+      return true;
+    }
+  }
+  bool did = false;
+  const std::string& old = bulk_undo_old_;
+  while (bulk_undo_at_ < old.size()) {
+    if (expired(did)) {
+      return true;
+    }
+    std::size_t n = std::min<std::size_t>(32u * 1024u, old.size() - bulk_undo_at_);
+    while (n > 0 && bulk_undo_at_ + n < old.size() &&
+           (static_cast<unsigned char>(old[bulk_undo_at_ + n]) & 0xC0) == 0x80) {
+      --n;
+    }
+    if (n == 0) {
+      n = 1;
+    }
+    const Glib::ustring piece(old.data() + bulk_undo_at_,
+                              old.data() + bulk_undo_at_ + n);
+    buf->insert(buf->get_iter_at_offset(bulk_undo_start_), piece);
+    bulk_undo_start_ += static_cast<int>(piece.length());
+    bulk_undo_at_ += n;
+    did = true;
+  }
+  finish_bulk_undo();
+  return false;
+}
+
+void MainWindow::finish_bulk_undo() {
+  auto buf = buffer();
+  if (buf) {
+    try {
+      buf->end_not_undoable_action();
+    } catch (...) {
+    }
+    const int levels = buf->get_max_undo_levels();
+    buf->set_max_undo_levels(0);
+    buf->set_max_undo_levels(levels);
+    if (bulk_undo_was_clean_) {
+      buf->set_modified(false);
+    }
+    buf->place_cursor(buf->get_iter_at_offset(
+        std::min(bulk_undo_start_, buf->get_char_count())));
+  }
+  ending_restore_ = false;
+  bytes_frozen_ = false;
+  bulk_undo_armed_ = false;
+  bulk_undo_running_ = false;
+  bulk_undo_old_.clear();
+  bulk_undo_old_.shrink_to_fit();
+  if (buf && !source_lines_.empty() &&
+      static_cast<int>(source_lines_.size()) != buf->get_line_count()) {
+    source_lines_.clear();
+    clear_ending_history();
+  }
+  if (view_parked_) {
+    unpark_document_view();
+  }
+  refresh_dirty_from_buffer();
+  update_undo_redo_sensitivity();
+  update_status();
+  bulk_undo_idle_.disconnect();
 }
 
 void MainWindow::on_redo() {
@@ -4597,6 +5099,7 @@ void MainWindow::end_find_user_action() {
 }
 
 void MainWindow::cancel_find_scan() {
+  bytes_frozen_ = false;
   const bool rollback = (find_scan_.user_action_open || find_scan_.commit_applied) &&
                         find_scan_.kind == FindScan::Kind::ReplaceAll;
   const bool parked = find_scan_.commit_parked;
@@ -4606,13 +5109,23 @@ void MainWindow::cancel_find_scan() {
   end_find_user_action();
   if (rollback) {
     if (auto buf = buffer()) {
-      if (buf->can_undo()) {
+      const bool slice_it =
+          find_scan_.commit_started && find_scan_.hay.size() >= 32u * 1024u;
+      if (slice_it) {
+        bulk_undo_old_ = std::move(find_scan_.hay);
+        bulk_undo_start_ = find_scan_.replace_start;
+        bulk_undo_end_ = find_scan_.commit_off;
+        bulk_undo_armed_ = true;
+        start_bulk_undo();
+      } else if (buf->can_undo()) {
         buf->undo();
       }
     }
-    refresh_dirty_from_buffer();
+    if (!bulk_undo_running_) {
+      refresh_dirty_from_buffer();
+    }
   }
-  if (parked && view_parked_) {
+  if (parked && view_parked_ && !bulk_undo_running_) {
     unpark_document_view();
   }
   find_scan_.commit_parked = false;
@@ -4653,6 +5166,7 @@ bool MainWindow::confirm_huge_undo(std::size_t bytes) {
                      : static_cast<Gtk::Window&>(*this),
       "Replace All would store a very large undo record.", false,
       Gtk::MESSAGE_QUESTION, Gtk::BUTTONS_NONE, true);
+  dlg.set_title("Replace All would store a very large undo record.");
   dlg.set_secondary_text(
       "Continuing keeps about " + format_bytes(bytes) +
       " so the replacement can be undone. Continue?");
@@ -4712,6 +5226,7 @@ void MainWindow::finish_find_scan(bool show_result) {
           "Replaced " + std::to_string(count) +
               (count == 1 ? " occurrence." : " occurrences."),
           false, Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK, true);
+      info.set_title("Replace All");
       run_modal(app_, info);
     }
   }
@@ -4960,7 +5475,7 @@ bool MainWindow::pump_replace() {
         find_scan_.started = false;
         find_scan_.cursor_off = 0;
         find_scan_.count = 0;
-        if (estimated >= limit && limit > 0) {
+        if (estimated >= limit && limit > 0 && !find_scan_.huge_confirmed) {
           find_idle_.disconnect();
           if (!confirm_huge_undo(estimated) || find_scan_.cancel) {
             finish_find_scan(false);
@@ -4975,7 +5490,8 @@ bool MainWindow::pump_replace() {
       }
       find_scan_.undo_bytes += per;
       ++find_scan_.count;
-      if (find_scan_.undo_bytes >= limit && limit > 0) {
+      if (find_scan_.undo_bytes >= limit && limit > 0 &&
+          !find_scan_.huge_confirmed) {
         const std::size_t estimated = find_scan_.undo_bytes;
         find_scan_.counting = false;
         find_scan_.started = false;
@@ -5168,6 +5684,10 @@ bool MainWindow::pump_replace_commit() {
     find_scan_.commit_applied = true;
     find_scan_.commit_off = find_scan_.replace_end;
     find_scan_.commit_byte = 0;
+    bulk_undo_was_clean_ = !buf->get_modified();
+    // The view is parked on the scratch buffer. Freeze the status so
+    // the slices do not flash an empty document or a partial size.
+    bytes_frozen_ = true;
     set_replace_progress(96);
   }
 
@@ -5184,7 +5704,7 @@ bool MainWindow::pump_replace_commit() {
         set_replace_progress(96);
         return true;
       }
-      const int slice = std::min(4096, find_scan_.commit_off - target);
+      const int slice = std::min(1024, find_scan_.commit_off - target);
       const int from = find_scan_.commit_off - slice;
       buf->erase(buf->get_iter_at_offset(from),
                  buf->get_iter_at_offset(find_scan_.commit_off));
@@ -5212,7 +5732,7 @@ bool MainWindow::pump_replace_commit() {
         return true;
       }
       std::size_t n =
-          std::min<std::size_t>(8u * 1024u, built.size() - find_scan_.commit_byte);
+          std::min<std::size_t>(4u * 1024u, built.size() - find_scan_.commit_byte);
       while (n > 0 && find_scan_.commit_byte + n < built.size() &&
              (static_cast<unsigned char>(built[find_scan_.commit_byte + n]) &
               0xC0) == 0x80) {
@@ -5221,7 +5741,8 @@ bool MainWindow::pump_replace_commit() {
       if (n == 0) {
         n = 1;
       }
-      const Glib::ustring piece(built.data() + find_scan_.commit_byte, n);
+      const Glib::ustring piece(built.data() + find_scan_.commit_byte,
+                                built.data() + find_scan_.commit_byte + n);
       buf->insert(buf->get_iter_at_offset(find_scan_.commit_off), piece);
       find_scan_.commit_off += static_cast<int>(piece.length());
       find_scan_.commit_byte += n;
@@ -5234,25 +5755,74 @@ bool MainWindow::pump_replace_commit() {
     }
   }
 
+  if (!find_scan_.commit_lines_noted) {
+    const bool keep =
+        find_scan_.commit_keep &&
+        static_cast<int>(find_scan_.commit_kinds.size()) == buf->get_line_count();
+    if (!keep) {
+      if (!source_lines_.empty()) {
+        source_lines_.clear();
+        clear_ending_history();
+      }
+      find_scan_.commit_lines_noted = true;
+    } else {
+      if (find_scan_.commit_line_at == 0) {
+        source_lines_.clear();
+        source_lines_.reserve(find_scan_.commit_kinds.size() + 1);
+      }
+      bool noted = false;
+      const auto& kinds = find_scan_.commit_kinds;
+      while (find_scan_.commit_line_at < kinds.size()) {
+        if (noted && g_get_monotonic_time() - slice_start > kReplaceSliceUs) {
+          set_replace_progress(99);
+          return true;
+        }
+        const std::size_t end = std::min(
+            kinds.size(), find_scan_.commit_line_at + static_cast<std::size_t>(8192));
+        for (; find_scan_.commit_line_at < end; ++find_scan_.commit_line_at) {
+          SourceLine line;
+          line.kind = kinds[find_scan_.commit_line_at];
+          source_lines_.push_back(std::move(line));
+        }
+        noted = true;
+      }
+      if (!source_lines_.empty() && source_lines_.back().kind != 0) {
+        SourceLine phantom;
+        phantom.kind = 0;
+        source_lines_.push_back(std::move(phantom));
+      }
+      find_scan_.commit_lines_noted = true;
+      if (slice_expired(noted)) {
+        set_replace_progress(99);
+        return true;
+      }
+    }
+  }
+
   ending_restore_ = false;
   end_find_user_action();
   set_replace_progress(100);
-  if (find_scan_.commit_keep &&
-      static_cast<int>(find_scan_.commit_kinds.size()) == buf->get_line_count()) {
-    remember_source_lines({}, find_scan_.commit_kinds);
-  } else if (!source_lines_.empty()) {
-    source_lines_.clear();
-    clear_ending_history();
-  }
   const int caret = std::min(find_scan_.replace_start, buf->get_char_count());
   buf->place_cursor(buf->get_iter_at_offset(caret));
+  // Unpark while the status is still held, so the attach cannot publish
+  // a cleared label or a size from a buffer the user has not seen yet.
   if (find_scan_.commit_parked && view_parked_) {
     unpark_document_view();
   }
+  bytes_frozen_ = false;
   find_scan_.commit_parked = false;
   find_scan_.commit_applied = false;
+  // Replaying this user action is one multi-hundred-millisecond call.
+  // Keep the old span and restore it in slices when Undo is pressed.
+  if (find_scan_.hay.size() >= 32u * 1024u) {
+    bulk_undo_old_ = std::move(find_scan_.hay);
+    bulk_undo_start_ = find_scan_.replace_start;
+    bulk_undo_end_ = find_scan_.commit_off;
+    bulk_undo_armed_ = true;
+  }
   clear_find_highlights();
   update_undo_redo_sensitivity();
+  refresh_dirty_from_buffer();
   update_status();
   return false;
 }
@@ -5521,6 +6091,22 @@ void MainWindow::start_replace_all(const FindOptions& opts,
   // Visible before the first idle, including the counting pass, which
   // used to run to completion with an empty status line.
   set_replace_progress(0);
+  // The precise count walks the buffer with text iterators and only then
+  // raised the dialog, several seconds after the click. Ask first, from
+  // the worst case (every needle-sized slice is a hit). The counting
+  // pass still runs, and it does not ask a second time.
+  if (maybe_huge) {
+    std::size_t estimate = std::numeric_limits<std::size_t>::max();
+    if (per == 0 || max_matches <= estimate / per) {
+      estimate = max_matches * per;
+    }
+    if (!confirm_huge_undo(estimate)) {
+      find_scan_.cancel = true;
+      finish_find_scan(false);
+      return;
+    }
+    find_scan_.huge_confirmed = true;
+  }
   find_idle_ = Glib::signal_idle().connect(
       sigc::mem_fun(*this, &MainWindow::on_find_idle), kResponsivePriority);
 }
