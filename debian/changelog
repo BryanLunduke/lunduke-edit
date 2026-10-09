@@ -1,5 +1,11 @@
 lunduke-edit (0.9-11) unstable; urgency=medium
 
+  * Replace All no longer erases the open document a slice at a time.
+    The new text is built in a detached buffer, in slices bounded by
+    wall-clock time, then swapped in as one undo step. Highlighting,
+    bracket matching, and search highlighting stay off during that
+    swap. The title drops "Replacing… 100%" when the commit ends, so
+    it is not still showing while the result dialog is open.
   * Opening a large file stores heights for one screen before
     GtkSourceView paints, so the main loop keeps handling Escape and
     moving the window until the file is fully open. A full-buffer

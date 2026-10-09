@@ -354,6 +354,18 @@ private:
     std::vector<char> commit_kinds;
     bool commit_lines_noted{false};
     std::size_t commit_line_at{0};
+    // The replacement is inserted into a detached buffer. The document
+    // buffer is swapped once, after that text is complete.
+    bool commit_swapped{false};
+    bool commit_hook_paused{false};
+    int commit_prefix_off{0};
+    int commit_suffix_off{0};
+    std::size_t commit_prefix_bytes{0};
+    std::size_t commit_suffix_bytes{0};
+    std::size_t commit_prefix_nl{0};
+    std::size_t commit_suffix_nl{0};
+    std::size_t commit_run{0};
+    bool commit_saw_long{false};
   };
 
   struct LoadState;
@@ -363,6 +375,17 @@ private:
   // GtkTextView does not shape every line before the window can paint.
   void park_document_view();
   void unpark_document_view();
+  void connect_document_signals();
+  void disconnect_document_signals();
+  void release_document_marks();
+  // Point the window at a different document buffer. Signals, tags, and
+  // search marks move with it. The view is updated only when it is showing
+  // the document; a parked view keeps the scratch buffer.
+  void adopt_document_buffer(const Glib::RefPtr<Gsv::Buffer>& neu);
+  void suspend_source_features();
+  void restore_source_features();
+  void discard_commit_swap();
+  bool insert_commit_piece(const Glib::ustring& piece);
   void update_load_status();
   bool start_async_load(const std::string& path);
   void pump_async_load();
@@ -395,6 +418,11 @@ private:
   // The document. The view shows this except while a load parks it.
   Glib::RefPtr<Gsv::Buffer> doc_buffer_;
   Glib::RefPtr<Gsv::Buffer> scratch_buffer_;
+  // Detached buffer that receives a Replace All commit. Not shown.
+  Glib::RefPtr<Gsv::Buffer> commit_swap_buffer_;
+  Glib::RefPtr<Gtk::TextTag> commit_swap_font_;
+  bool commit_swap_undo_open_{false};
+  std::vector<sigc::connection> doc_conns_;
   bool view_parked_{false};
   // The next expose of a just-attached large buffer must measure the
   // visible lines before GtkSourceView walks them.
@@ -422,7 +450,20 @@ private:
   int bulk_undo_end_{0};
   std::size_t bulk_undo_at_{0};
   std::string bulk_undo_old_;
+  // The document from before a swapped Replace All. Undo puts it back.
+  Glib::RefPtr<Gsv::Buffer> bulk_undo_buffer_;
+  bool bulk_undo_blocked_{false};
+  std::size_t bulk_undo_utf8_{0};
+  std::size_t bulk_undo_newlines_{0};
+  std::vector<char> bulk_undo_kinds_;
+  bool bulk_undo_had_lines_{false};
+  std::vector<std::vector<char>> bulk_undo_ending_undo_;
+  std::vector<std::vector<char>> bulk_undo_ending_redo_;
   sigc::connection bulk_undo_idle_;
+  bool source_features_suspended_{false};
+  bool saved_highlight_syntax_{true};
+  bool saved_highlight_brackets_{true};
+  sigc::connection source_feature_idle_;
   void start_bulk_undo();
   bool pump_bulk_undo();
   void finish_bulk_undo();

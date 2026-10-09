@@ -6327,6 +6327,10 @@ struct EditChecks {
          ProdGeom::Tall, short_path.c_str(), "row", "ROW"},
         {"replace-escape-cpulimit", true, true, true, 1000.0, 240000, 80.0,
          40.0, ProdGeom::Default, replace_path.c_str(), "line ", "row "},
+        // Same bounds as replace-work-tall-cpulimit. CI runs it once.
+        // LUNDUKE_EDIT_PROD_STRESS repeats it; the local gate uses 10.
+        {"replace-work-tall-stress", true, true, false, 1000.0, 300000, 0, 0,
+         ProdGeom::Tall, replace_path.c_str(), "line ", "row "},
     };
 
     const char* only = g_getenv("LUNDUKE_EDIT_PROD_FILTER");
@@ -6334,6 +6338,16 @@ struct EditChecks {
       if (only != nullptr && std::strstr(leg.name, only) == nullptr) {
         continue;
       }
+      int repeats = 1;
+      if (std::strcmp(leg.name, "replace-work-tall-stress") == 0) {
+        if (const char* n = g_getenv("LUNDUKE_EDIT_PROD_STRESS")) {
+          repeats = std::atoi(n);
+          if (repeats < 1) {
+            repeats = 1;
+          }
+        }
+      }
+      for (int rep = 0; rep < repeats; ++rep) {
       if (leg.throttle && !have_cpulimit) {
         expect(false, "production stall test requires /usr/bin/cpulimit");
         std::cout << "production " << leg.name << " cpulimit missing\n";
@@ -6416,6 +6430,12 @@ struct EditChecks {
                "Escape during Replace All is pressed while it is still running");
         expect(!stats.dirty, "Escape during Replace All leaves the buffer clean");
       }
+      if (repeats > 1) {
+        std::cout << "production " << leg.name << " rep=" << (rep + 1)
+                  << "/" << repeats << " max_gap_ms=" << stats.max_gap_ms
+                  << "\n";
+      }
+    }
     }
     std::cout << "production responsiveness end\n";
   }
