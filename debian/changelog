@@ -1,5 +1,11 @@
 lunduke-edit (0.9-11) unstable; urgency=medium
 
+  * Replace All is one step in the normal undo and redo history. Typing
+    before or after it undoes in that order, and redo puts the
+    replacement back. The modified star follows the last save, so undo
+    after saving the replacement marks the file dirty and the next save
+    writes the original text. Cancelling before the swap leaves the
+    buffer and the undo stack unchanged.
   * Replace All no longer erases the open document a slice at a time.
     The new text is built in a detached buffer, in slices bounded by
     wall-clock time, then swapped in as one undo step. Highlighting,
@@ -27,8 +33,8 @@ lunduke-edit (0.9-11) unstable; urgency=medium
   * Replace All keeps "Replacing… N%" and the previous size on screen
     until the new text is swapped in, and asks about a very large undo
     record before the counting pass.
-  * Undo of a large Replace All restores the previous text in short
-    slices, so that one step does not freeze the main loop.
+  * Undo and redo of a large Replace All swap the previous document
+    back in one step, so that step does not freeze the main loop.
   * Cancelling Replace All — from the large-undo question, before the
     swap, or during the swap — leaves the buffer unmodified and does
     not mark it dirty. The stall test delivers Escape to the Find

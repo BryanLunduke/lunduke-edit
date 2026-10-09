@@ -201,6 +201,9 @@ private:
   // Edit
   void on_undo();
   void on_redo();
+  // Gtk undo on the current buffer, or one Replace All buffer swap.
+  bool can_edit_undo();
+  bool can_edit_redo();
   void on_cut();
   void on_copy();
   void on_paste();
@@ -437,36 +440,47 @@ private:
   // Replace All's commit rewrites the document off-screen. Status and the
   // byte count stay put until the swap finishes.
   bool bytes_frozen_{false};
-  // A large Replace All is one undo step, but replaying that step in one
-  // call freezes the main loop. The old span is restored in idle slices.
-  bool bulk_undo_armed_{false};
-  bool bulk_undo_running_{false};
-  bool bulk_undo_erased_{false};
-  bool bulk_undo_was_clean_{false};
-  // Set when this restore is rolling back a cancelled Replace All, so the
-  // title can say so until the previous text is back.
-  bool bulk_undo_from_cancel_{false};
-  int bulk_undo_start_{0};
-  int bulk_undo_end_{0};
-  std::size_t bulk_undo_at_{0};
-  std::string bulk_undo_old_;
-  // The document from before a swapped Replace All. Undo puts it back.
-  Glib::RefPtr<Gsv::Buffer> bulk_undo_buffer_;
-  bool bulk_undo_blocked_{false};
-  std::size_t bulk_undo_utf8_{0};
-  std::size_t bulk_undo_newlines_{0};
-  std::vector<char> bulk_undo_kinds_;
-  bool bulk_undo_had_lines_{false};
-  std::vector<std::vector<char>> bulk_undo_ending_undo_;
-  std::vector<std::vector<char>> bulk_undo_ending_redo_;
-  sigc::connection bulk_undo_idle_;
+  // One Replace All is one entry beside GtkSourceUndoManager, not a
+  // change inside it. The entry swaps document buffers. Edits made on a
+  // buffer stay in that buffer's own undo manager, so typing after a
+  // replace is undone before the swap, and redo walks back the same way.
+  struct DocGeneration {
+    Glib::RefPtr<Gsv::Buffer> buffer;
+    std::size_t utf8_bytes{0};
+    std::size_t newline_count{0};
+    bool had_lines{false};
+    bool long_line{false};
+    std::vector<char> kinds;
+    std::vector<std::vector<char>> ending_undo;
+    std::vector<std::vector<char>> ending_redo;
+  };
+  std::vector<DocGeneration> hist_undo_;
+  std::vector<DocGeneration> hist_redo_;
+  DocGeneration staged_replace_;
+  bool staged_replace_ready_{false};
+  // Set while undo, redo, or a swap runs, so a nested user-action does
+  // not clear the redo stack those calls are walking.
+  bool history_replay_{false};
+  // Buffer that was current the last time the document matched disk.
+  // Gtk's modified flag is authoritative only on this object.
+  Glib::RefPtr<Gsv::Buffer> save_buffer_;
+  void stage_replace_undo();
+  void remember_replace_undo(const Glib::RefPtr<Gsv::Buffer>& previous);
+  void discard_staged_replace();
+  // Cancel before the swap. Put line notes and the ending stacks back
+  // to the snapshot taken when the commit started.
+  void abandon_staged_replace();
+  void drop_redo_generations();
+  void drop_swap_history();
+  DocGeneration capture_generation();
+  void install_generation(DocGeneration& frame);
+  void swap_generations(std::vector<DocGeneration>& from,
+                        std::vector<DocGeneration>& onto);
+  void finish_history_step();
   bool source_features_suspended_{false};
   bool saved_highlight_syntax_{true};
   bool saved_highlight_brackets_{true};
   sigc::connection source_feature_idle_;
-  void start_bulk_undo();
-  bool pump_bulk_undo();
-  void finish_bulk_undo();
   bool follow_caret_{false};
   bool adjusting_scroll_{false};
   int follow_caret_spins_{0};

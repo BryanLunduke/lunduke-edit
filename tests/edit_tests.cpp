@@ -4405,8 +4405,7 @@ struct EditChecks {
   }
 
   static void settle_cancel(MainWindow& w, bool& saw) {
-    for (int i = 0; i < 400000 && (w.find_scan_.active || w.bulk_undo_running_);
-         ++i) {
+    for (int i = 0; i < 400000 && w.find_scan_.active; ++i) {
       g_main_context_iteration(nullptr, false);
       note_dirty(w, saw);
     }
@@ -4719,10 +4718,10 @@ struct EditChecks {
     expect(done_steps >= 2, "a finished Replace All posted progress");
     expect(replace_gap < 500000, "a finished Replace All stays responsive");
     expect(w.find_scan_.max_slice_us < 500000, "the commit slice stays short");
-    expect(w.buffer()->can_undo(), "Replace All is one undo step");
+    expect(w.can_edit_undo(), "Replace All is one undo step");
     w.on_undo();
     expect(w.buffer()->get_text() == original, "one undo restores Replace All");
-    expect(!w.buffer()->can_undo(), "Replace All did not push a second undo");
+    expect(!w.can_edit_undo(), "Replace All did not push a second undo");
     {
       auto iter = w.buffer()->get_iter_at_mark(w.buffer()->get_insert());
       const std::string want =
@@ -4991,11 +4990,24 @@ struct EditChecks {
     if (cancel) {
       g_print("REPLACE_UNCHANGED %d\n",
               w->buffer()->get_text() == original ? 1 : 0);
+    } else if (g_getenv("LUNDUKE_EDIT_TEST_HISTORY_GAP") != nullptr) {
+      const Glib::ustring replaced = w->buffer()->get_text();
+      const gint64 undo_t0 = g_get_monotonic_time();
+      w->on_undo();
+      const long undo_us = static_cast<long>(g_get_monotonic_time() - undo_t0);
+      const bool back = w->buffer()->get_text() == original;
+      const gint64 redo_t0 = g_get_monotonic_time();
+      w->on_redo();
+      const long redo_us = static_cast<long>(g_get_monotonic_time() - redo_t0);
+      const bool forward = w->buffer()->get_text() == replaced;
+      g_print("HISTORY_UNDO_US %ld\n", undo_us);
+      g_print("HISTORY_REDO_US %ld\n", redo_us);
+      g_print("HISTORY_ROUNDTRIP %d\n", (back && forward) ? 1 : 0);
     } else {
       const bool changed = w->buffer()->get_text() != original;
       w->on_undo();
       const bool restored = w->buffer()->get_text() == original;
-      const bool single = !w->buffer()->can_undo();
+      const bool single = !w->can_edit_undo();
       g_print("REPLACE_UNDO %d\n", (changed && restored && single) ? 1 : 0);
     }
     struct rusage before {};
@@ -5769,7 +5781,10 @@ struct EditChecks {
     bool dirty{false};
     bool escaped{false};
     bool undo_ok{false};
+    bool redo_ok{false};
     bool apply_seen{false};
+    double undo_gap_ms{0};
+    double redo_gap_ms{0};
     int pings{0};
     int max_height{0};
   };
@@ -5875,7 +5890,7 @@ struct EditChecks {
                                     bool cancel, double gap_limit_ms,
                                     int deadline_ms, double escape_after_ms,
                                     ProdGeom geom, const char* needle,
-                                    const char* replacement) {
+                                    const char* replacement, bool redo_after) {
     ProdStats stats;
     const gint64 start = g_get_monotonic_time();
     Window editor = 0;
@@ -5886,6 +5901,9 @@ struct EditChecks {
     bool undo_sent = false;
     int undo_tries = 0;
     gint64 last_undo_key = 0;
+    bool redo_sent = false;
+    int redo_tries = 0;
+    gint64 last_redo_key = 0;
     int escape_sends = 0;
     bool shaped = false;
     bool shaped_late = false;
@@ -6035,6 +6053,12 @@ struct EditChecks {
       }
       if (keys_sent && rtt > stats.replace_gap_ms) {
         stats.replace_gap_ms = rtt;
+      }
+      if (undo_sent && !stats.undo_ok && rtt > stats.undo_gap_ms) {
+        stats.undo_gap_ms = rtt;
+      }
+      if (redo_sent && !stats.redo_ok && rtt > stats.redo_gap_ms) {
+        stats.redo_gap_ms = rtt;
       }
       const std::string title = probe.title_of(editor);
       const bool has_file = title.find(base) != std::string::npos;
@@ -6197,6 +6221,29 @@ struct EditChecks {
       }
       if (undo_sent && !has_star && has_file) {
         stats.undo_ok = true;
+        if (!redo_after) {
+          stats.done_ms = elapsed_ms();
+          break;
+        }
+        if (!redo_sent) {
+          const std::string id =
+              std::to_string(static_cast<unsigned long>(editor));
+          xdotool_cmd("mousemove --window " + id + " 280 200 click 1");
+          send_key(probe, editor, "ctrl+y");
+          redo_sent = true;
+          last_redo_key = g_get_monotonic_time();
+          ++redo_tries;
+          continue;
+        }
+      }
+      if (redo_sent && !has_star && redo_tries < 6 &&
+          g_get_monotonic_time() - last_redo_key > 400000) {
+        send_key(probe, editor, "ctrl+shift+z");
+        last_redo_key = g_get_monotonic_time();
+        ++redo_tries;
+      }
+      if (redo_sent && has_star && has_file) {
+        stats.redo_ok = true;
         stats.done_ms = elapsed_ms();
         break;
       }
@@ -6215,6 +6262,484 @@ struct EditChecks {
       out.write(piece.data(), static_cast<std::streamsize>(n));
       wrote += n;
     }
+  }
+
+  static bool prod_child_alive(pid_t pid) {
+    int status = 0;
+    return waitpid(pid, &status, WNOHANG) == 0;
+  }
+
+  static bool prod_title_has_star(const std::string& title) {
+    return title.find(" *") != std::string::npos;
+  }
+
+  static void prod_focus(ProdProbe& probe, Window editor) {
+    if (editor == 0 || probe.dpy == nullptr) {
+      return;
+    }
+    // A click in the same place as the last one is a double or triple
+    // click and selects a word or a line. Later Ctrl+Z then undoes that
+    // selection instead of the keystrokes. Move the caret with the
+    // keyboard.
+    XRaiseWindow(probe.dpy, editor);
+    XSetInputFocus(probe.dpy, editor, RevertToParent, CurrentTime);
+    XFlush(probe.dpy);
+  }
+
+  static void prod_type_text(ProdProbe& probe, Window editor, const char* text,
+                             bool at_end) {
+    prod_focus(probe, editor);
+    send_key(probe, editor, at_end ? "ctrl+End" : "ctrl+Home");
+    poll(nullptr, 0, 40);
+    xdotool_cmd(std::string("type --delay 30 --clearmodifiers ") + text);
+    poll(nullptr, 0, 80);
+  }
+
+  static void prod_note(const char* step, const std::string& title,
+                        const std::string& path) {
+    const std::string bytes = read_bytes(path);
+    std::string head = bytes.substr(0, std::min<std::size_t>(bytes.size(), 48));
+    for (char& c : head) {
+      if (c == '\n') {
+        c = '/';
+      }
+    }
+    std::cerr << "step " << step << " title=[" << title << "] bytes="
+              << bytes.size() << " head=[" << head << "]\n";
+  }
+
+  static bool prod_wait(ProdProbe& probe, pid_t pid, Window editor, int ms,
+                        const std::function<bool(const std::string&)>& pred,
+                        std::string& title) {
+    const gint64 t0 = g_get_monotonic_time();
+    while (static_cast<int>((g_get_monotonic_time() - t0) / 1000) < ms) {
+      if (!prod_child_alive(pid)) {
+        return false;
+      }
+      if (Window undo = probe.find_related(editor, "very large undo")) {
+        send_key(probe, undo, "alt+r");
+        poll(nullptr, 0, 40);
+      }
+      title = probe.title_of(editor);
+      if (pred(title)) {
+        return true;
+      }
+      poll(nullptr, 0, 20);
+    }
+    title = probe.title_of(editor);
+    return pred(title);
+  }
+
+  // Replace All through the real dialog, then dismiss the result.
+  static bool prod_replace_all(ProdProbe& probe, pid_t pid, Window editor,
+                               std::string& title) {
+    bool armed = false;
+    // A document that was already dirty still has a star. That is not
+    // proof the replacement finished.
+    bool saw_replace = false;
+    const gint64 t0 = g_get_monotonic_time();
+    while (static_cast<int>((g_get_monotonic_time() - t0) / 1000) < 90000) {
+      if (!prod_child_alive(pid)) {
+        return false;
+      }
+      if (Window undo = probe.find_related(editor, "very large undo")) {
+        send_key(probe, undo, "alt+r");
+        poll(nullptr, 0, 40);
+        continue;
+      }
+      title = probe.title_of(editor);
+      const bool replacing = title.find("Replacing") != std::string::npos;
+      Window result = probe.find_related(editor, "Replace All");
+      Window find = probe.find_related(editor, "Find");
+      if (!armed) {
+        if (find == 0) {
+          send_key(probe, editor, "ctrl+f");
+          poll(nullptr, 0, 200);
+          continue;
+        }
+        send_key(probe, find, "ctrl+a");
+        xdotool_cmd("type --delay 5 --clearmodifiers 'line '");
+        send_key(probe, find, "alt+w");
+        poll(nullptr, 0, 60);
+        xdotool_cmd("type --delay 5 --clearmodifiers 'row '");
+        send_key(probe, find, "alt+l");
+        armed = true;
+        continue;
+      }
+      if (replacing || result != 0) {
+        saw_replace = true;
+      }
+      if (result != 0) {
+        send_key(probe, result, "Return");
+        poll(nullptr, 0, 40);
+        continue;
+      }
+      if (saw_replace && !replacing) {
+        if (find != 0) {
+          send_key(probe, find, "Escape");
+          poll(nullptr, 0, 40);
+          continue;
+        }
+        prod_focus(probe, editor);
+        return true;
+      }
+      poll(nullptr, 0, 25);
+    }
+    title = probe.title_of(editor);
+    return false;
+  }
+
+  // Cancel while "Replacing… N%" is inside [low, high).
+  static bool prod_cancel_replace(ProdProbe& probe, pid_t pid, Window editor,
+                                  int low, int high, int& seen,
+                                  std::string& title) {
+    bool armed = false;
+    seen = -1;
+    int max_pct = -1;
+    const gint64 t0 = g_get_monotonic_time();
+    while (static_cast<int>((g_get_monotonic_time() - t0) / 1000) < 120000) {
+      if (!prod_child_alive(pid)) {
+        return false;
+      }
+      if (Window undo = probe.find_related(editor, "very large undo")) {
+        send_key(probe, undo, "alt+r");
+        poll(nullptr, 0, 40);
+        continue;
+      }
+      title = probe.title_of(editor);
+      const int pct = replacing_percent(title);
+      if (pct > max_pct) {
+        max_pct = pct;
+      }
+      Window find = probe.find_related(editor, "Find");
+      if (!armed) {
+        if (find == 0) {
+          send_key(probe, editor, "ctrl+f");
+          poll(nullptr, 0, 200);
+          continue;
+        }
+        send_key(probe, find, "ctrl+a");
+        xdotool_cmd("type --delay 5 --clearmodifiers 'line '");
+        send_key(probe, find, "alt+w");
+        poll(nullptr, 0, 60);
+        xdotool_cmd("type --delay 5 --clearmodifiers 'row '");
+        send_key(probe, find, "alt+l");
+        armed = true;
+        continue;
+      }
+      if (pct >= low && pct < high) {
+        seen = pct;
+        Window target = find != 0 ? find : editor;
+        send_key(probe, target, "Escape");
+        const bool settled = prod_wait(
+            probe, pid, editor, 15000,
+            [](const std::string& t) {
+              return t.find("Replacing") == std::string::npos &&
+                     t.find("Restoring") == std::string::npos;
+            },
+            title);
+        if (Window still = probe.find_related(editor, "Find")) {
+          send_key(probe, still, "Escape");
+          poll(nullptr, 0, 40);
+          title = probe.title_of(editor);
+        }
+        std::cout << "production replace-history cancel pct=" << seen
+                  << " max=" << max_pct << "\n";
+        return settled && title.find("Replacing") == std::string::npos;
+      }
+      if (armed && pct < 0 && title.find("Replacing") == std::string::npos &&
+          prod_title_has_star(title)) {
+        std::cout << "production replace-history cancel missed window max="
+                  << max_pct << "\n";
+        return false;
+      }
+      poll(nullptr, 0, 15);
+    }
+    std::cout << "production replace-history cancel timeout max=" << max_pct
+              << "\n";
+    return false;
+  }
+
+  static bool prod_save_matches(
+      ProdProbe& probe, pid_t pid, Window editor, const std::string& path,
+      bool want_star, const std::function<bool(const std::string&)>& file_ok,
+      std::string& title) {
+    prod_focus(probe, editor);
+    send_key(probe, editor, "ctrl+s");
+    const bool title_ok = prod_wait(
+        probe, pid, editor, 8000,
+        [&](const std::string& t) {
+          return prod_title_has_star(t) == want_star &&
+                 t.find("Replacing") == std::string::npos;
+        },
+        title);
+    const std::string bytes = read_bytes(path);
+    const bool ok = title_ok && file_ok(bytes);
+    if (!ok) {
+      prod_note("save", title, path);
+    }
+    return ok;
+  }
+
+  static bool prod_key_until(ProdProbe& probe, pid_t pid, Window editor,
+                             const char* key, int tries,
+                             const std::function<bool(const std::string&)>& pred,
+                             std::string& title) {
+    for (int i = 0; i < tries; ++i) {
+      prod_focus(probe, editor);
+      send_key(probe, editor, key);
+      if (prod_wait(probe, pid, editor, 2500, pred, title)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // (a)–(d) and (f) against the shipped binary. (e) is the undo/redo
+  // stall legs in the production matrix.
+  static void test_production_replace_history(const std::string& dir,
+                                              const std::string& bin) {
+    std::cout << "production replace-history begin\n";
+    const auto star = [](const std::string& t) { return prod_title_has_star(t); };
+    const auto clean = [](const std::string& t) {
+      return !prod_title_has_star(t) && t.find("Replacing") == std::string::npos;
+    };
+
+    auto with_editor = [&](const char* name, const std::string& path,
+                           const std::function<bool(ProdProbe&, pid_t, Window,
+                                                    std::string&)>& body) {
+      std::cout << "production replace-history " << name << " begin\n";
+      ProdProbe probe;
+      if (!probe.open()) {
+        expect(false, name);
+        return;
+      }
+      const pid_t pid = spawn_production(bin, path, false);
+      if (pid <= 0) {
+        expect(false, name);
+        probe.close();
+        return;
+      }
+      const auto slash = path.find_last_of('/');
+      const std::string base =
+          slash == std::string::npos ? path : path.substr(slash + 1);
+      Window editor = 0;
+      std::string title;
+      const gint64 t0 = g_get_monotonic_time();
+      bool ready = false;
+      while (static_cast<int>((g_get_monotonic_time() - t0) / 1000) < 20000) {
+        if (!prod_child_alive(pid)) {
+          break;
+        }
+        editor = probe.find_editor();
+        if (editor != 0) {
+          title = probe.title_of(editor);
+          if (title.find(base) != std::string::npos &&
+              title.find("Replacing") == std::string::npos) {
+            ready = true;
+            break;
+          }
+        }
+        poll(nullptr, 0, 20);
+      }
+      bool ok = false;
+      if (ready) {
+        ok = body(probe, pid, editor, title);
+      }
+      if (!ok) {
+        std::cerr << "production replace-history " << name << " title=["
+                  << title << "]\n";
+      }
+      expect(ready && ok, name);
+      stop_production(pid);
+      wait_for_editor_gone(probe);
+      probe.close();
+      std::cout << "production replace-history " << name
+                << (ok ? " ok\n" : " fail\n");
+    };
+
+    const std::string small = dir + "/prod-hist-small.txt";
+    write_repeated(small, "line dog sit\n", 40000);
+    const std::string small_bytes = read_bytes(small);
+    std::string small_replaced = small_bytes;
+    for (std::size_t at = 0;
+         (at = small_replaced.find("line ", at)) != std::string::npos; at += 4) {
+      small_replaced.replace(at, 5, "row ");
+    }
+    auto fresh_small = [&]() { write_bytes(small, small_bytes); };
+    auto same_as = [](const std::string& expect) {
+      return [expect](const std::string& got) { return got == expect; };
+    };
+
+    const char* only_case = g_getenv("LUNDUKE_EDIT_HIST_CASE");
+    auto want_case = [&](const char* name) {
+      return only_case == nullptr || std::strstr(name, only_case) != nullptr;
+    };
+
+    fresh_small();
+    if (!want_case("save")) {
+    } else
+    with_editor("save", small, [&](ProdProbe& probe, pid_t pid, Window editor,
+                                   std::string& title) {
+      if (!prod_replace_all(probe, pid, editor, title)) {
+        return false;
+      }
+      if (!prod_save_matches(probe, pid, editor, small, false,
+                            same_as(small_replaced), title)) {
+        return false;
+      }
+      if (!prod_key_until(probe, pid, editor, "ctrl+z", 4, star, title)) {
+        return false;
+      }
+      if (!prod_save_matches(probe, pid, editor, small, false,
+                            same_as(small_bytes), title)) {
+        return false;
+      }
+      if (!prod_key_until(probe, pid, editor, "ctrl+shift+z", 4, star, title)) {
+        return false;
+      }
+      return prod_save_matches(probe, pid, editor, small, false,
+                              same_as(small_replaced), title);
+    });
+
+    fresh_small();
+    if (want_case("type"))
+    with_editor("type", small, [&](ProdProbe& probe, pid_t pid, Window editor,
+                                   std::string& title) {
+      if (!prod_replace_all(probe, pid, editor, title)) {
+        return false;
+      }
+      prod_type_text(probe, editor, "ZQX", true);
+      // The replace is still unsaved, so the star is already up. One undo
+      // must remove only the typing; the saved bytes show that.
+      prod_focus(probe, editor);
+      send_key(probe, editor, "ctrl+z");
+      poll(nullptr, 0, 200);
+      if (!prod_save_matches(probe, pid, editor, small, false,
+                            same_as(small_replaced), title)) {
+        return false;
+      }
+      if (!prod_key_until(probe, pid, editor, "ctrl+z", 4, star, title)) {
+        return false;
+      }
+      if (!prod_save_matches(probe, pid, editor, small, false,
+                            same_as(small_bytes), title)) {
+        return false;
+      }
+      if (!prod_key_until(probe, pid, editor, "ctrl+y", 4, star, title)) {
+        return false;
+      }
+      if (!prod_save_matches(probe, pid, editor, small, false,
+                            same_as(small_replaced), title)) {
+        return false;
+      }
+      if (!prod_key_until(probe, pid, editor, "ctrl+shift+z", 4, star, title)) {
+        return false;
+      }
+      return prod_save_matches(probe, pid, editor, small, false,
+                              same_as(small_replaced + "ZQX"), title);
+    });
+
+    fresh_small();
+    if (want_case("before"))
+    with_editor("before", small, [&](ProdProbe& probe, pid_t pid, Window editor,
+                                     std::string& title) {
+      prod_type_text(probe, editor, "Q", true);
+      if (!prod_wait(probe, pid, editor, 4000, star, title)) {
+        return false;
+      }
+      if (!prod_replace_all(probe, pid, editor, title)) {
+        return false;
+      }
+      // Still dirty from the earlier typing, so the star does not tell
+      // this undo apart from a missed key. The saved text does.
+      prod_focus(probe, editor);
+      send_key(probe, editor, "ctrl+z");
+      poll(nullptr, 0, 200);
+      if (!prod_save_matches(probe, pid, editor, small, false,
+                            same_as(small_bytes + "Q"), title)) {
+        return false;
+      }
+      if (!prod_key_until(probe, pid, editor, "ctrl+z", 4, star, title)) {
+        return false;
+      }
+      return prod_save_matches(probe, pid, editor, small, false,
+                              same_as(small_bytes), title);
+    });
+
+    fresh_small();
+    if (want_case("clear"))
+    with_editor("clear", small, [&](ProdProbe& probe, pid_t pid, Window editor,
+                                    std::string& title) {
+      if (!prod_replace_all(probe, pid, editor, title)) {
+        return false;
+      }
+      if (!prod_key_until(probe, pid, editor, "ctrl+z", 4, clean, title)) {
+        return false;
+      }
+      prod_type_text(probe, editor, "Z", true);
+      if (!prod_wait(probe, pid, editor, 4000, star, title)) {
+        return false;
+      }
+      send_key(probe, editor, "ctrl+y");
+      poll(nullptr, 0, 150);
+      send_key(probe, editor, "ctrl+shift+z");
+      poll(nullptr, 0, 150);
+      return prod_save_matches(probe, pid, editor, small, false,
+                              same_as(small_bytes + "Z"), title);
+    });
+
+    const std::string cancel_path = dir + "/prod-hist-cancel.txt";
+    write_repeated(cancel_path, "line dog sit\n", 2000000);
+    const std::string cancel_original = read_bytes(cancel_path);
+    auto cancel_case = [&](const char* name, int low, int high) {
+      write_bytes(cancel_path, cancel_original);
+      with_editor(name, cancel_path,
+                  [&](ProdProbe& probe, pid_t pid, Window editor,
+                      std::string& title) {
+                    prod_type_text(probe, editor, "Q", true);
+                    if (!prod_save_matches(
+                            probe, pid, editor, cancel_path, false,
+                            same_as(cancel_original + "Q"), title)) {
+                      return false;
+                    }
+                    const std::string saved = read_bytes(cancel_path);
+                    int seen = -1;
+                    if (!prod_cancel_replace(probe, pid, editor, low, high, seen,
+                                            title)) {
+                      return false;
+                    }
+                    if (read_bytes(cancel_path) != saved) {
+                      return false;
+                    }
+                    if (!prod_wait(probe, pid, editor, 4000, clean, title)) {
+                      return false;
+                    }
+                    if (!prod_key_until(probe, pid, editor, "ctrl+z", 4, star,
+                                       title)) {
+                      return false;
+                    }
+                    if (!prod_save_matches(
+                            probe, pid, editor, cancel_path, false,
+                            [&](const std::string& b) { return b == cancel_original; },
+                            title)) {
+                      return false;
+                    }
+                    send_key(probe, editor, "ctrl+z");
+                    poll(nullptr, 0, 200);
+                    return prod_save_matches(
+                        probe, pid, editor, cancel_path, false,
+                        [&](const std::string& b) { return b == cancel_original; },
+                        title);
+                  });
+    };
+    if (want_case("cancel-30")) {
+      cancel_case("cancel-30", 30, 50);
+    }
+    if (want_case("cancel-96")) {
+      cancel_case("cancel-96", 96, 100);
+    }
+    std::cout << "production replace-history end\n";
   }
 
   static void test_production_responsiveness(const std::string& dir) {
@@ -6331,6 +6856,11 @@ struct EditChecks {
         // LUNDUKE_EDIT_PROD_STRESS repeats it; the local gate uses 10.
         {"replace-work-tall-stress", true, true, false, 1000.0, 300000, 0, 0,
          ProdGeom::Tall, replace_path.c_str(), "line ", "row "},
+        // Undo and redo of the same 12 MB replace, tall window.
+        {"replace-undo-redo-tall", false, true, false, 200.0, 180000, 0, 0,
+         ProdGeom::Tall, replace_path.c_str(), "line ", "row "},
+        {"replace-undo-redo-tall-cpulimit", true, true, false, 1000.0, 300000,
+         0, 0, ProdGeom::Tall, replace_path.c_str(), "line ", "row "},
     };
 
     const char* only = g_getenv("LUNDUKE_EDIT_PROD_FILTER");
@@ -6368,10 +6898,11 @@ struct EditChecks {
         probe.close();
         continue;
       }
+      const bool redo_after = std::strstr(leg.name, "undo-redo") != nullptr;
       const ProdStats stats = watch_production(
           probe, pid, base, leg.replace, leg.cancel, leg.gap_limit,
           leg.deadline_ms, leg.escape_after_ms, leg.geom, leg.needle,
-          leg.replacement);
+          leg.replacement, redo_after);
       stop_production(pid);
       wait_for_editor_gone(probe);
       probe.close();
@@ -6422,6 +6953,16 @@ struct EditChecks {
       if (leg.replace && !leg.cancel) {
         expect(stats.dirty, "Replace All marks the buffer dirty");
         expect(stats.undo_ok, "Replace All is one undo step");
+        if (redo_after) {
+          expect(stats.redo_ok, "Replace All can be redone");
+          expect(stats.undo_gap_ms <= leg.gap_limit,
+                 "undo of Replace All stays inside the stall bound");
+          expect(stats.redo_gap_ms <= leg.gap_limit,
+                 "redo of Replace All stays inside the stall bound");
+          std::cout << "production " << leg.name
+                    << " undo_gap_ms=" << stats.undo_gap_ms
+                    << " redo_gap_ms=" << stats.redo_gap_ms << "\n";
+        }
       }
       if (leg.replace && leg.cancel) {
         expect(stats.apply_seen,
@@ -6437,7 +6978,279 @@ struct EditChecks {
       }
     }
     }
+    if (only == nullptr || std::strstr("replace-history", only) != nullptr) {
+      test_production_replace_history(dir, bin);
+    }
     std::cout << "production responsiveness end\n";
+  }
+
+  static std::string repeat_piece(const std::string& piece, std::size_t bytes) {
+    std::string out;
+    out.reserve(bytes + piece.size());
+    while (out.size() < bytes) {
+      const std::size_t n = std::min(piece.size(), bytes - out.size());
+      out.append(piece.data(), n);
+    }
+    return out;
+  }
+
+  static void pump_replace(MainWindow& w) {
+    for (int i = 0; i < 400000 && w.find_scan_.active; ++i) {
+      g_main_context_iteration(nullptr, false);
+    }
+  }
+
+  static void replace_line_row(MainWindow& w) {
+    FindOptions opts;
+    opts.search_for = "line ";
+    opts.replace_with = "row ";
+    opts.case_sensitive = true;
+    w.start_replace_all(opts, nullptr);
+    pump_replace(w);
+    expect(!w.find_scan_.active, "Replace All finishes");
+  }
+
+  static bool title_has_star(MainWindow& w) {
+    const Glib::ustring title = w.get_title();
+    return title.find(" *") != Glib::ustring::npos;
+  }
+
+  // A keystroke is a user action. A bare insert is not, and only the
+  // user action drops a Replace All that is waiting on the redo stack.
+  static void type_user(MainWindow& w, const Glib::ustring& text, bool at_end) {
+    auto buf = w.buffer();
+    buf->begin_user_action();
+    if (at_end) {
+      buf->insert(buf->end(), text);
+    } else {
+      buf->insert(buf->get_iter_at_mark(buf->get_insert()), text);
+    }
+    buf->end_user_action();
+  }
+
+  // Replace All is one step in the same undo/redo history as typing.
+  static void test_replace_history(MainWindow& w, const std::string& dir) {
+    std::cout << "replace-history begin\n";
+    const std::string piece = "line dog sit\n";
+    const std::string body = repeat_piece(piece, 20000);
+    const std::string replaced_body = [&]() {
+      std::string out = body;
+      for (std::size_t at = 0; (at = out.find("line ", at)) != std::string::npos;
+           at += 4) {
+        out.replace(at, 5, "row ");
+      }
+      return out;
+    }();
+    expect(body.size() > 8000, "history fixture is past the swap threshold");
+    expect(replaced_body.find("line ") == std::string::npos,
+           "history fixture replacement removes the needle");
+
+    // (a) Save, then undo, tracks the file on disk rather than the
+    // pre-replace buffer.
+    {
+      const std::string path = dir + "/hist-save.txt";
+      write_bytes(path, body);
+      expect(w.open_file(path), "history save fixture opens");
+      const Glib::ustring original = w.buffer()->get_text();
+      replace_line_row(w);
+      const Glib::ustring replaced = w.buffer()->get_text();
+      expect(replaced != original, "Replace All changes the history fixture");
+      expect(w.can_edit_undo(), "Replace All can be undone");
+      expect(!w.buffer()->can_undo(),
+             "the swap is not a second GtkSource undo entry");
+      expect(w.save_document(), "save after Replace All");
+      expect(!w.dirty_ && !title_has_star(w), "save clears the star");
+      expect(read_bytes(path).find("row ") != std::string::npos,
+             "save writes the replaced text");
+      w.on_undo();
+      expect(w.buffer()->get_text() == original, "undo after save restores the original");
+      expect(w.dirty_ && title_has_star(w),
+             "undo after save marks the buffer dirty");
+      expect(w.save_document(), "save after undo");
+      expect(read_bytes(path).find("line ") != std::string::npos &&
+                 read_bytes(path).find("row ") == std::string::npos,
+             "save after undo writes the original");
+      expect(!w.dirty_, "save after undo clears the star");
+      w.on_redo();
+      expect(w.buffer()->get_text() == replaced, "redo restores the replacement");
+      expect(w.dirty_ && title_has_star(w), "redo after save marks the buffer dirty");
+      expect(w.save_document(), "save after redo");
+      expect(read_bytes(path).find("row ") != std::string::npos,
+             "save after redo writes the replaced text");
+      std::cout << "replace-history save ok\n";
+    }
+
+    // (b) Typing after Replace All is its own undo step.
+    {
+      const std::string path = dir + "/hist-type.txt";
+      write_bytes(path, body);
+      expect(w.open_file(path), "history type fixture opens");
+      const Glib::ustring original = w.buffer()->get_text();
+      replace_line_row(w);
+      const Glib::ustring replaced = w.buffer()->get_text();
+      type_user(w, "ZQX", true);
+      expect(w.buffer()->get_text() == replaced + "ZQX", "typing lands after Replace All");
+      w.on_undo();
+      expect(w.buffer()->get_text() == replaced,
+             "the first undo removes only the typing");
+      w.on_undo();
+      expect(w.buffer()->get_text() == original,
+             "the second undo reverts Replace All");
+      w.on_redo();
+      expect(w.buffer()->get_text() == replaced, "the first redo restores Replace All");
+      w.on_redo();
+      expect(w.buffer()->get_text() == replaced + "ZQX",
+             "the second redo restores the typing");
+      std::cout << "replace-history type ok\n";
+    }
+
+    // (c) An edit made before Replace All is undone after it.
+    {
+      const std::string path = dir + "/hist-before.txt";
+      write_bytes(path, body);
+      expect(w.open_file(path), "history before fixture opens");
+      const Glib::ustring original = w.buffer()->get_text();
+      type_user(w, "Q", false);
+      const Glib::ustring typed = w.buffer()->get_text();
+      replace_line_row(w);
+      const Glib::ustring replaced = w.buffer()->get_text();
+      expect(replaced != typed, "Replace All still runs after typing");
+      w.on_undo();
+      expect(w.buffer()->get_text() == typed,
+             "undo puts the earlier typing back");
+      w.on_undo();
+      expect(w.buffer()->get_text() == original,
+             "the next undo removes the earlier typing");
+      w.on_redo();
+      expect(w.buffer()->get_text() == typed,
+             "redo restores the earlier typing");
+      w.on_redo();
+      expect(w.buffer()->get_text() == replaced,
+             "the next redo restores Replace All");
+      std::cout << "replace-history before ok\n";
+    }
+
+    // (d) A new edit after undoing Replace All drops the redo.
+    {
+      const std::string path = dir + "/hist-clear.txt";
+      write_bytes(path, body);
+      expect(w.open_file(path), "history clear fixture opens");
+      const Glib::ustring original = w.buffer()->get_text();
+      replace_line_row(w);
+      w.on_undo();
+      expect(w.buffer()->get_text() == original, "undo restored the clear fixture");
+      expect(w.can_edit_redo(), "Replace All can be redone");
+      type_user(w, "Z", true);
+      expect(!w.can_edit_redo(), "typing clears the Replace All redo");
+      w.on_redo();
+      expect(w.buffer()->get_text() == original + "Z",
+             "redo does not bring Replace All back");
+      std::cout << "replace-history clear ok\n";
+    }
+
+    // (f) Cancel before the swap does not touch the undo stack.
+    // 2 MB is large enough that extract reports a percent in the 30s
+    // and the commit yields at 96–99 before the swap.
+    auto cancel_at = [&](int low, int high, const char* label) {
+      const std::string path = dir + std::string("/hist-cancel-") + label + ".txt";
+      write_bytes(path, repeat_piece(piece, 2000000));
+      expect(w.open_file(path), label);
+      const Glib::ustring original = w.buffer()->get_text();
+      type_user(w, "Q", true);
+      const Glib::ustring typed = w.buffer()->get_text();
+      expect(w.can_edit_undo() && !w.can_edit_redo(), label);
+      const std::size_t endings = w.ending_undo_.size();
+      FindOptions opts;
+      opts.search_for = "line ";
+      opts.replace_with = "row ";
+      opts.case_sensitive = true;
+      w.start_replace_all(opts, nullptr);
+      bool hit = false;
+      int seen = -1;
+      for (int i = 0; i < 400000 && w.find_scan_.active; ++i) {
+        g_main_context_iteration(nullptr, false);
+        const int pct = w.find_scan_.progress_pct;
+        if (pct >= low && pct < high) {
+          seen = pct;
+          w.cancel_find_scan();
+          hit = true;
+          break;
+        }
+      }
+      pump_replace(w);
+      std::cout << "replace-history cancel " << label << " pct=" << seen
+                << " hit=" << hit << "\n";
+      expect(hit && seen >= low && seen < high, label);
+      expect(!w.find_scan_.active, label);
+      expect(w.buffer()->get_text() == typed, label);
+      expect(w.can_edit_undo() && !w.can_edit_redo(), label);
+      expect(w.ending_undo_.size() == endings, label);
+      w.on_undo();
+      expect(w.buffer()->get_text() == original, label);
+      expect(!w.can_edit_undo(), label);
+      w.on_undo();
+      expect(w.buffer()->get_text() == original, label);
+    };
+    cancel_at(30, 50, "30");
+    cancel_at(96, 100, "96");
+    std::cout << "replace-history cancel ok\n";
+
+    // (e) Unthrottled undo and redo of a 12 MB Replace All.
+    {
+      const std::string path = dir + "/hist-12mb.txt";
+      const std::string big =
+          repeat_piece("line dog sit quick ipsum fox value line\n", 12000000);
+      write_bytes(path, big);
+      expect(w.open_file(path), "12 MB history fixture opens");
+      const Glib::ustring original = w.buffer()->get_text();
+      replace_line_row(w);
+      const Glib::ustring replaced = w.buffer()->get_text();
+      expect(replaced != original, "12 MB Replace All changes the text");
+      const gint64 undo_t0 = g_get_monotonic_time();
+      w.on_undo();
+      const long undo_us = static_cast<long>(g_get_monotonic_time() - undo_t0);
+      expect(w.buffer()->get_text() == original, "12 MB undo restores the original");
+      const gint64 redo_t0 = g_get_monotonic_time();
+      w.on_redo();
+      const long redo_us = static_cast<long>(g_get_monotonic_time() - redo_t0);
+      expect(w.buffer()->get_text() == replaced, "12 MB redo restores the replacement");
+      std::cout << "replace-history 12mb undo_us=" << undo_us
+                << " redo_us=" << redo_us << "\n";
+      expect(undo_us >= 0 && undo_us < 200000,
+             "unthrottled 12 MB undo stays within 200 ms");
+      expect(redo_us >= 0 && redo_us < 200000,
+             "unthrottled 12 MB redo stays within 200 ms");
+    }
+
+    if (argv0.empty()) {
+      expect(false, "history throttle test knows its executable");
+    } else {
+      const std::string path = dir + "/hist-12mb-throttle.txt";
+      write_bytes(path, repeat_piece("line dog sit quick ipsum fox value line\n",
+                                    12000000));
+      const ToolRun run =
+          run_tool({argv0, path}, true,
+                   {{"LUNDUKE_EDIT_TEST_REPLACE_CHILD", "1"},
+                    {"LUNDUKE_EDIT_TEST_HISTORY_GAP", "1"},
+                    {"LUNDUKE_EDIT_TEST", "1"}},
+                   180000);
+      const long undo_us = field_long(run.output, "HISTORY_UNDO_US");
+      const long redo_us = field_long(run.output, "HISTORY_REDO_US");
+      const long roundtrip = field_long(run.output, "HISTORY_ROUNDTRIP");
+      std::cout << "replace-history throttled undo_us=" << undo_us
+                << " redo_us=" << redo_us << " roundtrip=" << roundtrip
+                << "\n";
+      if (!run.ok || roundtrip != 1 || undo_us < 0 || undo_us >= 1000000 ||
+          redo_us < 0 || redo_us >= 1000000) {
+        std::cerr << run.output;
+      }
+      expect(run.ok && roundtrip == 1, "throttled 12 MB undo/redo round-trips");
+      expect(undo_us >= 0 && undo_us < 1000000,
+             "throttled 12 MB undo stays within 1000 ms");
+      expect(redo_us >= 0 && redo_us < 1000000,
+             "throttled 12 MB redo stays within 1000 ms");
+    }
+    std::cout << "replace-history end\n";
   }
 
   static int run() {
@@ -6488,6 +7301,7 @@ struct EditChecks {
     test_round5(*app.get(), *w, dir);
     test_round6(*app.get(), *w, dir);
     test_round7_status_and_replace(*w, dir);
+    test_replace_history(*w, dir);
     test_argv_large_open(dir);
     test_throttled_replace(dir);
     test_xdnd(dir);
