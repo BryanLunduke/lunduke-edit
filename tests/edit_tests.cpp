@@ -5260,7 +5260,8 @@ struct EditChecks {
 
     // Round-trip through the editor's main loop. The reply is the
     // _NET_WM_PING the toolkit echoes to the root window.
-    double ping(Window window, int timeout_ms, pid_t pid = -1) {
+    double ping(Window window, int timeout_ms, pid_t pid = -1,
+                const std::function<void()>& tick = {}) {
       if (dpy == nullptr || window == 0) {
         return static_cast<double>(timeout_ms);
       }
@@ -5277,6 +5278,9 @@ struct EditChecks {
       XSendEvent(dpy, window, False, NoEventMask, &ev);
       XFlush(dpy);
       while (true) {
+        if (tick) {
+          tick();
+        }
         if (pid > 0) {
           int status = 0;
           if (waitpid(pid, &status, WNOHANG) == pid) {
@@ -5306,14 +5310,21 @@ struct EditChecks {
         pfd.fd = ConnectionNumber(dpy);
         pfd.events = POLLIN;
         const int remain = timeout_ms - static_cast<int>(elapsed);
-        poll(&pfd, 1, remain > 0 ? remain : 0);
+        // Short waits so a cancel key can go out on time while this
+        // round trip is still measuring a longer stall.
+        const int slice = remain > 50 ? 50 : remain;
+        poll(&pfd, 1, slice > 0 ? slice : 0);
       }
     }
   };
 
   static bool xdotool_cmd(const std::string& args) {
-    const std::string cmd = "/usr/bin/xdotool " + args + " >/tmp/xdotool-prod.log 2>&1";
+    const std::string cmd =
+        "/usr/bin/xdotool " + args + " >/tmp/xdotool-prod.log 2>&1";
     const int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      std::cerr << "xdotool rc=" << rc << " args=[" << args << "]\n";
+    }
     return rc == 0;
   }
 
@@ -5403,6 +5414,7 @@ struct EditChecks {
     bool replace_armed = false;
     gint64 replace_armed_at = 0;
     bool undo_sent = false;
+    int escape_sends = 0;
     const int ping_timeout = static_cast<int>(gap_limit_ms) + 150;
     auto elapsed_ms = [&]() {
       return static_cast<double>(g_get_monotonic_time() - start) / 1000.0;
@@ -5427,24 +5439,33 @@ struct EditChecks {
           continue;
         }
       }
-      // Send Escape before the next ping. A ping waits out a stalled slice,
-      // and by the time it returns the load may already have committed.
-      if (!replace && cancel && !stats.escaped &&
-          since_map() >= escape_after_ms) {
+      // Escape is sent from inside the ping wait. A full-timeout poll would
+      // otherwise run past the cancel point, and one key during the commit
+      // slice is too late. Repeats every 200 ms cover about 1 s while the
+      // title is still Untitled.
+      const double rtt = probe.ping(editor, ping_timeout, pid, [&]() {
+        if (replace || !cancel || escape_sends >= 8 ||
+            since_map() < escape_after_ms) {
+          return;
+        }
+        const bool due =
+            !stats.escaped ||
+            since_map() >= stats.escape_at_ms + escape_sends * 200.0;
+        if (!due) {
+          return;
+        }
         const std::string early = probe.title_of(editor);
-        if (early.find(base) == std::string::npos) {
-          // --sync waits until the editor processes focus. Under cpulimit
-          // that returns only after the load slice finishes, so Escape
-          // arrives too late. Ask the window manager to focus, then send
-          // an XTEST key (XSendEvent is ignored on this display).
-          xdotool_cmd("windowfocus " + std::to_string(editor));
-          poll(nullptr, 0, 40);
-          xdotool_cmd("key --clearmodifiers Escape");
-          stats.escaped = true;
+        if (early.find(base) != std::string::npos) {
+          return;
+        }
+        xdotool_cmd("windowfocus " + std::to_string(editor) +
+                    " key --clearmodifiers Escape");
+        if (!stats.escaped) {
           stats.escape_at_ms = since_map();
         }
-      }
-      const double rtt = probe.ping(editor, ping_timeout, pid);
+        stats.escaped = true;
+        ++escape_sends;
+      });
       if (rtt >= 0 && rtt < 30.0) {
         // A tight ping loop otherwise spins the CPU and crowds the editor.
         poll(nullptr, 0, 15);
@@ -5606,10 +5627,11 @@ struct EditChecks {
       double escape_min_ms;
       const char* path;
     };
-    // Unthrottled open finishes in well under a second on a fast CPU, so
-    // Escape is sent while the title is still Untitled. The cpulimit open
-    // and both Replace All runs are still going at one second, which is
-    // when Escape is pressed there.
+    // Unthrottled open finishes in well under a second, so Escape is sent
+    // while the title is still Untitled. A cpulimit open finishes near one
+    // second on a fast CPU; Escape starts at 400 ms and is repeated through
+    // about 1 s while the title stays Untitled. Replace All is still running
+    // at one second, which is when Escape is pressed there.
     const Leg legs[] = {
         {"open-unthrottled", false, false, false, 250.0, 60000, 0, 0,
          open_path.c_str()},
@@ -5617,8 +5639,8 @@ struct EditChecks {
          40.0, open_path.c_str()},
         {"open-cpulimit", true, false, false, 1000.0, 120000, 0, 0,
          open_path.c_str()},
-        {"open-escape-cpulimit", true, false, true, 1000.0, 60000, 1000.0,
-         900.0, open_path.c_str()},
+        {"open-escape-cpulimit", true, false, true, 1000.0, 60000, 400.0,
+         300.0, open_path.c_str()},
         {"replace-unthrottled", false, true, false, 250.0, 180000, 0, 0,
          replace_path.c_str()},
         {"replace-escape-unthrottled", false, true, true, 250.0, 60000, 1000.0,
