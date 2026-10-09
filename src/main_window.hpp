@@ -415,6 +415,9 @@ private:
   bool bulk_undo_running_{false};
   bool bulk_undo_erased_{false};
   bool bulk_undo_was_clean_{false};
+  // Set when this restore is rolling back a cancelled Replace All, so the
+  // title can say so until the previous text is back.
+  bool bulk_undo_from_cancel_{false};
   int bulk_undo_start_{0};
   int bulk_undo_end_{0};
   std::size_t bulk_undo_at_{0};

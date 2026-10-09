@@ -15,10 +15,12 @@ cd "$ROOT"
 rm -rf "$BUILD"
 meson setup "$BUILD" --prefix=/usr --buildtype=release -Dstrip=true
 meson compile -C "$BUILD"
+# One session bus for the suite. Editors inherit it, and the bus exits
+# with this command instead of leaving a dbus-daemon per window.
 if [ -z "${DISPLAY:-}" ]; then
-  xvfb-run -a meson test -C "$BUILD"
+  xvfb-run -a dbus-run-session -- meson test -C "$BUILD"
 else
-  meson test -C "$BUILD"
+  dbus-run-session -- meson test -C "$BUILD"
 fi
 
 rm -rf "$DEST"
