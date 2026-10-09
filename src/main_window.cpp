@@ -4,6 +4,8 @@
 #include "application.hpp"
 #include "test_hooks.hpp"
 
+#include <cstring>
+
 #include <giomm/cancellable.h>
 #include <giomm/file.h>
 #include <giomm/fileinputstream.h>
@@ -191,6 +193,66 @@ int find_chunk_size() {
 
 std::size_t huge_undo_limit() {
   return test_huge_undo_bytes(kDefaultHugeUndoBytes);
+}
+
+// GtkSourceUndoManagerDefault keeps redo groups to the right of `location`
+// and has no public call that drops only those. A Replace All has to drop
+// them, or the next redo would revive an edit from before the replace,
+// while the undo groups on the left stay so that edit can still be undone.
+// The instance layout is GtkSourceUndoManagerDefault in 3.24.11: GObject,
+// then the private pointer. The private struct starts with the buffer, the
+// action-group queue, and the location list node.
+struct UndoManagerPeek {
+  GObject parent;
+  void* priv;
+};
+
+struct UndoPrivPeek {
+  void* buffer;
+  GQueue* groups;
+  GList* location;
+};
+
+void discard_gtk_redo(const Glib::RefPtr<Gsv::Buffer>& buf) {
+  if (!buf || !buf->can_redo()) {
+    return;
+  }
+  GtkSourceUndoManager* mgr = gtk_source_buffer_get_undo_manager(buf->gobj());
+  if (mgr == nullptr) {
+    return;
+  }
+  const char* type_name = G_OBJECT_TYPE_NAME(mgr);
+  if (type_name == nullptr ||
+      std::strcmp(type_name, "GtkSourceUndoManagerDefault") != 0) {
+    return;
+  }
+  auto* priv = static_cast<UndoPrivPeek*>(
+      static_cast<UndoManagerPeek*>(static_cast<void*>(mgr))->priv);
+  if (priv == nullptr || priv->groups == nullptr || priv->location == nullptr) {
+    return;
+  }
+  int undo_groups = 0;
+  bool saw_location = false;
+  for (GList* node = priv->groups->head; node != nullptr; node = node->next) {
+    if (node == priv->location) {
+      saw_location = true;
+      break;
+    }
+    ++undo_groups;
+  }
+  if (!saw_location) {
+    return;
+  }
+  const int restore = buf->get_max_undo_levels();
+  if (undo_groups <= 0) {
+    buf->set_max_undo_levels(0);
+  } else {
+    // Setting the level equal to the undo count trims redo first. Passing
+    // through -1 forces that trim even when the level is already the count.
+    buf->set_max_undo_levels(-1);
+    buf->set_max_undo_levels(undo_groups);
+  }
+  buf->set_max_undo_levels(restore == 0 ? 100 : restore);
 }
 
 std::size_t count_newlines(const char* data, std::size_t len) {
@@ -964,6 +1026,7 @@ MainWindow::MainWindow(Application& app) : app_(app) {
 
   doc_buffer_ = Gsv::Buffer::create();
   doc_buffer_->set_max_undo_levels(100);
+  save_buffer_ = doc_buffer_;
   text_view_.set_buffer(doc_buffer_);
   auto buf = doc_buffer_;
   find_tag_ = buf->create_tag("lunduke-find-hit");
@@ -993,23 +1056,37 @@ MainWindow::MainWindow(Application& app) : app_(app) {
 
   text_view_.signal_draw().connect(
       sigc::mem_fun(*this, &MainWindow::on_text_view_draw), false);
-  // Before GtkSourceView's binding. A grouped undo of a multi-megabyte
-  // Replace All is one stack entry and one long replay; handle that
-  // entry here so the replay can yield.
-  text_view_.signal_key_press_event().connect([this](GdkEventKey* event) {
-    if (event == nullptr || !bulk_undo_armed_) {
-      return false;
-    }
-    const guint mods = event->state & gtk_accelerator_get_default_mod_mask();
-    const bool undo_key =
-        (mods & GDK_CONTROL_MASK) != 0 && (mods & GDK_SHIFT_MASK) == 0 &&
-        (event->keyval == GDK_KEY_z || event->keyval == GDK_KEY_Z);
-    if (!undo_key) {
-      return false;
-    }
-    start_bulk_undo();
-    return true;
-  }, false);
+  // Before GtkSourceView's binding. Ctrl+Z on the view calls the buffer
+  // undo manager directly, which does not know about a Replace All swap.
+  // Returning TRUE stops that class handler, so a swap is not followed
+  // by an undo of whatever edit is on the buffer just restored.
+  g_signal_connect(
+      text_view_.gobj(), "key-press-event",
+      G_CALLBACK(+[](GtkWidget*, GdkEventKey* event, gpointer data) -> gboolean {
+        auto* self = static_cast<MainWindow*>(data);
+        if (event == nullptr) {
+          return FALSE;
+        }
+        const guint mods = event->state & gtk_accelerator_get_default_mod_mask();
+        const bool ctrl = (mods & GDK_CONTROL_MASK) != 0;
+        const bool shift = (mods & GDK_SHIFT_MASK) != 0;
+        const bool extra = (mods & (GDK_MOD1_MASK | GDK_SUPER_MASK)) != 0;
+        if (!ctrl || extra) {
+          return FALSE;
+        }
+        const bool z = event->keyval == GDK_KEY_z || event->keyval == GDK_KEY_Z;
+        const bool y = event->keyval == GDK_KEY_y || event->keyval == GDK_KEY_Y;
+        if (!shift && z) {
+          self->on_undo();
+          return TRUE;
+        }
+        if ((shift && z) || (!shift && y)) {
+          self->on_redo();
+          return TRUE;
+        }
+        return FALSE;
+      }),
+      this);
   // A resize does not run GTK's first-validate idle again. Measure the
   // new height here, before the expose that follows size-allocate.
   text_view_.signal_size_allocate().connect_notify(
@@ -1242,6 +1319,12 @@ void MainWindow::connect_document_signals() {
   doc_conns_.push_back(buf->signal_begin_user_action().connect([this]() {
     in_user_action_ = true;
     ending_snapshotted_ = false;
+    // A new edit drops redo, including a Replace All that was undone.
+    // Undo and redo themselves open a user action to replay text; that
+    // must not throw away the step they are about to walk back to.
+    if (!history_replay_ && !seeding_) {
+      drop_redo_generations();
+    }
   }));
   doc_conns_.push_back(buf->signal_end_user_action().connect([this]() {
     in_user_action_ = false;
@@ -2081,6 +2164,8 @@ void MainWindow::load_seed_sample() {
   buf->set_text("");
   buf->end_not_undoable_action();
   buf->set_modified(false);
+  drop_swap_history();
+  save_buffer_ = buf;
   file_path_.clear();
   encoding_ = "UTF-8";
   saved_encoding_ = "UTF-8";
@@ -3099,6 +3184,8 @@ bool MainWindow::commit_loaded_text(const std::shared_ptr<LoadState>& state) {
   try {
     note_loaded_text(state->text);
     buf->set_modified(false);
+    drop_swap_history();
+    save_buffer_ = buf;
     file_path_ = state->path;
     saved_encoding_ = encoding_;
     encoding_dirty_ = false;
@@ -3209,8 +3296,6 @@ void MainWindow::update_title() {
     if (status.find("Replacing") == 0) {
       title = status + " — " + title;
     }
-  } else if (bulk_undo_running_ && bulk_undo_from_cancel_) {
-    title = "Restoring… — " + title;
   }
   set_title(title);
 }
@@ -3362,12 +3447,11 @@ bool MainWindow::on_focus_in_event(GdkEventFocus* event) {
 }
 
 void MainWindow::update_undo_redo_sensitivity() {
-  auto buf = buffer();
   if (undo_item_) {
-    undo_item_->set_sensitive(bulk_undo_armed_ || (buf && buf->can_undo()));
+    undo_item_->set_sensitive(can_edit_undo());
   }
   if (redo_item_) {
-    redo_item_->set_sensitive(buf && buf->can_redo());
+    redo_item_->set_sensitive(can_edit_redo());
   }
 }
 
@@ -3405,7 +3489,12 @@ void MainWindow::on_buffer_changed() {
 }
 
 void MainWindow::on_modified_changed() {
-  if (bytes_frozen_) {
+  if (!history_replay_ && !seeding_ && !bytes_frozen_) {
+    if (auto buf = buffer(); buf && !buf->get_modified()) {
+      save_buffer_ = buf;
+    }
+  }
+  if (bytes_frozen_ || history_replay_) {
     return;
   }
   refresh_dirty_from_buffer();
@@ -3614,6 +3703,8 @@ void MainWindow::on_new() {
   buf->set_text("");
   buf->end_not_undoable_action();
   buf->set_modified(false);
+  drop_swap_history();
+  save_buffer_ = buf;
   file_path_.clear();
   encoding_ = "UTF-8";
   saved_encoding_ = "UTF-8";
@@ -3930,183 +4021,185 @@ bool MainWindow::on_key_release_event(GdkEventKey* event) {
   return Gtk::ApplicationWindow::on_key_release_event(event);
 }
 
-void MainWindow::on_undo() {
-  if (bulk_undo_armed_) {
-    start_bulk_undo();
-    while (bulk_undo_running_) {
-      g_main_context_iteration(nullptr, TRUE);
-    }
-    return;
-  }
+bool MainWindow::can_edit_undo() {
   auto buf = buffer();
-  if (buf && buf->can_undo()) {
-    buf->undo();
-    refresh_dirty_from_buffer();
-    update_undo_redo_sensitivity();
-    update_status();
-  }
+  return (buf && buf->can_undo()) || !hist_undo_.empty();
 }
 
-void MainWindow::start_bulk_undo() {
-  if (!bulk_undo_armed_ || bulk_undo_running_) {
-    return;
-  }
+bool MainWindow::can_edit_redo() {
   auto buf = buffer();
-  if (!buf) {
-    bulk_undo_armed_ = false;
-    bulk_undo_old_.clear();
-    return;
-  }
-  bulk_undo_running_ = true;
-  bulk_undo_erased_ = false;
-  bulk_undo_at_ = 0;
-  if (bulk_undo_end_ < bulk_undo_start_) {
-    bulk_undo_end_ = bulk_undo_start_;
-  }
-  if (buf->get_line_count() > 400 && !view_parked_) {
-    park_document_view();
-  }
-  bytes_frozen_ = true;
-  ending_restore_ = true;
-  // A swapped Replace All keeps the previous buffer. Putting it back is
-  // the undo; the attached buffer is not erased in slices.
-  if (!bulk_undo_buffer_) {
-    bulk_undo_blocked_ = true;
-    try {
-      buf->begin_not_undoable_action();
-    } catch (...) {
-    }
-  }
-  bulk_undo_idle_ = Glib::signal_idle().connect(
-      sigc::mem_fun(*this, &MainWindow::pump_bulk_undo), kResponsivePriority);
+  return (buf && buf->can_redo()) || !hist_redo_.empty();
 }
 
-bool MainWindow::pump_bulk_undo() {
-  auto buf = buffer();
-  if (!buf || !bulk_undo_running_) {
-    finish_bulk_undo();
-    return false;
-  }
-  if (bulk_undo_buffer_) {
-    const auto restored = bulk_undo_buffer_;
-    bulk_undo_buffer_.reset();
-    adopt_document_buffer(restored);
-    utf8_bytes_ = bulk_undo_utf8_;
-    newline_count_ = bulk_undo_newlines_;
-    if (bulk_undo_had_lines_) {
-      apply_ending_kinds(bulk_undo_kinds_);
+void MainWindow::drop_redo_generations() {
+  hist_redo_.clear();
+}
+
+void MainWindow::drop_swap_history() {
+  hist_undo_.clear();
+  hist_redo_.clear();
+  discard_staged_replace();
+}
+
+void MainWindow::discard_staged_replace() {
+  staged_replace_ = DocGeneration{};
+  staged_replace_ready_ = false;
+}
+
+void MainWindow::abandon_staged_replace() {
+  if (staged_replace_ready_) {
+    if (staged_replace_.had_lines) {
+      apply_ending_kinds(staged_replace_.kinds);
     } else {
       source_lines_.clear();
     }
-    ending_undo_ = std::move(bulk_undo_ending_undo_);
-    ending_redo_ = std::move(bulk_undo_ending_redo_);
-    bulk_undo_kinds_.clear();
-    bulk_undo_kinds_.shrink_to_fit();
+    ending_undo_ = std::move(staged_replace_.ending_undo);
+    ending_redo_ = std::move(staged_replace_.ending_redo);
+    utf8_bytes_ = staged_replace_.utf8_bytes;
+    newline_count_ = staged_replace_.newline_count;
+    long_line_present_ = staged_replace_.long_line;
     ending_restore_ = false;
-    finish_bulk_undo();
-    return false;
+    have_pending_kinds_ = false;
   }
-  const gint64 t0 = g_get_monotonic_time();
-  auto expired = [&](bool did) {
-    return did && g_get_monotonic_time() - t0 > kLoadSliceUs;
-  };
-  if (!bulk_undo_erased_) {
-    bool did = false;
-    while (bulk_undo_end_ > bulk_undo_start_) {
-      if (expired(did)) {
-        return true;
-      }
-      // One GtkTextBuffer erase pays a large fixed cost. A few kilobytes
-      // keeps that cost inside the slice budget; 1024-character erases
-      // made a 12 MB undo take minutes.
-      const int slice = std::min(32 * 1024, bulk_undo_end_ - bulk_undo_start_);
-      const int from = bulk_undo_end_ - slice;
-      buf->erase(buf->get_iter_at_offset(from),
-                 buf->get_iter_at_offset(bulk_undo_end_));
-      bulk_undo_end_ = from;
-      did = true;
-    }
-    bulk_undo_erased_ = true;
-    if (expired(did)) {
-      return true;
-    }
-  }
-  bool did = false;
-  const std::string& old = bulk_undo_old_;
-  while (bulk_undo_at_ < old.size()) {
-    if (expired(did)) {
-      return true;
-    }
-    std::size_t n = std::min<std::size_t>(32u * 1024u, old.size() - bulk_undo_at_);
-    while (n > 0 && bulk_undo_at_ + n < old.size() &&
-           (static_cast<unsigned char>(old[bulk_undo_at_ + n]) & 0xC0) == 0x80) {
-      --n;
-    }
-    if (n == 0) {
-      n = 1;
-    }
-    const Glib::ustring piece(old.data() + bulk_undo_at_,
-                              old.data() + bulk_undo_at_ + n);
-    buf->insert(buf->get_iter_at_offset(bulk_undo_start_), piece);
-    bulk_undo_start_ += static_cast<int>(piece.length());
-    bulk_undo_at_ += n;
-    did = true;
-  }
-  finish_bulk_undo();
-  return false;
+  discard_staged_replace();
 }
 
-void MainWindow::finish_bulk_undo() {
-  auto buf = buffer();
-  if (buf) {
-    if (bulk_undo_blocked_) {
-      try {
-        buf->end_not_undoable_action();
-      } catch (...) {
-      }
-      bulk_undo_blocked_ = false;
-    }
-    const int levels = buf->get_max_undo_levels();
-    buf->set_max_undo_levels(0);
-    buf->set_max_undo_levels(levels);
-    if (bulk_undo_was_clean_) {
-      buf->set_modified(false);
-    }
-    buf->place_cursor(buf->get_iter_at_offset(
-        std::min(bulk_undo_start_, buf->get_char_count())));
+void MainWindow::stage_replace_undo() {
+  staged_replace_ = DocGeneration{};
+  staged_replace_.utf8_bytes = utf8_bytes_;
+  staged_replace_.newline_count = newline_count_;
+  staged_replace_.had_lines = !source_lines_.empty();
+  staged_replace_.long_line = long_line_present_;
+  if (staged_replace_.had_lines) {
+    staged_replace_.kinds = ending_kinds();
   }
-  ending_restore_ = false;
-  bulk_undo_armed_ = false;
-  bulk_undo_running_ = false;
-  bulk_undo_from_cancel_ = false;
-  bulk_undo_old_.clear();
-  bulk_undo_old_.shrink_to_fit();
-  if (buf && !source_lines_.empty() &&
-      static_cast<int>(source_lines_.size()) != buf->get_line_count()) {
+  staged_replace_.ending_undo = ending_undo_;
+  staged_replace_.ending_redo = ending_redo_;
+  staged_replace_ready_ = true;
+}
+
+void MainWindow::remember_replace_undo(const Glib::RefPtr<Gsv::Buffer>& previous) {
+  if (!staged_replace_ready_ || !previous) {
+    return;
+  }
+  discard_gtk_redo(previous);
+  drop_redo_generations();
+  staged_replace_.buffer = previous;
+  if (hist_undo_.size() >= 100) {
+    hist_undo_.erase(hist_undo_.begin());
+  }
+  hist_undo_.push_back(std::move(staged_replace_));
+  staged_replace_ = DocGeneration{};
+  staged_replace_ready_ = false;
+}
+
+MainWindow::DocGeneration MainWindow::capture_generation() {
+  DocGeneration frame;
+  frame.buffer = doc_buffer_;
+  frame.utf8_bytes = utf8_bytes_;
+  frame.newline_count = newline_count_;
+  frame.had_lines = !source_lines_.empty();
+  frame.long_line = long_line_present_;
+  if (frame.had_lines) {
+    frame.kinds = ending_kinds();
+  }
+  frame.ending_undo = ending_undo_;
+  frame.ending_redo = ending_redo_;
+  return frame;
+}
+
+void MainWindow::install_generation(DocGeneration& frame) {
+  if (frame.had_lines) {
+    apply_ending_kinds(frame.kinds);
+  } else {
     source_lines_.clear();
-    clear_ending_history();
   }
-  // Unpark while the byte status is still frozen. Attaching the document
-  // can emit modified-changed, and a cancelled replace must not flash a
-  // star for that.
-  if (view_parked_) {
-    unpark_document_view();
+  ending_undo_ = std::move(frame.ending_undo);
+  ending_redo_ = std::move(frame.ending_redo);
+  utf8_bytes_ = frame.utf8_bytes;
+  newline_count_ = frame.newline_count;
+  long_line_present_ = frame.long_line;
+  if (long_line_present_) {
+    force_wrap_off();
   }
-  bytes_frozen_ = false;
-  restore_source_features();
+}
+
+void MainWindow::finish_history_step() {
+  history_replay_ = false;
+  if (auto live = buffer()) {
+    if (live != save_buffer_ && !live->get_modified()) {
+      history_replay_ = true;
+      live->set_modified(true);
+      history_replay_ = false;
+    }
+  }
   refresh_dirty_from_buffer();
   update_undo_redo_sensitivity();
   update_status();
-  bulk_undo_idle_.disconnect();
+}
+
+void MainWindow::swap_generations(std::vector<DocGeneration>& from,
+                                  std::vector<DocGeneration>& onto) {
+  if (from.empty() || !from.back().buffer) {
+    return;
+  }
+  auto outgoing = capture_generation();
+  DocGeneration incoming = std::move(from.back());
+  from.pop_back();
+  const bool heavy =
+      (outgoing.buffer && outgoing.buffer->get_char_count() > 4000) ||
+      (incoming.buffer && incoming.buffer->get_char_count() > 4000);
+  if (heavy && !view_parked_) {
+    park_document_view();
+  }
+  history_replay_ = true;
+  seeding_ = true;
+  if (incoming.buffer) {
+    incoming.buffer->set_highlight_syntax(false);
+    incoming.buffer->set_highlight_matching_brackets(false);
+  }
+  suspend_source_features();
+  onto.push_back(std::move(outgoing));
+  adopt_document_buffer(incoming.buffer);
+  install_generation(incoming);
+  clear_find_highlights();
+  find_highlights_on_ = false;
+  seeding_ = false;
+  if (view_parked_) {
+    unpark_document_view();
+  }
+  if (source_feature_idle_.empty()) {
+    source_feature_idle_ = Glib::signal_idle().connect([this]() {
+      restore_source_features();
+      return false;
+    });
+  }
+  finish_history_step();
+}
+
+void MainWindow::on_undo() {
+  auto buf = buffer();
+  if (buf && buf->can_undo()) {
+    history_replay_ = true;
+    buf->undo();
+    finish_history_step();
+    return;
+  }
+  if (!hist_undo_.empty()) {
+    swap_generations(hist_undo_, hist_redo_);
+  }
 }
 
 void MainWindow::on_redo() {
   auto buf = buffer();
   if (buf && buf->can_redo()) {
+    history_replay_ = true;
     buf->redo();
-    refresh_dirty_from_buffer();
-    update_undo_redo_sensitivity();
-    update_status();
+    finish_history_step();
+    return;
+  }
+  if (!hist_redo_.empty()) {
+    swap_generations(hist_redo_, hist_undo_);
   }
 }
 
@@ -5274,54 +5367,23 @@ void MainWindow::end_find_user_action() {
 }
 
 void MainWindow::cancel_find_scan() {
-  // A commit that has not swapped buffers has not touched the document.
-  // Drop the detached copy instead of undoing a half-applied erase.
+  // The open document is not edited until the detached buffer is swapped
+  // in. Cancel before that drops the copy. There is no half-applied
+  // erase to roll back, and the undo stack stays as it was.
   if (!find_scan_.commit_swapped) {
     discard_commit_swap();
+    abandon_staged_replace();
   }
-  const bool rollback = (find_scan_.user_action_open || find_scan_.commit_applied) &&
-                        find_scan_.kind == FindScan::Kind::ReplaceAll;
   const bool parked = find_scan_.commit_parked;
   find_scan_.cancel = true;
   find_scan_.commit_applied = false;
   find_idle_.disconnect();
-  // end_user_action marks the half-applied buffer modified and emits
-  // modified-changed. Keep the status frozen across that, and across the
-  // restore, so a cancelled replace does not flash a dirty title.
-  if (!rollback) {
-    bytes_frozen_ = false;
-  }
   end_find_user_action();
-  bool slice_restore = false;
-  if (rollback) {
-    if (auto buf = buffer()) {
-      const bool slice_it =
-          find_scan_.commit_started && find_scan_.hay.size() >= 32u * 1024u;
-      if (slice_it) {
-        bulk_undo_old_ = std::move(find_scan_.hay);
-        bulk_undo_start_ = find_scan_.replace_start;
-        bulk_undo_end_ = find_scan_.commit_off;
-        bulk_undo_armed_ = true;
-        bulk_undo_from_cancel_ = true;
-        start_bulk_undo();
-        slice_restore = bulk_undo_running_;
-      } else if (buf->can_undo()) {
-        buf->undo();
-        if (bulk_undo_was_clean_) {
-          buf->set_modified(false);
-        }
-      } else if (bulk_undo_was_clean_) {
-        buf->set_modified(false);
-      }
-    }
-  }
-  if (parked && view_parked_ && !slice_restore) {
+  if (parked && view_parked_) {
     unpark_document_view();
   }
-  if (!slice_restore) {
-    bytes_frozen_ = false;
-    refresh_dirty_from_buffer();
-  }
+  bytes_frozen_ = false;
+  refresh_dirty_from_buffer();
   find_scan_.commit_parked = false;
   find_scan_.active = false;
   find_scan_.dlg = nullptr;
@@ -5329,10 +5391,7 @@ void MainWindow::cancel_find_scan() {
   if (status_find_.get_text().find("Replacing") == 0) {
     set_find_count(-1, false);
   }
-  // Drop "Replacing…" now that the scan is idle. A sliced restore is
-  // still parked and still frozen, so this publishes "Restoring…" and
-  // not a star.
-  if (!find_scan_.commit_swapped || !find_scan_.active) {
+  if (!find_scan_.commit_swapped) {
     restore_source_features();
   }
   update_title();
@@ -5383,6 +5442,7 @@ void MainWindow::finish_find_scan(bool show_result) {
   }
   if (!find_scan_.commit_swapped) {
     discard_commit_swap();
+    abandon_staged_replace();
     if (source_features_suspended_) {
       restore_source_features();
     }
@@ -5883,16 +5943,7 @@ bool MainWindow::pump_replace_commit() {
     }
     // Remember the document we will put back on Undo, before line notes
     // rewrite the per-line endings.
-    bulk_undo_was_clean_ = !live->get_modified();
-    bulk_undo_utf8_ = utf8_bytes_;
-    bulk_undo_newlines_ = newline_count_;
-    bulk_undo_had_lines_ = !source_lines_.empty();
-    bulk_undo_kinds_.clear();
-    if (bulk_undo_had_lines_) {
-      bulk_undo_kinds_ = ending_kinds();
-    }
-    bulk_undo_ending_undo_ = ending_undo_;
-    bulk_undo_ending_redo_ = ending_redo_;
+    stage_replace_undo();
     const int old_nl = static_cast<int>(
         count_newlines(find_scan_.hay.data(), find_scan_.hay.size()));
     const int new_nl = static_cast<int>(
@@ -6116,25 +6167,10 @@ bool MainWindow::pump_replace_commit() {
       commit_swap_undo_open_ = false;
     }
     commit_swap_buffer_->set_max_undo_levels(100);
-    // One grouped undo record so the buffer reports can-undo. Ctrl+Z
-    // restores the previous document buffer instead of replaying this.
-    const int before = commit_swap_buffer_->get_char_count();
-    commit_swap_buffer_->begin_user_action();
-    commit_swap_buffer_->insert(commit_swap_buffer_->end(), " ");
-    {
-      auto end = commit_swap_buffer_->end();
-      auto start = end;
-      if (start.backward_char()) {
-        commit_swap_buffer_->erase(start, end);
-      }
-    }
-    commit_swap_buffer_->end_user_action();
-    if (commit_swap_buffer_->get_char_count() != before) {
-      finish_find_scan(false);
-      return false;
-    }
     auto previous = doc_buffer_;
+    remember_replace_undo(previous);
     seeding_ = true;
+    history_replay_ = true;
     adopt_document_buffer(commit_swap_buffer_);
     commit_swap_buffer_.reset();
     commit_swap_font_.reset();
@@ -6150,15 +6186,17 @@ bool MainWindow::pump_replace_commit() {
         find_scan_.commit_prefix_nl +
         count_newlines(find_scan_.built.data(), find_scan_.built.size()) +
         find_scan_.commit_suffix_nl;
+    // The previous document's ending stack lives in the undo entry.
+    // Edits on this buffer start their own.
+    clear_ending_history();
     if (find_scan_.commit_saw_long) {
       note_line_length(kLongLineChars);
       force_wrap_off();
     }
-    bulk_undo_buffer_ = previous;
-    bulk_undo_old_.clear();
-    bulk_undo_old_.shrink_to_fit();
-    bulk_undo_start_ = find_scan_.replace_start;
-    bulk_undo_armed_ = true;
+    if (auto neu = buffer(); neu && neu != save_buffer_ && !neu->get_modified()) {
+      neu->set_modified(true);
+    }
+    history_replay_ = false;
   }
 
   ending_restore_ = false;
