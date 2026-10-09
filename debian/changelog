@@ -15,7 +15,9 @@ lunduke-edit (0.9-11) unstable; urgency=medium
     A paint no longer walks every line of a 12 MB buffer.
   * Opening a file inserts text, applies the font tag, and records
     line endings in short slices, including a file of several million
-    short lines. Escape during that work is not dropped.
+    short lines. Escape during that work is not dropped. The previous
+    document is cleared in short slices first, and a file that is not
+    valid UTF-8 still opens as Latin-1.
   * Replace All keeps "Replacing… N%" and the previous size on screen
     until the new text is swapped in, and asks about a very large undo
     record before the counting pass.

@@ -5450,17 +5450,40 @@ struct EditChecks {
     bool escaped{false};
     bool undo_ok{false};
     int pings{0};
+    int max_height{0};
   };
 
   enum class ProdGeom { Default, Tall, Maximize, ResizeLoad, ResizeApply };
 
   static void shape_window(ProdProbe& probe, Window editor, int width,
                            int height, bool maximize) {
+    // xvfb-run has no window manager, and xdotool's resize is an EWMH
+    // request that nothing handles there. Move and size the client
+    // directly so a tall or maximized leg is actually that size.
+    if (probe.dpy != nullptr) {
+      if (maximize) {
+        width = XDisplayWidth(probe.dpy, DefaultScreen(probe.dpy));
+        height = XDisplayHeight(probe.dpy, DefaultScreen(probe.dpy));
+      }
+      XMoveResizeWindow(probe.dpy, editor, 0, 0,
+                        static_cast<unsigned>(width),
+                        static_cast<unsigned>(height));
+      XFlush(probe.dpy);
+    }
     const std::string id = std::to_string(static_cast<unsigned long>(editor));
-    xdotool_cmd("windowmove " + id + " 8 8");
+    xdotool_cmd("windowmove " + id + " 0 0");
     xdotool_cmd("windowsize " + id + " " + std::to_string(width) + " " +
                 std::to_string(height));
     if (!maximize || probe.dpy == nullptr) {
+      // Set the size again after xdotool. Without a window manager the
+      // EWMH request does not change the window, and it must stay at
+      // the size just applied.
+      if (probe.dpy != nullptr) {
+        XMoveResizeWindow(probe.dpy, editor, 0, 0,
+                          static_cast<unsigned>(width),
+                          static_cast<unsigned>(height));
+        XFlush(probe.dpy);
+      }
       return;
     }
     Display* dpy = probe.dpy;
@@ -5505,6 +5528,7 @@ struct EditChecks {
     bool shaped = false;
     bool shaped_late = false;
     gint64 last_resize = 0;
+    int max_height = 0;
     // Measure past the pass/fail line so a timeout is not mistaken for
     // the real stall. The expect below still uses gap_limit_ms.
     const int ping_timeout = std::max(4000, static_cast<int>(gap_limit_ms) + 150);
@@ -5543,6 +5567,19 @@ struct EditChecks {
         } else {
           poll(nullptr, 0, 20);
           continue;
+        }
+      }
+      if (editor != 0 && probe.dpy != nullptr) {
+        Window geom_root = 0;
+        int gx = 0;
+        int gy = 0;
+        unsigned gw = 0;
+        unsigned gh = 0;
+        unsigned gb = 0;
+        unsigned gd = 0;
+        if (XGetGeometry(probe.dpy, editor, &geom_root, &gx, &gy, &gw, &gh,
+                         &gb, &gd) != 0) {
+          max_height = std::max(max_height, static_cast<int>(gh));
         }
       }
       if (editor != 0 && geom == ProdGeom::Tall && !shaped) {
@@ -5767,6 +5804,7 @@ struct EditChecks {
       }
       (void)replace_armed;
     }
+    stats.max_height = max_height;
     return stats;
   }
 
@@ -5937,7 +5975,13 @@ struct EditChecks {
                 << " escape_at_ms=" << stats.escape_at_ms
                 << " honor_ms=" << stats.honor_ms
                 << " honored=" << stats.honored
-                << " undo_ok=" << stats.undo_ok << "\n";
+                << " undo_ok=" << stats.undo_ok
+                << " height=" << stats.max_height << "\n";
+      if (leg.geom == ProdGeom::Tall || leg.geom == ProdGeom::Maximize ||
+          leg.geom == ProdGeom::ResizeLoad || leg.geom == ProdGeom::ResizeApply) {
+        expect(stats.max_height >= 700,
+               "production window actually reaches a tall size");
+      }
       expect(stats.mapped && stats.map_ms >= 0 &&
                  stats.map_ms < (leg.throttle ? 15000.0 : 5000.0),
              "production window maps");
@@ -5981,7 +6025,9 @@ struct EditChecks {
 
     // Before this process registers org.lunduke.LundukeEdit. The production
     // binary is a single instance and would otherwise hand the file here.
-    test_production_responsiveness(dir);
+    if (g_getenv("LUNDUKE_EDIT_SKIP_PRODUCTION") == nullptr) {
+      test_production_responsiveness(dir);
+    }
     if (g_getenv("LUNDUKE_EDIT_PRODUCTION_ONLY") != nullptr) {
       return failures;
     }

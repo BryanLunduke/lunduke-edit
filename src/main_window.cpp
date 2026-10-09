@@ -1253,6 +1253,7 @@ struct MainWindow::LoadState {
   bool text_ready{false};
   std::size_t insert_byte{0};
   bool insert_started{false};
+  bool insert_cleared{false};
   int tag_at{0};
   bool tagged{false};
   std::size_t lines_at{0};
@@ -2672,10 +2673,15 @@ bool MainWindow::slice_load_decode(const std::shared_ptr<LoadState>& state,
     }
     if (!state->text_ready) {
       if (prefer_utf8_) {
-        try {
+        // ustring's string constructor keeps invalid UTF-8 and does not
+        // throw, so a Latin-1 byte would be inserted as-is and the open
+        // would fail the character-count check.
+        if (g_utf8_validate(state->norm_out.data(),
+                            static_cast<gssize>(state->norm_out.size()),
+                            nullptr)) {
           state->text = Glib::ustring(state->norm_out);
           state->encoding = "UTF-8";
-        } catch (const Glib::ConvertError&) {
+        } else {
           state->text = Glib::convert(state->norm_out, "UTF-8", "ISO-8859-1");
           state->encoding = "ISO-8859-1";
         }
@@ -2752,6 +2758,35 @@ bool MainWindow::slice_load_insert(const std::shared_ptr<LoadState>& state,
     }
     state->insert_started = true;
   }
+  // The window already holds the previous document. Inserting at the end
+  // would append, and the character-count check would reject the open.
+  // Drop the old text in slices while the view is parked so a large
+  // buffer does not freeze the display before the new file appears.
+  if (!state->insert_cleared) {
+    bool did = false;
+    try {
+      while (buf->get_char_count() > 0) {
+        if (did && g_get_monotonic_time() - t0 > kLoadSliceUs) {
+          note_load_progress(88);
+          return true;
+        }
+        const int n = buf->get_char_count();
+        const int slice = std::min(32 * 1024, n);
+        auto end = buf->end();
+        auto start = end;
+        if (!start.backward_chars(slice)) {
+          start = buf->begin();
+        }
+        buf->erase(start, end);
+        did = true;
+      }
+    } catch (const std::bad_alloc&) {
+      fail_async_load(state, "Not enough memory to open this file.",
+                      state->path);
+      return false;
+    }
+    state->insert_cleared = true;
+  }
   const char* data = state->text.data();
   const std::size_t total = state->text.bytes();
   bool did = false;
@@ -2773,7 +2808,10 @@ bool MainWindow::slice_load_insert(const std::shared_ptr<LoadState>& state,
       if (n == 0) {
         n = 1;
       }
-      const Glib::ustring piece(data + state->insert_byte, n);
+      // ustring(const char*, n) copies n characters, not n bytes, and
+      // reads past the slice when a character is more than one byte.
+      const Glib::ustring piece(data + state->insert_byte,
+                                data + state->insert_byte + n);
       buf->insert(buf->end(), piece);
       state->insert_byte += n;
       did = true;
@@ -3840,7 +3878,8 @@ bool MainWindow::pump_bulk_undo() {
     if (n == 0) {
       n = 1;
     }
-    const Glib::ustring piece(old.data() + bulk_undo_at_, n);
+    const Glib::ustring piece(old.data() + bulk_undo_at_,
+                              old.data() + bulk_undo_at_ + n);
     buf->insert(buf->get_iter_at_offset(bulk_undo_start_), piece);
     bulk_undo_start_ += static_cast<int>(piece.length());
     bulk_undo_at_ += n;
@@ -5702,7 +5741,8 @@ bool MainWindow::pump_replace_commit() {
       if (n == 0) {
         n = 1;
       }
-      const Glib::ustring piece(built.data() + find_scan_.commit_byte, n);
+      const Glib::ustring piece(built.data() + find_scan_.commit_byte,
+                                built.data() + find_scan_.commit_byte + n);
       buf->insert(buf->get_iter_at_offset(find_scan_.commit_off), piece);
       find_scan_.commit_off += static_cast<int>(piece.length());
       find_scan_.commit_byte += n;
