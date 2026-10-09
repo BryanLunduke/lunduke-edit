@@ -1,3 +1,18 @@
+lunduke-edit (0.9-11) unstable; urgency=medium
+
+  * Opening a large file stores heights for one screen before
+    GtkSourceView paints, so the main loop keeps handling Escape and
+    moving the window until the file is fully open. A full-buffer
+    line walk on the first draw no longer runs.
+  * Replace All shows progress while it counts matches. A large commit
+    is erased and inserted in short slices and remains one undo step.
+    Cancel and Escape work through that commit.
+  * The line-number gutter numbers the empty line after a final newline.
+  * A production-binary test measures main-loop stalls with X11
+    _NET_WM_PING, including under cpulimit -l 25.
+
+ -- Phil <phil@brushpad.local>  Fri, 09 Oct 2026 18:00:00 +0000
+
 lunduke-edit (0.9-10) unstable; urgency=medium
 
   * Replace All builds the new text off the buffer in short main-loop

@@ -253,12 +253,17 @@ private:
   bool extract_replace_text(gint64 slice_start_us);
   bool build_literal_replacement(gint64 slice_start_us);
   bool build_hit_replacement(gint64 slice_start_us);
+  // Large commits erase and insert in idle slices inside one user action.
+  // Returns true when the idle should run again.
+  bool pump_replace_commit();
   void set_replace_progress(int pct);
   bool literal_replace_possible(const FindOptions& opts,
                                 const std::string& hay) const;
-  // Shape one screen of lines before the first paint. Unmeasured lines
-  // report a height of 0, and both GtkTextView and GtkSourceView then
-  // treat the rest of the buffer as inside the clip.
+  // Store real heights for the visible lines before GtkSourceView draws.
+  // Unmeasured lines report a height of 0, and the source view then walks
+  // get_line_yrange to the end of the buffer. gtk_text_layout_validate is
+  // pixel-budgeted; get_line_yrange and get_iter_location do not mark a
+  // line valid.
   void prevalidate_viewport();
   bool on_text_view_draw(const Cairo::RefPtr<Cairo::Context>& cr);
   void reveal_loaded_view();
@@ -334,6 +339,17 @@ private:
     int char_at{0};
     int progress_pct{-1};
     gint64 max_slice_us{0};
+    // Commit of a large built replacement. The view stays parked and one
+    // user action stays open across idle yields so Cancel is a single undo.
+    bool commit_started{false};
+    bool commit_erased{false};
+    bool commit_inserted{false};
+    bool commit_parked{false};
+    bool commit_applied{false};
+    bool commit_keep{false};
+    int commit_off{0};
+    std::size_t commit_byte{0};
+    std::vector<char> commit_kinds;
   };
 
   struct LoadState;
@@ -373,6 +389,8 @@ private:
   // The next expose of a just-attached large buffer must measure the
   // visible lines before GtkSourceView walks them.
   bool layout_guard_{false};
+  // gtk_text_layout_validate emits changed, which can re-enter draw.
+  bool validating_layout_{false};
   bool follow_caret_{false};
   bool adjusting_scroll_{false};
   int follow_caret_spins_{0};

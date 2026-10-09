@@ -1085,7 +1085,7 @@ MainWindow::MainWindow(Application& app) : app_(app) {
           have_pending_kinds_ = false;
         }
         ending_restore_ = false;
-        if (auto live = text_view_.get_buffer()) {
+        if (auto live = buffer()) {
           if (!source_lines_.empty() &&
               static_cast<int>(source_lines_.size()) != live->get_line_count()) {
             source_lines_.clear();
@@ -1117,7 +1117,7 @@ MainWindow::MainWindow(Application& app) : app_(app) {
           have_pending_kinds_ = false;
         }
         ending_restore_ = false;
-        if (auto live = text_view_.get_buffer()) {
+        if (auto live = buffer()) {
           if (!source_lines_.empty() &&
               static_cast<int>(source_lines_.size()) != live->get_line_count()) {
             source_lines_.clear();
@@ -1298,67 +1298,57 @@ void MainWindow::unpark_document_view() {
 }
 
 void MainWindow::prevalidate_viewport() {
+  if (validating_layout_) {
+    return;
+  }
   auto buf = text_view_.get_buffer();
   if (!buf || buf->begin() == buf->end()) {
     return;
   }
-  int widget_h = text_view_.get_allocated_height();
-  if (widget_h < 64) {
-    widget_h = 400;
+  GtkTextLayout* layout = text_view_layout(text_view_);
+  if (layout == nullptr || gtk_text_layout_is_valid(layout)) {
+    return;
   }
-  const int target = widget_h * 2;
-  Gtk::TextIter iter = buf->begin();
   Gdk::Rectangle vis;
   text_view_.get_visible_rect(vis);
+  int screen = vis.get_height();
+  if (screen < 64) {
+    screen = text_view_.get_allocated_height();
+  }
+  if (screen < 64) {
+    screen = 480;
+  }
+  // Validate past the clip. A y that lands exactly on the measured height
+  // makes get_line_at_y fall through to the end iterator, and GtkSourceView
+  // then highlights and walks every line.
+  const int bottom = vis.get_y() + screen;
+  Gtk::TextIter edge = buf->begin();
   int line_top = 0;
-  text_view_.get_line_at_y(iter, vis.get_y(), line_top);
-  if (iter.get_line() > 2) {
-    iter.backward_lines(2);
+  text_view_.get_line_at_y(edge, std::max(bottom, 0), line_top);
+  int y = 0;
+  int height = 0;
+  text_view_.get_line_yrange(edge, y, height);
+  const int lines = buf->get_line_count();
+  const bool jumped =
+      lines > 50 && edge.get_line() >= lines - 2 && bottom < 100000;
+  if (height > 0 && !jumped) {
+    return;
   }
-  int covered = 0;
-  int base_y = -1;
-  for (int guard = 0; guard < 800 && !iter.is_end(); ++guard) {
-    int y = 0;
-    int height = 0;
-    text_view_.get_line_yrange(iter, y, height);
-    if (height <= 0) {
-      Gdk::Rectangle loc;
-      text_view_.get_iter_location(iter, loc);
-      y = loc.get_y();
-      height = std::max(loc.get_height(), 1);
-    }
-    if (base_y < 0) {
-      base_y = y;
-    }
-    covered = (y - base_y) + std::max(height, 1);
-    if (covered >= target) {
-      break;
-    }
-    if (!iter.forward_line()) {
-      break;
-    }
+  int budget = screen + 256;
+  if (budget > 4000) {
+    budget = 4000;
   }
+  validating_layout_ = true;
+  gtk_text_layout_validate(layout, budget);
+  validating_layout_ = false;
 }
 
 bool MainWindow::on_text_view_draw(const Cairo::RefPtr<Cairo::Context>&) {
-  auto buf = text_view_.get_buffer();
-  bool need = layout_guard_ || loading_;
-  if (!need && buf && buf->get_line_count() > 400) {
-    Gdk::Rectangle vis;
-    text_view_.get_visible_rect(vis);
-    Gtk::TextIter edge = buf->begin();
-    int line_top = 0;
-    const int bottom = vis.get_y() + std::max(vis.get_height(), 1) - 1;
-    text_view_.get_line_at_y(edge, std::max(bottom, 0), line_top);
-    int y = 0;
-    int height = 0;
-    text_view_.get_line_yrange(edge, y, height);
-    need = height <= 0;
-  }
-  if (need) {
-    prevalidate_viewport();
-    layout_guard_ = false;
-  }
+  // Before GtkSourceView's draw. One bounded validate stores heights on
+  // the visible lines so that draw stops at the clip instead of walking
+  // a million zero-height lines.
+  prevalidate_viewport();
+  layout_guard_ = false;
   return false;
 }
 
@@ -3863,17 +3853,25 @@ void MainWindow::on_open_pref_latin1() {
 void MainWindow::remember_source_lines(const Glib::ustring& text,
                                        const std::vector<char>& kinds) {
   source_lines_.clear();
-  const auto parts = split_lf_lines(std::string(text.data(), text.bytes()));
-  source_lines_.reserve(parts.size() + 1);
-  for (std::size_t i = 0; i < parts.size(); ++i) {
-    SourceLine line;
-    line.text = parts[i].text;
-    if (i < kinds.size()) {
-      line.kind = kinds[i];
-    } else {
-      line.kind = parts[i].nl ? style_kind(newline_style_) : 0;
+  // Saving only needs the per-line break. Copying every line of a large
+  // file here is a multi-second stall on the main thread, and
+  // apply_line_endings reads the kind, not the text.
+  if (!kinds.empty()) {
+    source_lines_.reserve(kinds.size() + 1);
+    for (char kind : kinds) {
+      SourceLine line;
+      line.kind = kind;
+      source_lines_.push_back(std::move(line));
     }
-    source_lines_.push_back(std::move(line));
+  } else {
+    const auto parts = split_lf_lines(std::string(text.data(), text.bytes()));
+    source_lines_.reserve(parts.size() + 1);
+    for (const auto& part : parts) {
+      SourceLine line;
+      line.text = part.text;
+      line.kind = part.nl ? style_kind(newline_style_) : 0;
+      source_lines_.push_back(std::move(line));
+    }
   }
   // GtkTextBuffer counts a trailing newline as an extra empty line. Keep a
   // kind-0 entry for it so later inserts land on the same index.
@@ -4599,9 +4597,11 @@ void MainWindow::end_find_user_action() {
 }
 
 void MainWindow::cancel_find_scan() {
-  const bool rollback = find_scan_.user_action_open &&
+  const bool rollback = (find_scan_.user_action_open || find_scan_.commit_applied) &&
                         find_scan_.kind == FindScan::Kind::ReplaceAll;
+  const bool parked = find_scan_.commit_parked;
   find_scan_.cancel = true;
+  find_scan_.commit_applied = false;
   find_idle_.disconnect();
   end_find_user_action();
   if (rollback) {
@@ -4612,6 +4612,10 @@ void MainWindow::cancel_find_scan() {
     }
     refresh_dirty_from_buffer();
   }
+  if (parked && view_parked_) {
+    unpark_document_view();
+  }
+  find_scan_.commit_parked = false;
   find_scan_.active = false;
   find_scan_.dlg = nullptr;
   find_scan_.finishing = false;
@@ -4926,6 +4930,19 @@ bool MainWindow::pump_replace() {
       find_scan_.count = 0;
       find_scan_.undo_bytes = 0;
     }
+    const gint64 count_started = g_get_monotonic_time();
+    auto note_count = [&]() {
+      const int total = std::max(1, buf->get_char_count());
+      int pct = static_cast<int>(
+          (static_cast<long long>(find_scan_.cursor_off) * 20) / total);
+      if (pct < 1 && find_scan_.cursor_off > 0) {
+        pct = 1;
+      }
+      if (pct > 20) {
+        pct = 20;
+      }
+      set_replace_progress(pct);
+    };
     const int chunk = find_chunk_size();
     int cursor_off = find_scan_.cursor_off;
     for (int n = 0; n < chunk; ++n) {
@@ -4934,6 +4951,7 @@ bool MainWindow::pump_replace() {
       const SearchStep step = step_search(false, cursor_off, ms, me);
       if (step == SearchStep::Yield) {
         find_scan_.cursor_off = cursor_off;
+        note_count();
         return true;
       }
       if (step != SearchStep::Hit) {
@@ -4977,17 +4995,24 @@ bool MainWindow::pump_replace() {
         find_scan_.counting = false;
         find_scan_.started = false;
         find_scan_.count = 0;
+        note_count();
         return true;
       }
       cursor_off = next.get_offset();
+      if (g_get_monotonic_time() - count_started > kReplaceSliceUs) {
+        find_scan_.cursor_off = cursor_off;
+        note_count();
+        return true;
+      }
     }
     find_scan_.cursor_off = cursor_off;
+    note_count();
     return true;
   }
 
   // Nothing is written into the buffer until the replacement text is
-  // finished. Cancel before that leaves the document unchanged. The
-  // commit itself is one erase and one insert, which is one undo step.
+  // finished. Cancel before that leaves the document unchanged. A large
+  // commit is sliced inside one user action; a small one is a single edit.
   const gint64 slice_start = g_get_monotonic_time();
   if (!find_scan_.mode_chosen) {
     Gtk::TextIter range_begin, range_end;
@@ -5080,15 +5105,155 @@ bool MainWindow::pump_replace() {
 
   const int count = find_scan_.count;
   if (count > 0) {
-    set_replace_progress(100);
-    apply_bulk_replace(find_scan_.replace_start, find_scan_.replace_end,
-                       Glib::ustring(find_scan_.built));
+    const bool heavy =
+        find_scan_.built.size() > 32u * 1024u ||
+        (find_scan_.replace_end - find_scan_.replace_start) > 8000;
+    if (heavy) {
+      if (pump_replace_commit()) {
+        return true;
+      }
+      if (!find_scan_.active || find_scan_.cancel) {
+        return false;
+      }
+    } else {
+      set_replace_progress(100);
+      apply_bulk_replace(find_scan_.replace_start, find_scan_.replace_end,
+                         Glib::ustring(find_scan_.built));
+    }
   }
   find_scan_.hits.clear();
   find_scan_.hay.clear();
   find_scan_.folded_hay.clear();
   find_scan_.built.clear();
+  find_scan_.commit_kinds.clear();
   finish_find_scan(true);
+  return false;
+}
+
+bool MainWindow::pump_replace_commit() {
+  auto buf = buffer();
+  if (!buf) {
+    finish_find_scan(false);
+    return false;
+  }
+  if (find_scan_.cancel) {
+    cancel_find_scan();
+    return false;
+  }
+  const gint64 slice_start = g_get_monotonic_time();
+  if (!find_scan_.commit_started) {
+    find_scan_.commit_started = true;
+    const int span = find_scan_.replace_end - find_scan_.replace_start;
+    const bool park = !view_parked_ &&
+                      (span > 4000 || find_scan_.built.size() > 4000);
+    if (park) {
+      park_document_view();
+      find_scan_.commit_parked = true;
+    }
+    const int old_nl =
+        static_cast<int>(count_newlines(find_scan_.hay.data(), find_scan_.hay.size()));
+    const int new_nl = static_cast<int>(
+        count_newlines(find_scan_.built.data(), find_scan_.built.size()));
+    find_scan_.commit_keep = !source_lines_.empty() && old_nl == new_nl;
+    if (find_scan_.commit_keep) {
+      snapshot_endings();
+      find_scan_.commit_kinds = ending_kinds();
+      ending_restore_ = true;
+    } else if (!source_lines_.empty()) {
+      source_lines_.clear();
+      clear_ending_history();
+    }
+    buf->begin_user_action();
+    find_scan_.user_action_open = true;
+    find_scan_.commit_applied = true;
+    find_scan_.commit_off = find_scan_.replace_end;
+    find_scan_.commit_byte = 0;
+    set_replace_progress(96);
+  }
+
+  auto slice_expired = [&](bool did_work) {
+    return did_work &&
+           g_get_monotonic_time() - slice_start > kReplaceSliceUs;
+  };
+
+  if (!find_scan_.commit_erased) {
+    const int target = find_scan_.replace_start;
+    bool erased_any = false;
+    while (find_scan_.commit_off > target) {
+      if (slice_expired(erased_any)) {
+        set_replace_progress(96);
+        return true;
+      }
+      const int slice = std::min(4096, find_scan_.commit_off - target);
+      const int from = find_scan_.commit_off - slice;
+      buf->erase(buf->get_iter_at_offset(from),
+                 buf->get_iter_at_offset(find_scan_.commit_off));
+      find_scan_.commit_off = from;
+      erased_any = true;
+    }
+    find_scan_.commit_erased = true;
+    find_scan_.commit_off = find_scan_.replace_start;
+    find_scan_.commit_byte = 0;
+    if (slice_expired(erased_any)) {
+      set_replace_progress(97);
+      return true;
+    }
+  }
+
+  if (!find_scan_.commit_inserted) {
+    const std::string& built = find_scan_.built;
+    bool inserted_any = false;
+    while (find_scan_.commit_byte < built.size()) {
+      if (slice_expired(inserted_any)) {
+        const int pct =
+            97 + static_cast<int>((find_scan_.commit_byte * 2) /
+                                  std::max<std::size_t>(built.size(), 1));
+        set_replace_progress(std::min(pct, 99));
+        return true;
+      }
+      std::size_t n =
+          std::min<std::size_t>(8u * 1024u, built.size() - find_scan_.commit_byte);
+      while (n > 0 && find_scan_.commit_byte + n < built.size() &&
+             (static_cast<unsigned char>(built[find_scan_.commit_byte + n]) &
+              0xC0) == 0x80) {
+        --n;
+      }
+      if (n == 0) {
+        n = 1;
+      }
+      const Glib::ustring piece(built.data() + find_scan_.commit_byte, n);
+      buf->insert(buf->get_iter_at_offset(find_scan_.commit_off), piece);
+      find_scan_.commit_off += static_cast<int>(piece.length());
+      find_scan_.commit_byte += n;
+      inserted_any = true;
+    }
+    find_scan_.commit_inserted = true;
+    if (slice_expired(inserted_any)) {
+      set_replace_progress(99);
+      return true;
+    }
+  }
+
+  ending_restore_ = false;
+  end_find_user_action();
+  set_replace_progress(100);
+  if (find_scan_.commit_keep &&
+      static_cast<int>(find_scan_.commit_kinds.size()) == buf->get_line_count()) {
+    remember_source_lines({}, find_scan_.commit_kinds);
+  } else if (!source_lines_.empty()) {
+    source_lines_.clear();
+    clear_ending_history();
+  }
+  const int caret = std::min(find_scan_.replace_start, buf->get_char_count());
+  buf->place_cursor(buf->get_iter_at_offset(caret));
+  if (find_scan_.commit_parked && view_parked_) {
+    unpark_document_view();
+  }
+  find_scan_.commit_parked = false;
+  find_scan_.commit_applied = false;
+  clear_find_highlights();
+  update_undo_redo_sensitivity();
+  update_status();
   return false;
 }
 
@@ -5113,7 +5278,7 @@ bool MainWindow::extract_replace_text(gint64 slice_start_us) {
          g_get_monotonic_time() - slice_start_us > kReplaceSliceUs)) {
       const int span = std::max(1, end - find_scan_.replace_start);
       const int done = find_scan_.extract_off - find_scan_.replace_start;
-      set_replace_progress((done * 30) / span);
+      set_replace_progress(20 + (done * 25) / span);
       return false;
     }
     const int next = std::min(end, find_scan_.extract_off + 8192);
@@ -5124,7 +5289,7 @@ bool MainWindow::extract_replace_text(gint64 slice_start_us) {
     find_scan_.extract_off = next;
   }
   find_scan_.extracted = true;
-  set_replace_progress(30);
+  set_replace_progress(45);
   return true;
 }
 
@@ -5194,7 +5359,7 @@ bool MainWindow::build_literal_replacement(gint64 slice_start_us) {
          (scanned > 0 &&
           g_get_monotonic_time() - slice_start_us > kReplaceSliceUs))) {
       const int pct =
-          30 + static_cast<int>((find_scan_.scan_at * 65) /
+          45 + static_cast<int>((find_scan_.scan_at * 50) /
                                 std::max<std::size_t>(hay.size(), 1));
       set_replace_progress(pct);
       return false;
@@ -5246,7 +5411,7 @@ bool MainWindow::build_hit_replacement(gint64 slice_start_us) {
         (scanned > 0 &&
          g_get_monotonic_time() - slice_start_us > kReplaceSliceUs)) {
       const int pct =
-          30 + static_cast<int>((find_scan_.hit_i * 65) /
+          45 + static_cast<int>((find_scan_.hit_i * 50) /
                                 std::max<std::size_t>(find_scan_.hits.size(), 1));
       set_replace_progress(pct);
       return false;
@@ -5289,6 +5454,11 @@ void MainWindow::set_replace_progress(int pct) {
   }
   if (pct > 100) {
     pct = 100;
+  }
+  // Counting occupies 0–20. Later passes must not rewind that number
+  // when their own scale starts lower.
+  if (find_scan_.progress_pct >= 0 && pct < find_scan_.progress_pct) {
+    return;
   }
   if (pct == find_scan_.progress_pct) {
     return;
@@ -5348,6 +5518,9 @@ void MainWindow::start_replace_all(const FindOptions& opts,
   const bool maybe_huge =
       limit > 0 && per > 0 && max_matches > limit / per;
   find_scan_.counting = maybe_huge;
+  // Visible before the first idle, including the counting pass, which
+  // used to run to completion with an empty status line.
+  set_replace_progress(0);
   find_idle_ = Glib::signal_idle().connect(
       sigc::mem_fun(*this, &MainWindow::on_find_idle), kResponsivePriority);
 }
@@ -5593,7 +5766,7 @@ bool MainWindow::apply_bulk_replace(int start_off, int end_off,
     unpark_document_view();
   }
   if (keep && static_cast<int>(kinds.size()) == buf->get_line_count()) {
-    remember_source_lines(buf->get_text(), kinds);
+    remember_source_lines({}, kinds);
   } else if (!source_lines_.empty()) {
     source_lines_.clear();
     clear_ending_history();

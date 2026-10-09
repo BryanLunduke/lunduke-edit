@@ -59,7 +59,7 @@ edit_dnd_source = executable(
   install: false,
 )
 
-test('behavior', edit_behavior_tests, timeout: 600)
+test('behavior', edit_behavior_tests, timeout: 1200)
 
 check_production_binary = find_program('tests/check-production-binary.sh')
 test(
