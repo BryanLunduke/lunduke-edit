@@ -5518,6 +5518,20 @@ struct EditChecks {
     while (elapsed_ms() < deadline_ms) {
       int status = 0;
       if (waitpid(pid, &status, WNOHANG) == pid) {
+        // A command-line open that was cancelled destroys its window and
+        // exits. That can beat the next ping, so treat a still-untitled
+        // exit as cancel success instead of a lost Escape.
+        if (stats.escaped && !stats.titled) {
+          if (stats.honor_ms < 0 && stats.escape_at_ms >= 0) {
+            stats.honor_ms = since_map() - stats.escape_at_ms;
+          }
+          if (stats.honor_ms >= 0 && stats.honor_ms <= 300.0) {
+            stats.honored = true;
+          }
+          if (stats.done_ms < 0) {
+            stats.done_ms = elapsed_ms();
+          }
+        }
         break;
       }
       if (editor == 0) {
