@@ -1,4 +1,4 @@
-# Lunduke Edit 0.9.2 — notes
+# Lunduke Edit 0.9.3 — notes
 
 ## Build
 
@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9.2-1_amd64.deb
+# → packaging/debs/lunduke-edit_0.9.3-1_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,11 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9.3
+
+- **LCOS identity**: app / Meson / About **0.9.3** / Debian package **0.9.3-1** for LCOS 0.9.3. No functional changes.
+- README / About / packaging / AppStream metainfo match **0.9.3**.
 
 ## 0.9.2
 
@@ -92,7 +97,12 @@ import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
 - **Text menu**: Show Line Numbers uses N, so it does not share Alt+L with Latin-1.
 - App / Meson / About stay **0.9**. Debian package **0.9-4**.
 
-## 0.9-2
+## 0.9.3
+
+- **LCOS identity**: app / Meson / About **0.9.3** / Debian package **0.9.3-1** for LCOS 0.9.3. No functional changes.
+- README / About / packaging / AppStream metainfo match **0.9.3**.
+
+## 0.9.2
 
 - **Save**: a symlink save replaces the canonical target. A broken symlink is left alone. Hard-linked files are written in place. Bytes are flushed before the rename, then the parent directory is flushed. The previous mode and, when permitted, owner are kept.
 - **Open**: a second instance reuses a window only when it is focused and still an empty untitled document. A failed open does not present a spare window. Closed windows are freed. Cancelling a dirty close keeps the window.
