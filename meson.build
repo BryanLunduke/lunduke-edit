@@ -59,15 +59,32 @@ edit_dnd_source = executable(
   install: false,
 )
 
-test('behavior', edit_behavior_tests, timeout: 3600)
+# A sanitizer build runs about ten times slower. Stretch the behavior
+# tests' waits with it, take full allocation stacks, and suppress only
+# toolkit-owned leaks (tests/lsan.supp). The production-binary scan checks
+# a release build; a sanitizer build keeps source paths on purpose.
+sanitize = get_option('b_sanitize')
+behavior_env = environment()
+if sanitize.contains('address')
+  behavior_env.set('LUNDUKE_EDIT_TEST_TIME_SCALE', '10')
+  behavior_env.set('ASAN_OPTIONS',
+    'halt_on_error=1:abort_on_error=1:print_summary=1:fast_unwind_on_malloc=0:malloc_context_size=40')
+  behavior_env.set('LSAN_OPTIONS',
+    'suppressions=' + meson.current_source_dir() / 'tests' / 'lsan.supp' +
+    ':print_suppressions=1:fast_unwind_on_malloc=0')
+endif
+test('behavior', edit_behavior_tests, timeout: sanitize == 'none' ? 3600 : 36000,
+     env: behavior_env)
 
 check_production_binary = find_program('tests/check-production-binary.sh')
-test(
-  'production-binary',
-  check_production_binary,
-  args: [lunduke_edit],
-  depends: lunduke_edit,
-)
+if sanitize == 'none'
+  test(
+    'production-binary',
+    check_production_binary,
+    args: [lunduke_edit],
+    depends: lunduke_edit,
+  )
+endif
 
 install_data(
   'data/org.lunduke.LundukeEdit.desktop',

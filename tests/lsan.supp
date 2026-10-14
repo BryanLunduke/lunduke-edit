@@ -1,0 +1,22 @@
+# LeakSanitizer suppressions for the ASan test run (meson -Db_sanitize=address).
+# Only toolkit and system-library allocations that live until process exit:
+# fontconfig's config/pattern cache, Mesa GLX, cairo font options, and
+# GLib/GTK one-time type and class data. No lunduke-edit or test frames.
+# A leak whose stack names src/ or tests/ code must stay reported.
+leak:libfontconfig.so
+leak:FcValueSave
+leak:FcLangSetCopy
+leak:FcPatternDuplicate
+leak:FcFontRenderPrepare
+leak:libGLX_mesa.so
+leak:libEGL_mesa.so
+leak:cairo_font_options_create
+leak:cairo_font_options_copy
+leak:g_type_register_static
+leak:g_type_register_fundamental
+leak:g_type_class_ref
+leak:g_type_add_interface_static
+leak:gtk_style_context_lookup_style
+leak:gtk_css_
+leak:pango_fc_font_map_
+leak:pango_ot_

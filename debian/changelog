@@ -1,6 +1,9 @@
 lunduke-edit (0.9.4-2) unstable; urgency=medium
 
   * Fix round 9 review findings.
+  * Tests: Replace All cancel and production timing checks wait on state
+    instead of fixed windows; ASan run uses LSan suppressions for toolkit
+    leaks only.
 
  -- Phil <phil@brushpad.local>  Wed, 14 Oct 2026 05:30:11 +0000
 
