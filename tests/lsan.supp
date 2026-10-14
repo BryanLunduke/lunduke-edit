@@ -20,3 +20,10 @@ leak:gtk_style_context_lookup_style
 leak:gtk_css_
 leak:pango_fc_font_map_
 leak:pango_ot_
+# Pango's cairo renderer keeps glyph/item caches (and the PangoLayout
+# wrappers that reach them) allocated under pango_renderer_draw_layout.
+# Evidence: a 20-line gtkmm program that only exports a 3-page
+# Gtk::PrintOperation and shows a layout per page leaks the same
+# pango_glyph_string / pango_item / Pango::Layout wrap_new chains; with
+# this one line it is LSan-clean. No Lunduke Edit code involved.
+leak:pango_renderer_draw_layout
