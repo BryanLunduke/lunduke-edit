@@ -27,3 +27,10 @@ leak:pango_ot_
 # pango_glyph_string / pango_item / Pango::Layout wrap_new chains; with
 # this one line it is LSan-clean. No Lunduke Edit code involved.
 leak:pango_renderer_draw_layout
+# gtkmm print-context layouts. Evidence: the same program, with only a
+# scoped Gtk::PrintContext::create_pango_layout() + get_size() per page
+# (no draw, RefPtr dropped at once), leaks the Pango::Layout wrapper and
+# its glyph/item chains with zero lunduke-edit code. This line makes that
+# program LSan-clean. Window-owned layouts in MainWindow::print_pages_
+# come from this call too.
+leak:Gtk::PrintContext::create_pango_layout
