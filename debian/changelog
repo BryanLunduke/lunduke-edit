@@ -1,3 +1,9 @@
+lunduke-edit (0.9.4-2) unstable; urgency=medium
+
+  * Fix round 9 review findings.
+
+ -- Phil <phil@brushpad.local>  Wed, 14 Oct 2026 05:30:11 +0000
+
 lunduke-edit (0.9.4-1) unstable; urgency=medium
 
   * Version bump for LCOS 0.9.4. No functional changes.

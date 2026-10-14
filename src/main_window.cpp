@@ -15,6 +15,7 @@
 #include <glibmm/fileutils.h>
 #include <glibmm/main.h>
 #include <glibmm/miscutils.h>
+#include <gtkmm/buttonbox.h>
 #include <gtkmm/aboutdialog.h>
 #include <gtkmm/icontheme.h>
 #include <gtkmm/cssprovider.h>
@@ -133,6 +134,11 @@ constexpr std::size_t kDefaultMaxPasteBytes = 32u * 1024u * 1024u;
 constexpr std::size_t kDefaultMaxOpenHardBytes = 64u * 1024u * 1024u;
 constexpr int kMaxColumnWalk = 4096;
 constexpr int kLongLineChars = 4000;
+// A line longer than this is shown split into display lines (round 9 E-2).
+// GtkTextView lays out a paragraph as one Pango layout, so a multi-megabyte
+// line costs seconds per keystroke. Short display lines keep that cheap.
+constexpr std::size_t kHugeLineChars = 20000;
+constexpr std::size_t kVirtualChunk = 1000;
 // Characters of a long line that stay visible around the caret. The rest is
 // tagged invisible so a keystroke does not shape the whole line. 4096 is
 // about the width GDK can scroll (windows stop at 32767 pixels).
@@ -816,6 +822,148 @@ std::vector<LinePart> split_lf_lines(const std::string& s) {
   return parts;
 }
 
+bool is_utf16(const std::string& enc) {
+  return enc == "UTF-16LE" || enc == "UTF-16BE";
+}
+
+Glib::ustring encoding_label(const std::string& enc) {
+  if (enc == "ISO-8859-1") {
+    return "Latin-1";
+  }
+  if (enc == "UTF-16LE") {
+    return "UTF-16 LE";
+  }
+  if (enc == "UTF-16BE") {
+    return "UTF-16 BE";
+  }
+  return enc;
+}
+
+// UTF-16 by byte order mark, or for BOM-less text by the pattern of zero
+// bytes that ASCII-range characters leave in every other byte.
+const char* detect_utf16(const std::string& raw, bool* bom) {
+  *bom = false;
+  if (raw.size() >= 2) {
+    const auto b0 = static_cast<unsigned char>(raw[0]);
+    const auto b1 = static_cast<unsigned char>(raw[1]);
+    if (b0 == 0xFF && b1 == 0xFE) {
+      *bom = true;
+      return "UTF-16LE";
+    }
+    if (b0 == 0xFE && b1 == 0xFF) {
+      *bom = true;
+      return "UTF-16BE";
+    }
+  }
+  if (raw.size() < 4 || raw.size() % 2 != 0) {
+    return nullptr;
+  }
+  const std::size_t n = std::min<std::size_t>(raw.size(), 65536);
+  std::size_t zero_even = 0;
+  std::size_t zero_odd = 0;
+  for (std::size_t i = 0; i + 1 < n; i += 2) {
+    if (raw[i] == '\0') {
+      ++zero_even;
+    }
+    if (raw[i + 1] == '\0') {
+      ++zero_odd;
+    }
+  }
+  const std::size_t pairs = n / 2;
+  // ASCII-range text in UTF-16 leaves a zero in nearly every high byte.
+  // A stray null in a byte file does not.
+  const char* guess = nullptr;
+  if (pairs >= 2 && zero_odd * 10 >= pairs * 7 && zero_even * 50 <= pairs) {
+    guess = "UTF-16LE";
+  } else if (pairs >= 2 && zero_even * 10 >= pairs * 7 &&
+             zero_odd * 50 <= pairs) {
+    guess = "UTF-16BE";
+  }
+  if (guess == nullptr) {
+    return nullptr;
+  }
+  // The decoded text must look like text: no nulls, no C0 controls other
+  // than tab, line feed, form feed and carriage return.
+  const bool le = guess[6] == 'L';
+  for (std::size_t i = 0; i + 1 < n; i += 2) {
+    const unsigned hi = static_cast<unsigned char>(raw[le ? i + 1 : i]);
+    const unsigned lo = static_cast<unsigned char>(raw[le ? i : i + 1]);
+    if (hi == 0 && lo < 0x20 && lo != '\t' && lo != '\n' && lo != '\r' &&
+        lo != '\f') {
+      return nullptr;
+    }
+  }
+  return guess;
+}
+
+// Splits every line longer than kHugeLineChars into display lines of about
+// kVirtualChunk bytes. Each inserted break gets kind 'v' in |kinds|, and
+// save writes nothing for it. Breaks go after a space or punctuation when
+// one is near, and never inside a multi-byte UTF-8 sequence.
+std::size_t insert_virtual_breaks(std::string& text, std::vector<char>& kinds) {
+  std::string out;
+  out.reserve(text.size() + text.size() / kVirtualChunk + 16);
+  std::vector<char> out_kinds;
+  out_kinds.reserve(kinds.size() + text.size() / kVirtualChunk + 2);
+  std::size_t li = 0;
+  std::size_t count = 0;
+  std::size_t s = 0;
+  while (s <= text.size()) {
+    const void* nl = s < text.size()
+                         ? std::memchr(text.data() + s, '\n', text.size() - s)
+                         : nullptr;
+    const std::size_t e =
+        nl ? static_cast<std::size_t>(static_cast<const char*>(nl) - text.data())
+           : text.size();
+    std::size_t pos = s;
+    if (e - s > kHugeLineChars) {
+      while (e - pos > kVirtualChunk) {
+        std::size_t cut = pos + kVirtualChunk;
+        std::size_t j = cut;
+        bool found = false;
+        while (j > pos + kVirtualChunk - 200) {
+          const char c = text[j - 1];
+          if (c == ' ' || c == ',' || c == ';' || c == '}' || c == '>' ||
+              c == '\t') {
+            found = true;
+            break;
+          }
+          --j;
+        }
+        if (found) {
+          cut = j;
+        } else {
+          while (cut > pos + 1 &&
+                 (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) {
+            --cut;
+          }
+        }
+        out.append(text, pos, cut - pos);
+        out.push_back('\n');
+        out_kinds.push_back('v');
+        ++count;
+        pos = cut;
+      }
+    }
+    out.append(text, pos, e - pos);
+    if (!nl) {
+      break;
+    }
+    out.push_back('\n');
+    out_kinds.push_back(li < kinds.size() ? kinds[li] : 'n');
+    ++li;
+    s = e + 1;
+  }
+  while (li < kinds.size()) {
+    out_kinds.push_back(kinds[li++]);
+  }
+  if (count > 0) {
+    text.swap(out);
+    kinds.swap(out_kinds);
+  }
+  return count;
+}
+
 char style_kind(NewlineStyle style) {
   if (style == NewlineStyle::Crlf) {
     return 'c';
@@ -846,7 +994,9 @@ std::string apply_line_endings(const std::string& encoded_lf,
     if (i < source.size()) {
       kind = source[i].kind == 0 ? style_kind(style) : source[i].kind;
     }
-    if (kind == 'c') {
+    if (kind == 'v') {
+      // Display-only break in a very long line. Not part of the file.
+    } else if (kind == 'c') {
       out.append("\r\n");
     } else if (kind == 'r') {
       out.push_back('\r');
@@ -1023,6 +1173,7 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   // A fresh document is UTF-8 even when the next Open uses another charset.
   encoding_ = "UTF-8";
   saved_encoding_ = "UTF-8";
+  reset_document_extras();
 
   doc_buffer_ = Gsv::Buffer::create();
   doc_buffer_->set_max_undo_levels(100);
@@ -1106,6 +1257,7 @@ MainWindow::MainWindow(Application& app) : app_(app) {
   seeding_ = false;
   encoding_ = "UTF-8";
   saved_encoding_ = "UTF-8";
+  reset_document_extras();
 
   property_is_active().signal_changed().connect([this]() {
     if (get_visible() && is_active()) {
@@ -1213,6 +1365,15 @@ struct MainWindow::LoadState {
   bool has_cr{false};
   bool saw_nul{false};
   bool saw_long{false};
+  bool saw_huge{false};
+  bool chunk_done{false};
+  std::size_t virtual_breaks{0};
+  std::string forced_encoding;
+  bool utf16{false};
+  bool bom{false};
+  bool latin1_fallback{false};
+  bool replaced_invalid{false};
+  long long invalid_offset{-1};
   bool norm_done{false};
   std::size_t norm_at{0};
   std::string norm_out;
@@ -1827,6 +1988,25 @@ void MainWindow::build_ui() {
   add(root_);
   root_.pack_start(menubar_, Gtk::PACK_SHRINK);
 
+  info_label_.set_line_wrap(true);
+  info_label_.set_xalign(0.0f);
+  info_label_.set_width_chars(40);
+  info_label_.set_max_width_chars(90);
+  info_label_.set_hexpand(true);
+  if (auto* content = dynamic_cast<Gtk::Container*>(info_bar_.get_content_area())) {
+    content->add(info_label_);
+  }
+  info_bar_.set_show_close_button(true);
+  if (auto* actions = dynamic_cast<Gtk::ButtonBox*>(info_bar_.get_action_area())) {
+    actions->set_layout(Gtk::BUTTONBOX_END);
+    actions->set_homogeneous(false);
+  }
+  info_bar_.signal_response().connect(
+      sigc::mem_fun(*this, &MainWindow::on_info_response));
+  info_bar_.set_no_show_all(true);
+  info_label_.show();
+  root_.pack_start(info_bar_, Gtk::PACK_SHRINK);
+
   gutter_ = Gtk::manage(new LineGutter(text_view_));
   editor_row_.pack_start(*gutter_, Gtk::PACK_SHRINK);
 
@@ -2102,7 +2282,9 @@ void MainWindow::build_menus() {
     menu->append(*item);
   };
 
-  add_section(text_menu, "Encoding");
+  // Save with Encoding only changes how the text is written. Reopen with
+  // Encoding re-reads the bytes on disk (round 9 E-1).
+  add_section(text_menu, "Save with Encoding");
 
   Gtk::RadioMenuItem::Group enc_group;
   enc_utf8_item_ =
@@ -2117,6 +2299,38 @@ void MainWindow::build_menus() {
   enc_latin1_item_->signal_activate().connect(
       sigc::mem_fun(*this, &MainWindow::on_encoding_latin1));
   text_menu->append(*enc_latin1_item_);
+
+  enc_utf16le_item_ =
+      Gtk::manage(new Gtk::RadioMenuItem(enc_group, "UTF-16 L_E", true));
+  enc_utf16le_item_->signal_activate().connect([this]() {
+    on_save_encoding_item(enc_utf16le_item_, "UTF-16LE");
+  });
+  text_menu->append(*enc_utf16le_item_);
+
+  enc_utf16be_item_ =
+      Gtk::manage(new Gtk::RadioMenuItem(enc_group, "UTF-16 _BE", true));
+  enc_utf16be_item_->signal_activate().connect([this]() {
+    on_save_encoding_item(enc_utf16be_item_, "UTF-16BE");
+  });
+  text_menu->append(*enc_utf16be_item_);
+
+  reopen_enc_item_ =
+      Gtk::manage(new Gtk::MenuItem("_Reopen with Encoding", true));
+  auto* reopen_menu = Gtk::manage(new Gtk::Menu());
+  const std::pair<const char*, const char*> reopen_choices[] = {
+      {"UTF-_8", "UTF-8"},
+      {"_Latin-1 (ISO-8859-1)", "ISO-8859-1"},
+      {"UTF-16 L_E", "UTF-16LE"},
+      {"UTF-16 _BE", "UTF-16BE"},
+  };
+  for (const auto& choice : reopen_choices) {
+    auto* item = Gtk::manage(new Gtk::MenuItem(choice.first, true));
+    const std::string enc = choice.second;
+    item->signal_activate().connect([this, enc]() { reopen_with_encoding(enc); });
+    reopen_menu->append(*item);
+  }
+  reopen_enc_item_->set_submenu(*reopen_menu);
+  text_menu->append(*reopen_enc_item_);
 
   text_menu->append(*Gtk::manage(new Gtk::SeparatorMenuItem()));
   add_section(text_menu, "Open Next File As");
@@ -2169,6 +2383,7 @@ void MainWindow::load_seed_sample() {
   file_path_.clear();
   encoding_ = "UTF-8";
   saved_encoding_ = "UTF-8";
+  reset_document_extras();
   encoding_dirty_ = false;
   newline_style_ = NewlineStyle::Lf;
   saved_newline_style_ = NewlineStyle::Lf;
@@ -2459,6 +2674,10 @@ void MainWindow::fail_async_load(const std::shared_ptr<LoadState>& state,
     state->mutated = false;
   }
   seeding_ = false;
+  // The error dialog must not sit over a stale "Opening… 80%" (round 9 E-5).
+  if (status_find_.get_text().find("Opening") == 0) {
+    set_find_count(-1, false);
+  }
   if (!primary.empty()) {
     if (primary == "Could not open file." ||
         primary == "File is too large to open.") {
@@ -2596,6 +2815,7 @@ bool MainWindow::start_async_load(const std::string& path) {
   state->cancellable = Gio::Cancellable::create();
   state->file = Gio::File::create_for_path(path);
   state->path = path;
+  state->forced_encoding = reopen_forced_;
   state->max_bytes = limit;
   state->hard_bytes = hard;
   state->allow_grow = allow_grow;
@@ -2782,6 +3002,49 @@ bool MainWindow::slice_load_decode(const std::shared_ptr<LoadState>& state,
     if (!state->original_copied) {
       state->original = state->raw;
       state->original_copied = true;
+      // UTF-16 is converted to UTF-8 before newline handling, which works
+      // on bytes. The original bytes stay in state->original.
+      {
+        const std::string& forced = state->forced_encoding;
+        bool bom = false;
+        const char* u16 = nullptr;
+        if (is_utf16(forced)) {
+          u16 = forced.c_str();
+          bool detected_bom = false;
+          const char* d = detect_utf16(state->raw, &detected_bom);
+          bom = detected_bom && d != nullptr && forced == d;
+        } else if (forced.empty()) {
+          u16 = detect_utf16(state->raw, &bom);
+        }
+        if (u16 != nullptr) {
+          const std::size_t skip = bom ? 2 : 0;
+          std::string utf8;
+          bool ok = true;
+          try {
+            utf8 = Glib::convert(state->raw.substr(skip), "UTF-8", u16);
+          } catch (const Glib::ConvertError&) {
+            ok = false;
+          }
+          if (!ok && !forced.empty()) {
+            fail_async_load(state, "This file is not valid UTF-16 text.",
+                            state->path);
+            return false;
+          }
+          if (ok) {
+            state->raw.swap(utf8);
+            state->utf16 = true;
+            state->bom = bom;
+            state->encoding = u16;
+          }
+        }
+      }
+      if (!state->utf16) {
+        const gchar* bad = nullptr;
+        if (!g_utf8_validate(state->raw.data(),
+                             static_cast<gssize>(state->raw.size()), &bad)) {
+          state->invalid_offset = static_cast<long long>(bad - state->raw.data());
+        }
+      }
       state->has_cr =
           std::memchr(state->raw.data(), '\r', state->raw.size()) != nullptr;
       state->saw_nul =
@@ -2821,6 +3084,9 @@ bool MainWindow::slice_load_decode(const std::shared_ptr<LoadState>& state,
             } else if (++state->norm_run >=
                        static_cast<std::size_t>(kLongLineChars)) {
               state->saw_long = true;
+              if (state->norm_run > kHugeLineChars) {
+                state->saw_huge = true;
+              }
             }
           }
           state->norm_at = batch;
@@ -2859,6 +3125,9 @@ bool MainWindow::slice_load_decode(const std::shared_ptr<LoadState>& state,
               if (++state->norm_run >=
                   static_cast<std::size_t>(kLongLineChars)) {
                 state->saw_long = true;
+                if (state->norm_run > kHugeLineChars) {
+                  state->saw_huge = true;
+                }
               }
               ++state->norm_at;
             }
@@ -2889,8 +3158,39 @@ bool MainWindow::slice_load_decode(const std::shared_ptr<LoadState>& state,
         return true;
       }
     }
+    if (!state->chunk_done) {
+      state->chunk_done = true;
+      if (state->saw_huge) {
+        state->virtual_breaks =
+            insert_virtual_breaks(state->norm_out, state->kinds);
+        if (state->virtual_breaks > 0) {
+          // Display lines are short; the per-line long-line work stays off.
+          state->saw_long = false;
+        }
+        if (expired()) {
+          return true;
+        }
+      }
+    }
     if (!state->text_ready) {
-      if (prefer_utf8_) {
+      const std::string& forced = state->forced_encoding;
+      if (state->utf16) {
+        state->text = Glib::ustring(state->norm_out);
+      } else if (forced == "UTF-8") {
+        if (state->invalid_offset < 0) {
+          state->text = Glib::ustring(state->norm_out);
+        } else {
+          gchar* fixed = g_utf8_make_valid(
+              state->norm_out.data(), static_cast<gssize>(state->norm_out.size()));
+          state->text = Glib::ustring(fixed);
+          g_free(fixed);
+          state->replaced_invalid = true;
+        }
+        state->encoding = "UTF-8";
+      } else if (forced == "ISO-8859-1") {
+        state->text = Glib::convert(state->norm_out, "UTF-8", "ISO-8859-1");
+        state->encoding = "ISO-8859-1";
+      } else if (prefer_utf8_) {
         // ustring's string constructor keeps invalid UTF-8 and does not
         // throw, so a Latin-1 byte would be inserted as-is and the open
         // would fail the character-count check.
@@ -2902,6 +3202,7 @@ bool MainWindow::slice_load_decode(const std::shared_ptr<LoadState>& state,
         } else {
           state->text = Glib::convert(state->norm_out, "UTF-8", "ISO-8859-1");
           state->encoding = "ISO-8859-1";
+          state->latin1_fallback = true;
         }
       } else {
         const std::string charset =
@@ -3211,7 +3512,32 @@ bool MainWindow::commit_loaded_text(const std::shared_ptr<LoadState>& state) {
     }
     seeding_ = false;
     long_line_present_ = state->long_line;
+    bom_ = state->bom;
+    latin1_fallback_ = state->latin1_fallback;
+    invalid_utf8_offset_ = state->invalid_offset;
+    virtual_breaks_ = state->virtual_breaks;
     sync_encoding_radios();
+    if (state->latin1_fallback) {
+      show_info(InfoKind::InvalidUtf8,
+                "This file is not valid UTF-8 (first invalid byte at offset " +
+                    std::to_string(state->invalid_offset) +
+                    "). It was opened as Latin-1, so accented letters may "
+                    "look wrong. Reopen as UTF-8 replaces invalid bytes "
+                    "with \uFFFD; saving without edits keeps the bytes as "
+                    "they are.");
+    } else if (state->replaced_invalid) {
+      show_info(InfoKind::Replaced,
+                "Invalid UTF-8 bytes were replaced with \u2018\uFFFD\u2019. "
+                "Saving will write the replacement characters.");
+    } else if (state->virtual_breaks > 0) {
+      show_info(InfoKind::LongLines,
+                "This file has very long lines. They are shown split into "
+                "shorter display lines so editing stays responsive. The "
+                "split points are not saved; Find does not match across "
+                "them.");
+    } else {
+      hide_info();
+    }
     buf->place_cursor(buf->begin());
     if (state->long_line) {
       force_wrap_off();
@@ -3328,7 +3654,8 @@ void MainWindow::update_bytes_status() {
   }
   status_bytes_.set_text(format_bytes(cached_save_bytes()));
   sync_overwrite_status();
-  status_enc_.set_text(encoding_ == "ISO-8859-1" ? "Latin-1" : encoding_);
+  status_enc_.set_text(encoding_label(encoding_) +
+                       (is_utf16(encoding_) && bom_ ? " BOM" : ""));
 }
 
 void MainWindow::update_status() {
@@ -3340,6 +3667,15 @@ std::size_t MainWindow::cached_save_bytes() const {
   std::size_t n = 0;
   if (encoding_ == "UTF-8") {
     n = utf8_bytes_;
+  } else if (is_utf16(encoding_)) {
+    // Two bytes per character outside surrogate pairs, plus the BOM.
+    int chars = 0;
+    if (doc_buffer_) {
+      chars = doc_buffer_->get_char_count();
+    } else if (auto buf = text_view_.get_buffer()) {
+      chars = buf->get_char_count();
+    }
+    n = static_cast<std::size_t>(std::max(chars, 0)) * 2 + (bom_ ? 2 : 0);
   } else if (doc_buffer_) {
     // The view shows an empty scratch buffer while a load is parked.
     // The save size is the document's character count.
@@ -3357,9 +3693,12 @@ std::size_t MainWindow::cached_save_bytes() const {
   // files only add that byte for lines that actually use CRLF. A document
   // with no per-line record still follows the single dominant style.
   if (!source_lines_.empty()) {
+    const std::size_t unit = is_utf16(encoding_) ? 2 : 1;
     for (const auto& line : source_lines_) {
       if (line.kind == 'c') {
-        ++n;
+        n += unit;
+      } else if (line.kind == 'v' && n >= unit) {
+        n -= unit;
       }
     }
     return n;
@@ -3559,6 +3898,7 @@ int MainWindow::display_column_at(const Gtk::TextIter& iter) const {
 void MainWindow::report_error(const Glib::ustring& primary,
                               const Glib::ustring& secondary) {
   ++error_reports_;
+  status_at_last_error_ = status_find_.get_text();
   last_error_primary_ = primary;
   last_error_secondary_ = secondary;
   if (test_mode()) {
@@ -3708,6 +4048,7 @@ void MainWindow::on_new() {
   file_path_.clear();
   encoding_ = "UTF-8";
   saved_encoding_ = "UTF-8";
+  reset_document_extras();
   encoding_dirty_ = false;
   newline_style_ = NewlineStyle::Lf;
   saved_newline_style_ = NewlineStyle::Lf;
@@ -3835,6 +4176,29 @@ bool MainWindow::save_to_path(const std::string& path) {
   }
 
   const Glib::ustring text = text_view_.get_buffer()->get_text();
+  if (virtual_breaks_ > 0 &&
+      static_cast<int>(source_lines_.size()) !=
+          text_view_.get_buffer()->get_line_count()) {
+    // The per-line record was dropped (for example by a multi-line Replace
+    // All), so the display-only breaks can no longer be told apart.
+    bool proceed = test_mode();
+    if (!test_mode()) {
+      Gtk::MessageDialog dlg(*this, "Save with display line breaks?", false,
+                             Gtk::MESSAGE_WARNING, Gtk::BUTTONS_NONE, true);
+      dlg.set_secondary_text(
+          "After the last edit the split points of the very long lines can "
+          "no longer be told apart from real line breaks. Saving will write "
+          "them as line breaks.");
+      dlg.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
+      dlg.add_button("_Save Anyway", Gtk::RESPONSE_ACCEPT);
+      dlg.set_default_response(Gtk::RESPONSE_CANCEL);
+      proceed = run_modal(app_, dlg) == Gtk::RESPONSE_ACCEPT;
+    }
+    if (!proceed) {
+      return false;
+    }
+    virtual_breaks_ = 0;
+  }
   std::string out_bytes;
   try {
     const bool unchanged_text =
@@ -3844,7 +4208,8 @@ bool MainWindow::save_to_path(const std::string& path) {
       out_bytes = loaded_bytes_;
     } else {
       std::string encoded;
-      if (encoding_ == "UTF-8") {
+      const bool utf16 = is_utf16(encoding_);
+      if (encoding_ == "UTF-8" || utf16) {
         encoded.assign(text.data(), text.bytes());
       } else {
         encoded = Glib::convert(text, encoding_, "UTF-8");
@@ -3858,6 +4223,15 @@ bool MainWindow::save_to_path(const std::string& path) {
           saved.push_back(SavedLine{line.text, line.kind});
         }
         out_bytes = apply_line_endings(encoded, saved, newline_style_);
+      }
+      if (utf16) {
+        // Line endings are applied on UTF-8 first; they are bytes there.
+        std::string wide = Glib::convert(out_bytes, encoding_, "UTF-8");
+        if (bom_) {
+          wide.insert(0, encoding_ == "UTF-16LE" ? std::string("\xFF\xFE", 2)
+                                                 : std::string("\xFE\xFF", 2));
+        }
+        out_bytes.swap(wide);
       }
     }
   } catch (const Glib::ConvertError& e) {
@@ -3881,8 +4255,16 @@ bool MainWindow::save_to_path(const std::string& path) {
   loaded_bytes_ = out_bytes;
   loaded_text_ = text;
   loaded_bytes_valid_ = true;
-  {
+  // A document with display-only breaks keeps its per-line record; the
+  // bytes on disk no longer have those breaks. UTF-16 bytes are not
+  // scanned as single-byte text either.
+  if (virtual_breaks_ == 0 && !is_utf16(encoding_)) {
     std::string scan = out_bytes;
+    std::vector<char> kinds;
+    normalize_newlines(scan, kinds);
+    remember_source_lines(text, kinds);
+  } else if (source_lines_.empty()) {
+    std::string scan(text.data(), text.bytes());
     std::vector<char> kinds;
     normalize_newlines(scan, kinds);
     remember_source_lines(text, kinds);
@@ -4563,12 +4945,110 @@ void MainWindow::set_encoding(const std::string& encoding) {
     update_status();
     return;
   }
+  const std::string before = encoding_;
   encoding_ = encoding;
+  if (is_utf16(encoding_) && !is_utf16(before)) {
+    // New UTF-16 files get a BOM, as Windows Notepad writes them.
+    bom_ = is_utf16(saved_encoding_) ? bom_ : true;
+  }
   if (!seeding_) {
     encoding_dirty_ = (encoding_ != saved_encoding_);
     refresh_dirty_from_buffer();
+    if (latin1_fallback_ && encoding_ != "ISO-8859-1") {
+      show_info(InfoKind::SaveHint,
+                "Save with Encoding only changes how this text is written. "
+                "It was read as Latin-1, so it will be saved exactly as it "
+                "looks now. To read the file as " + encoding_label(encoding_) +
+                    " instead, use Text \u2192 Reopen with Encoding.");
+    }
   }
   update_status();
+}
+
+void MainWindow::on_save_encoding_item(Gtk::RadioMenuItem* item,
+                                       const std::string& encoding) {
+  if (item && item->get_active() && !seeding_) {
+    set_encoding(encoding);
+  }
+}
+
+bool MainWindow::reopen_with_encoding(const std::string& encoding) {
+  if (file_path_.empty() || loading_) {
+    return false;
+  }
+  if (dirty_) {
+    bool discard = false;
+    if (const char* hook = test_discard()) {
+      discard = std::strcmp(hook, "cancel") != 0;
+    } else if (!test_mode()) {
+      Gtk::MessageDialog dlg(*this, "Discard changes and reopen?", false,
+                             Gtk::MESSAGE_QUESTION, Gtk::BUTTONS_NONE, true);
+      dlg.set_secondary_text(
+          "Reopening reads \"" + current_basename() + "\" from disk as " +
+          encoding_label(encoding) +
+          ". The changes in this window will be lost.");
+      dlg.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
+      dlg.add_button("_Discard and Reopen", Gtk::RESPONSE_ACCEPT);
+      dlg.set_default_response(Gtk::RESPONSE_CANCEL);
+      discard = run_modal(app_, dlg) == Gtk::RESPONSE_ACCEPT;
+    }
+    if (!discard) {
+      return false;
+    }
+  }
+  const std::string path = file_path_;
+  reopen_forced_ = encoding;
+  const bool ok = open_file_body(path);
+  reopen_forced_.clear();
+  return ok;
+}
+
+void MainWindow::show_info(InfoKind kind, const Glib::ustring& text) {
+  info_kind_ = kind;
+  info_label_.set_text(text);
+  if (auto* area = dynamic_cast<Gtk::Container*>(info_bar_.get_action_area())) {
+    for (auto* child : area->get_children()) {
+      area->remove(*child);
+      delete child;
+    }
+  }
+  info_bar_.set_message_type(kind == InfoKind::LongLines || kind == InfoKind::SaveHint
+                                 ? Gtk::MESSAGE_INFO
+                                 : Gtk::MESSAGE_WARNING);
+  if (kind == InfoKind::InvalidUtf8 || kind == InfoKind::SaveHint) {
+    info_bar_.add_button("Reopen as _UTF-8", 1);
+  }
+  if (kind == InfoKind::InvalidUtf8) {
+    info_bar_.add_button("_Keep Latin-1", Gtk::RESPONSE_CLOSE);
+  }
+  if (kind == InfoKind::Replaced) {
+    info_bar_.add_button("Reopen as _Latin-1", 2);
+  }
+  info_bar_.show();
+}
+
+void MainWindow::hide_info() {
+  info_kind_ = InfoKind::Hidden;
+  info_bar_.hide();
+}
+
+void MainWindow::on_info_response(int response) {
+  hide_info();
+  if (response == 1) {
+    reopen_with_encoding("UTF-8");
+  } else if (response == 2) {
+    reopen_with_encoding("ISO-8859-1");
+  } else if (response == 3) {
+    reopen_with_encoding("UTF-16LE");
+  }
+}
+
+void MainWindow::reset_document_extras() {
+  bom_ = false;
+  latin1_fallback_ = false;
+  invalid_utf8_offset_ = -1;
+  virtual_breaks_ = 0;
+  hide_info();
 }
 
 void MainWindow::set_open_preference(bool utf8) {
@@ -4580,10 +5060,17 @@ void MainWindow::set_open_preference(bool utf8) {
 void MainWindow::sync_encoding_radios() {
   const bool was = seeding_;
   seeding_ = true;
+  if (reopen_enc_item_) {
+    reopen_enc_item_->set_sensitive(!file_path_.empty());
+  }
   if (encoding_ == "ISO-8859-1") {
     if (enc_latin1_item_) {
       enc_latin1_item_->set_active(true);
     }
+  } else if (encoding_ == "UTF-16LE" && enc_utf16le_item_) {
+    enc_utf16le_item_->set_active(true);
+  } else if (encoding_ == "UTF-16BE" && enc_utf16be_item_) {
+    enc_utf16be_item_->set_active(true);
   } else if (enc_utf8_item_) {
     enc_utf8_item_->set_active(true);
   }
