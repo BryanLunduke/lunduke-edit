@@ -14,6 +14,7 @@
 #include <gtkmm/selectiondata.h>
 #include <gtkmm/checkmenuitem.h>
 #include <gtkmm/frame.h>
+#include <gtkmm/infobar.h>
 #include <gtkmm/label.h>
 #include <gtkmm/menu.h>
 #include <gtkmm/menubar.h>
@@ -222,6 +223,16 @@ private:
   void on_encoding_utf8();
   void on_encoding_latin1();
   void set_encoding(const std::string& encoding);
+  void on_save_encoding_item(Gtk::RadioMenuItem* item,
+                             const std::string& encoding);
+  // Re-reads the file on disk and decodes it as |encoding| (round 9 E-1).
+  bool reopen_with_encoding(const std::string& encoding);
+  // Info bar above the text (invalid UTF-8, long-line display, hints).
+  enum class InfoKind { Hidden, InvalidUtf8, Replaced, LongLines, SaveHint };
+  void show_info(InfoKind kind, const Glib::ustring& text);
+  void hide_info();
+  void on_info_response(int response);
+  void reset_document_extras();
   void set_open_preference(bool utf8);
   void on_about();
 
@@ -415,6 +426,11 @@ private:
 
   Gtk::Box root_{Gtk::ORIENTATION_VERTICAL};
   Gtk::MenuBar menubar_;
+  Gtk::InfoBar info_bar_;
+  Gtk::Label info_label_;
+  InfoKind info_kind_{InfoKind::Hidden};
+  // Status-bar find/progress text when the last error was reported.
+  Glib::ustring status_at_last_error_;
   Gtk::Box editor_row_{Gtk::ORIENTATION_HORIZONTAL};
   Gtk::ScrolledWindow scrolled_;
   Gsv::View text_view_;
@@ -508,6 +524,19 @@ private:
   Gtk::Menu* recents_menu_{nullptr};
   Gtk::RadioMenuItem* enc_utf8_item_{nullptr};
   Gtk::RadioMenuItem* enc_latin1_item_{nullptr};
+  Gtk::RadioMenuItem* enc_utf16le_item_{nullptr};
+  Gtk::RadioMenuItem* enc_utf16be_item_{nullptr};
+  Gtk::MenuItem* reopen_enc_item_{nullptr};
+  // Encoding forced by Reopen with Encoding for the next load, or empty.
+  std::string reopen_forced_;
+  // UTF-16 documents: write a byte order mark on save.
+  bool bom_{false};
+  // Opened as Latin-1 because the bytes were not valid UTF-8.
+  bool latin1_fallback_{false};
+  long long invalid_utf8_offset_{-1};
+  // Display-only line breaks inserted into very long lines (round 9 E-2).
+  // Their source kind is 'v' and save writes no bytes for them.
+  std::size_t virtual_breaks_{0};
   Gtk::RadioMenuItem* open_utf8_item_{nullptr};
   Gtk::RadioMenuItem* open_latin1_item_{nullptr};
 

@@ -29,6 +29,14 @@ import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
 
+## 0.9.4-2 (round 9 fixes)
+
+- **E-1**: Text → *Save with Encoding* (UTF-8, Latin-1, UTF-16 LE/BE) only changes how the text is written. New *Reopen with Encoding* submenu re-reads the file from disk in the chosen encoding (asks before discarding unsaved changes). Reopening as UTF-8 replaces invalid bytes with U+FFFD.
+- **E-2**: Lines over 20,000 characters are shown split into display lines of about 1,000 bytes (break kind `v`, written as nothing on save). A 5 MB one-line file opens in well under a second and typing at either end stays responsive. An info bar says so.
+- **E-3**: Invalid UTF-8 still opens losslessly as Latin-1, but an info bar names the first bad byte offset and offers *Reopen as UTF-8* or *Keep Latin-1*.
+- **E-4**: UTF-16 LE/BE files open (BOM, or BOM-less by zero-byte pattern) and save back in the same encoding, keeping the BOM and line endings.
+- **E-5**: The "Opening… N%" status is cleared before an open error is shown.
+
 ## 0.9.4
 
 - **LCOS identity**: app / Meson / About **0.9.4** / Debian package **0.9.4-1** for LCOS 0.9.4. No functional changes.

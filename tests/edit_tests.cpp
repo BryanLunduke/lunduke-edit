@@ -430,6 +430,192 @@ struct EditChecks {
     return false;
   }
 
+
+  // Round 9: encodings (E-1, E-3, E-4), very long lines (E-2), open-error
+  // status (E-5).
+  static void test_round9(MainWindow& w, const std::string& dir) {
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    w.on_new();
+    // Earlier checks leave "Open next file as Latin-1" selected.
+    const bool saved_pref = w.prefer_utf8_;
+    w.set_open_preference(true);
+    // E-1 / E-3
+    expect(w.reopen_enc_item_ != nullptr &&
+               w.reopen_enc_item_->get_label() == "_Reopen with Encoding",
+           "r9: Text menu has Reopen with Encoding");
+    expect(w.reopen_enc_item_ && !w.reopen_enc_item_->get_sensitive(),
+           "r9: Reopen with Encoding is off for an unsaved document");
+    const std::string bad_path = dir + "/r9-bad-utf8.txt";
+    const std::string bad("caf\xc3\xa9 na\xc3\xafve \xff\n");
+    write_bytes(bad_path, bad);
+    expect(w.open_file(bad_path), "r9: open invalid UTF-8");
+    expect(w.encoding_ == "ISO-8859-1" && w.latin1_fallback_,
+           "r9: invalid UTF-8 falls back to Latin-1");
+    expect(w.info_bar_.get_visible() &&
+               w.info_kind_ == MainWindow::InfoKind::InvalidUtf8,
+           "r9: invalid UTF-8 shows the info bar");
+    expect(w.invalid_utf8_offset_ == 13, "r9: info bar names the bad offset");
+    expect(w.info_label_.get_text().find("offset 13") != Glib::ustring::npos,
+           "r9: info bar text has the offset");
+    expect(w.reopen_enc_item_->get_sensitive(),
+           "r9: Reopen with Encoding is on for a file");
+    w.enc_utf8_item_->set_active(true);
+    expect(w.encoding_ == "UTF-8" &&
+               w.info_kind_ == MainWindow::InfoKind::SaveHint,
+           "r9: Save with UTF-8 on a Latin-1 fallback explains Reopen");
+    expect(w.reopen_with_encoding("UTF-8"), "r9: reopen as UTF-8");
+    expect(w.encoding_ == "UTF-8" && !w.dirty_, "r9: reopened UTF-8 is clean");
+    expect(w.buffer()->get_text() == "caf\xc3\xa9 na\xc3\xafve \xef\xbf\xbd\n",
+           "r9: reopen decodes UTF-8 and replaces the bad byte");
+    expect(w.info_kind_ == MainWindow::InfoKind::Replaced,
+           "r9: replaced bytes are announced");
+    expect(w.save_to_path(bad_path) && read_bytes(bad_path) == bad,
+           "r9: unedited reopened file saves the original bytes");
+    w.buffer()->insert(w.buffer()->end(), "x");
+    expect(w.save_to_path(bad_path), "r9: save edited UTF-8");
+    expect(read_bytes(bad_path) ==
+               "caf\xc3\xa9 na\xc3\xafve \xef\xbf\xbd\nx",
+           "r9: accented letters are not double-encoded");
+    expect(w.reopen_with_encoding("ISO-8859-1"), "r9: reopen as Latin-1");
+    expect(w.encoding_ == "ISO-8859-1" &&
+               w.buffer()->get_text().find("caf\xc3\x83\xc2\xa9") == 0,
+           "r9: reopen as Latin-1 re-decodes from disk");
+    w.buffer()->insert(w.buffer()->end(), "y");
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "cancel", TRUE);
+    expect(!w.reopen_with_encoding("UTF-8"), "r9: cancel keeps unsaved edits");
+    expect(w.encoding_ == "ISO-8859-1" && w.dirty_,
+           "r9: cancelled reopen leaves the document alone");
+    g_setenv("LUNDUKE_EDIT_TEST_DISCARD", "discard", TRUE);
+    expect(w.reopen_with_encoding("UTF-8") && !w.dirty_,
+           "r9: discard and reopen");
+
+    // E-4
+    const std::string le_path = dir + "/r9-u16le.txt";
+    const std::string le("\xff\xfeh\0i\0\r\0\n\0\xe9\0", 12);
+    write_bytes(le_path, le);
+    expect(w.open_file(le_path), "r9: open UTF-16 LE with BOM");
+    expect(w.encoding_ == "UTF-16LE" && w.bom_, "r9: UTF-16 LE detected");
+    expect(w.buffer()->get_text() == "hi\n\xc3\xa9", "r9: UTF-16 LE text");
+    expect(w.status_enc_.get_text() == "UTF-16 LE BOM",
+           "r9: status shows UTF-16 LE BOM");
+    expect(w.enc_utf16le_item_->get_active(), "r9: UTF-16 LE radio checked");
+    expect(w.save_to_path(le_path) && read_bytes(le_path) == le,
+           "r9: unedited UTF-16 saves identical bytes");
+    w.buffer()->insert(w.buffer()->end(), "!");
+    expect(w.save_to_path(le_path), "r9: save edited UTF-16 LE");
+    expect(read_bytes(le_path) ==
+               std::string("\xff\xfeh\0i\0\r\0\n\0\xe9\0!\0", 14),
+           "r9: UTF-16 LE save keeps BOM and CRLF");
+    const std::string be_path = dir + "/r9-u16be.txt";
+    const std::string be("\0h\0i\0\n\0o\0k", 10);
+    write_bytes(be_path, be);
+    expect(w.open_file(be_path), "r9: open BOM-less UTF-16 BE");
+    expect(w.encoding_ == "UTF-16BE" && !w.bom_, "r9: UTF-16 BE heuristic");
+    expect(w.buffer()->get_text() == "hi\nok", "r9: UTF-16 BE text");
+    w.buffer()->insert(w.buffer()->end(), "?");
+    expect(w.save_to_path(be_path) &&
+               read_bytes(be_path) == std::string("\0h\0i\0\n\0o\0k\0?", 12),
+           "r9: UTF-16 BE save has no BOM");
+    w.on_new();
+    w.buffer()->set_text("A");
+    w.enc_utf16le_item_->set_active(true);
+    const std::string new16 = dir + "/r9-new16.txt";
+    expect(w.save_to_path(new16) &&
+               read_bytes(new16) == std::string("\xff\xfe" "A\0", 4),
+           "r9: new UTF-16 file gets a BOM");
+
+    // E-5
+    const std::string nul_path = dir + "/r9-nul.txt";
+    write_bytes(nul_path, std::string("a\0b\xff", 4));
+    w.on_new();
+    expect(!w.open_file(nul_path), "r9: null-byte file is refused");
+    expect(w.status_at_last_error_.find("Opening") != 0,
+           "r9: open error does not keep the Opening status");
+
+    // E-2
+    std::string long_line;
+    for (int i = 0; i < 20000; ++i) {
+      long_line += "word ";
+    }
+    const std::string long_path = dir + "/r9-long.txt";
+    write_bytes(long_path, long_line + "\nshort\r\n");
+    expect(w.open_file(long_path), "r9: open a 100 K-character line");
+    expect(w.virtual_breaks_ >= 90, "r9: long line gets display breaks");
+    expect(w.info_kind_ == MainWindow::InfoKind::LongLines,
+           "r9: long-line display is announced");
+    bool all_short = true;
+    for (int i = 0; i < w.buffer()->get_line_count(); ++i) {
+      if (w.buffer()->get_iter_at_line(i).get_chars_in_line() > 1100) {
+        all_short = false;
+      }
+    }
+    expect(all_short, "r9: every display line is short");
+    expect(w.status_bytes_.get_text() == "100,008 bytes" ||
+               w.status_bytes_.get_text() == "100008 bytes",
+           "r9: byte count ignores display breaks");
+    expect(w.save_to_path(long_path) &&
+               read_bytes(long_path) == long_line + "\nshort\r\n",
+           "r9: unedited long line saves identically");
+    auto mid = w.buffer()->get_iter_at_line(50);
+    w.buffer()->insert(mid, "X");
+    w.buffer()->insert(w.buffer()->get_iter_at_line(w.buffer()->get_line_count() - 2), "Y");
+    expect(w.save_to_path(long_path), "r9: save edited long line");
+    std::string want = long_line;
+    {
+      // Display line 50 starts after 50 chunks of exactly 1000 bytes here.
+      want.insert(50000, "X");
+    }
+    expect(read_bytes(long_path) == want + "\nYshort\r\n",
+           "r9: edits save without display breaks");
+    w.on_undo();
+    w.on_undo();
+    expect(w.save_to_path(long_path) &&
+               read_bytes(long_path) == long_line + "\nshort\r\n",
+           "r9: undo restores the long line");
+    w.buffer()->insert(w.buffer()->get_iter_at_line(10), "\n");
+    expect(w.save_to_path(long_path), "r9: save with a real break");
+    std::string want_nl = long_line;
+    want_nl.insert(10000, "\r\n");  // CRLF is this file's dominant style.
+    const std::string got_nl = read_bytes(long_path);
+    if (got_nl != want_nl + "\nshort\r\n") {
+      std::cerr << "r9 nl: got " << got_nl.size() << " want "
+                << want_nl.size() + 8 << " lines " << w.source_lines_.size()
+                << "/" << w.buffer()->get_line_count() << " vb "
+                << w.virtual_breaks_ << "\n";
+    }
+    expect(got_nl == want_nl + "\nshort\r\n",
+           "r9: a typed line break is saved");
+
+    // 5 MB one-line file opens quickly and typing at the end stays cheap.
+    std::string big;
+    big.reserve(5000000);
+    for (int i = 0; i < 1000000; ++i) {
+      big += "word ";
+    }
+    const std::string big_path = dir + "/r9-5mb.txt";
+    write_bytes(big_path, big);
+    w.on_new();
+    const gint64 t0 = g_get_monotonic_time();
+    expect(w.open_file(big_path), "r9: open 5 MB one-line file");
+    const double open_s = (g_get_monotonic_time() - t0) / 1e6;
+    std::cerr << "r9: 5 MB one-line open " << open_s << " s\n";
+    expect(open_s < 30.0, "r9: 5 MB one-line file opens in seconds");
+    w.buffer()->place_cursor(w.buffer()->end());
+    const gint64 t1 = g_get_monotonic_time();
+    w.buffer()->insert_at_cursor("z");
+    while (g_main_context_pending(nullptr)) {
+      g_main_context_iteration(nullptr, FALSE);
+    }
+    const double type_s = (g_get_monotonic_time() - t1) / 1e6;
+    std::cerr << "r9: 5 MB one-line type at end " << type_s << " s\n";
+    expect(type_s < 2.0, "r9: typing at the end of a 5 MB line is quick");
+    w.buffer()->set_modified(false);
+    w.refresh_dirty_from_buffer();
+    w.on_new();
+    w.set_open_preference(saved_pref);
+    g_unsetenv("LUNDUKE_EDIT_TEST_DISCARD");
+  }
+
   static void pump_job(MainWindow& w) {
     for (int i = 0; i < 100000 && w.find_scan_.active; ++i) {
       g_main_context_iteration(nullptr, false);
@@ -3580,7 +3766,7 @@ struct EditChecks {
           }
           if (auto* label = dynamic_cast<Gtk::Label*>(item->get_child())) {
             const std::string text = label->get_text();
-            if (text == "Encoding" || text == "Open Next File As") {
+            if (text == "Save with Encoding" || text == "Open Next File As") {
               ++section_hits;
               expect(item->get_sensitive(), "section titles are not greyed out");
             }
@@ -3588,7 +3774,7 @@ struct EditChecks {
         }
       }
       expect(font_items == 1, "Text contains one Font command");
-      expect(section_hits == 2, "Encoding and Open Next File As are section titles");
+      expect(section_hits == 2, "Save with Encoding and Open Next File As are section titles");
       expect(w.open_utf8_item_ &&
                  w.open_utf8_item_->get_label().find("Next file") != std::string::npos &&
                  w.open_utf8_item_->get_label().find("_8") != std::string::npos,
@@ -7305,6 +7491,7 @@ struct EditChecks {
     test_argv_large_open(dir);
     test_throttled_replace(dir);
     test_xdnd(dir);
+    test_round9(*w, dir);
 
     if (!font_path.empty()) {
       if (saved_font.empty()) {
