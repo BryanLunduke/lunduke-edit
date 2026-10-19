@@ -686,12 +686,14 @@ struct EditChecks {
     const std::string b = dir + "/b.txt";
     const std::string c = dir + "/c.txt";
     const std::string good = dir + "/good.txt";
-    const std::string missing = dir + "/missing.txt";
+    // A path that does not exist now opens as a new document (see
+    // test_open_new_path). A directory is still an open failure.
+    const std::string missing = dir + "/open-many-dir.d";
     write_bytes(a, "file-a");
     write_bytes(b, "file-b");
     write_bytes(c, "file-c");
     write_bytes(good, "good");
-    ::unlink(missing.c_str());
+    g_mkdir_with_parents(missing.c_str(), 0700);
 
     if (!app.main_window() || !app.main_window()->get_visible()) {
       auto* created = app.create_window();
@@ -751,6 +753,153 @@ struct EditChecks {
     expect(window_has_path(app, good), "good file opens");
     expect(main_window_count(app) == before_mix + 1,
            "missing file does not leave an extra window");
+  }
+
+  static MainWindow* window_with_path(Application& app, const std::string& path) {
+    for (auto* win : app.get_windows()) {
+      auto* mw = dynamic_cast<MainWindow*>(win);
+      if (mw && mw->file_path_ == path) {
+        return mw;
+      }
+    }
+    return nullptr;
+  }
+
+  // 0.9.5-1: `lunduke-edit newfile.txt` for a path that does not exist opens
+  // an empty document bound to that path; the first Save creates the file.
+  // A missing parent directory is reported at save time, not at launch.
+  static void test_open_new_path(Application& app, const std::string& dir) {
+    const std::string fresh = dir + "/new-095-1.txt";
+    const std::string nodir = dir + "/no-such-dir-095-1";
+    const std::string orphan = nodir + "/orphan.txt";
+    const std::string denied = dir + "/new-095-1-denied.txt";
+    ::unlink(fresh.c_str());
+    ::rmdir(nodir.c_str());
+    write_bytes(denied, "secret");
+    expect(::chmod(denied.c_str(), 0000) == 0, "chmod 000 for new-path test");
+
+    std::set<MainWindow*> prior;
+    for (auto* win : app.get_windows()) {
+      if (auto* mw = dynamic_cast<MainWindow*>(win)) {
+        prior.insert(mw);
+      }
+    }
+    // Only windows this test opened are closed again.
+    auto drop = [&](MainWindow* mw) {
+      if (mw != nullptr && prior.count(mw) == 0) {
+        app.destroy_window_now(mw);
+      }
+    };
+    const int before = main_window_count(app);
+    app.open_files({fresh});
+    flush_ui();
+    MainWindow* nw = window_with_path(app, fresh);
+    expect(nw != nullptr, "nonexistent path opens a window bound to the path");
+    expect(main_window_count(app) == before + 1,
+           "nonexistent path opens exactly one window");
+    if (nw != nullptr) {
+      expect(nw->buffer()->get_text().empty(), "new-path document is empty");
+      expect(!nw->dirty_, "new-path document starts clean");
+      expect(nw->get_title().find("new-095-1.txt") == 0,
+             "title shows the new file's name");
+      expect(::access(fresh.c_str(), F_OK) != 0,
+             "opening a new path does not create the file yet");
+      expect(nw->last_open_error_.empty(), "new path is not an open error");
+
+      // A second launch of the same path presents the same window.
+      app.open_files({fresh});
+      flush_ui();
+      expect(main_window_count(app) == before + 1,
+             "second launch of the new path reuses its window");
+
+      nw->buffer()->set_text("hello new file\n");
+      nw->buffer()->set_modified(true);
+      nw->refresh_dirty_from_buffer();
+      g_setenv("LUNDUKE_EDIT_TEST_SAVE_AS", "cancel", TRUE);
+      const bool saved = nw->save_document();
+      g_unsetenv("LUNDUKE_EDIT_TEST_SAVE_AS");
+      expect(saved, "first Save of a new-path document succeeds without Save As");
+      expect(read_bytes(fresh) == "hello new file\n",
+             "first Save creates the file with the text");
+      expect(!nw->dirty_ && nw->file_path_ == fresh,
+             "saved new-path document is clean and keeps its path");
+      drop(nw);
+    }
+
+    // An untouched new-path document still creates an (empty) file on Save.
+    const std::string blank = dir + "/new-095-1-blank.txt";
+    ::unlink(blank.c_str());
+    app.open_files({blank});
+    flush_ui();
+    MainWindow* bw = window_with_path(app, blank);
+    expect(bw != nullptr, "second nonexistent path opens bound");
+    if (bw != nullptr) {
+      g_setenv("LUNDUKE_EDIT_TEST_SAVE_AS", "cancel", TRUE);
+      expect(bw->save_document(), "Save of an unedited new-path document succeeds");
+      g_unsetenv("LUNDUKE_EDIT_TEST_SAVE_AS");
+      struct stat bst {};
+      expect(::stat(blank.c_str(), &bst) == 0 && S_ISREG(bst.st_mode) &&
+                 bst.st_size == 0,
+             "Save of an unedited new-path document creates an empty file");
+      drop(bw);
+    }
+
+    // Missing parent directory: opens fine, Save gives a clear error.
+    const int before_orphan = main_window_count(app);
+    app.open_files({orphan});
+    flush_ui();
+    MainWindow* ow = window_with_path(app, orphan);
+    expect(ow != nullptr, "path in a missing folder still opens at launch");
+    expect(main_window_count(app) == before_orphan + 1,
+           "missing-folder path opens one window");
+    if (ow != nullptr) {
+      ow->buffer()->set_text("orphan text");
+      ow->buffer()->set_modified(true);
+      ow->refresh_dirty_from_buffer();
+      ow->last_save_error_.clear();
+      g_setenv("LUNDUKE_EDIT_TEST_SAVE_AS", "cancel", TRUE);
+      expect(!ow->save_document(), "Save into a missing folder fails");
+      g_unsetenv("LUNDUKE_EDIT_TEST_SAVE_AS");
+      expect(ow->last_save_error_.find("folder for this file does not exist") !=
+                 std::string::npos,
+             "missing-folder Save says the folder does not exist");
+      expect(ow->last_save_error_.find(nodir) != std::string::npos,
+             "missing-folder Save names the folder");
+      expect(ow->dirty_ && ow->buffer()->get_text() == "orphan text",
+             "failed missing-folder Save keeps the text");
+      expect(::access(nodir.c_str(), F_OK) != 0, "Save does not create the folder");
+      ow->buffer()->set_modified(false);
+      ow->refresh_dirty_from_buffer();
+      drop(ow);
+    }
+
+    // Other open failures keep their behavior: error, no extra window.
+    const int before_denied = main_window_count(app);
+    app.open_files({denied});
+    flush_ui();
+    expect(main_window_count(app) == before_denied,
+           "unreadable path at launch still leaves no window");
+    expect(!window_has_path(app, denied), "unreadable path is not bound");
+    expect(::chmod(denied.c_str(), 0644) == 0, "restore mode after new-path test");
+    const int before_dir = main_window_count(app);
+    app.open_files({dir});
+    flush_ui();
+    expect(main_window_count(app) == before_dir,
+           "directory at launch still leaves no window");
+    // A dangling symlink is not treated as a new file.
+    const std::string dangling = dir + "/new-095-1-dangling";
+    ::unlink(dangling.c_str());
+    expect(::symlink((nodir + "/target").c_str(), dangling.c_str()) == 0,
+           "make dangling symlink");
+    const int before_link = main_window_count(app);
+    app.open_files({dangling});
+    flush_ui();
+    expect(main_window_count(app) == before_link,
+           "dangling symlink at launch is still an open failure");
+    ::unlink(dangling.c_str());
+    ::unlink(fresh.c_str());
+    ::unlink(blank.c_str());
+    ::unlink(denied.c_str());
   }
 
   static void test_review_fixes(Application& app, MainWindow& w,
@@ -7670,6 +7819,7 @@ struct EditChecks {
     test_save_open_undo(*w, dir);
     test_find_replace(*w);
     test_open_many(*app.get(), dir);
+    test_open_new_path(*app.get(), dir);
     test_review_fixes(*app.get(), *w, dir);
     test_hostile_review(*app.get(), *w, dir);
     test_round3(*app.get(), *w, dir);

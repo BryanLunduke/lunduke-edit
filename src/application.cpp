@@ -385,7 +385,7 @@ void Application::open_files(const std::vector<std::string>& paths) {
              focused_->is_empty_untitled()) {
     // Reuse only the focused window, and only while it is still a blank
     // untitled document. Any other document stays where it is.
-    if (focused_->open_file(paths[0])) {
+    if (focused_->open_file_or_new(paths[0])) {
       focused_->present();
     }
     index = 1;
@@ -398,7 +398,7 @@ void Application::open_files(const std::vector<std::string>& paths) {
       continue;
     }
     auto* w = create_window();
-    if (!w->open_file(paths[index])) {
+    if (!w->open_file_or_new(paths[index])) {
       destroy_window_now(w);
       continue;
     }

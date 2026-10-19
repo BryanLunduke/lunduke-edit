@@ -98,7 +98,7 @@ namespace {
 
 using NewlineStyle = MainWindow::NewlineStyle;
 
-const char* kVersion = "0.9.4";
+const char* kVersion = "0.9.5";
 constexpr const char* kAppId = "org.lunduke.LundukeEdit";
 constexpr const char* kFallbackIcon = "accessories-text-editor";
 
@@ -614,6 +614,11 @@ bool replace_following(const std::string& path, const std::string& bytes,
   }
   OwnedFd dirfd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
   if (dirfd.get() < 0) {
+    if (errno == ENOENT) {
+      error = "The folder for this file does not exist. Create the folder "
+              "first, or use Save As to choose another location.\n" + dir;
+      return false;
+    }
     error = std::string("Could not open directory: ") + std::strerror(errno);
     return false;
   }
@@ -2528,6 +2533,31 @@ bool MainWindow::reopen_same_path(const std::string& path,
   return open_file_body(path);
 }
 
+bool MainWindow::open_file_or_new(const std::string& path) {
+  // Only a path that is not there at all (not a dangling symlink, not a
+  // missing parent component that is a file) starts a new document. A
+  // missing parent directory is reported when Save tries to write.
+  struct stat st {};
+  if (opening_ || loading_ || path.empty() || ::lstat(path.c_str(), &st) == 0 ||
+      errno != ENOENT) {
+    return open_file(path);
+  }
+  if (!is_empty_untitled()) {
+    return open_file(path);
+  }
+  bind_new_file(path);
+  return true;
+}
+
+void MainWindow::bind_new_file(const std::string& path) {
+  clear_to_new_document();
+  file_path_ = path;
+  have_file_id_ = false;
+  last_open_error_.clear();
+  update_title();
+  update_status();
+}
+
 bool MainWindow::open_file_body(const std::string& path) {
   if (!start_async_load(path)) {
     return false;
@@ -4035,6 +4065,10 @@ void MainWindow::on_new() {
   if (!confirm_discard_or_save()) {
     return;
   }
+  clear_to_new_document();
+}
+
+void MainWindow::clear_to_new_document() {
   clear_document_search_pins();
   seeding_ = true;
   auto buf = buffer();
@@ -4168,7 +4202,9 @@ bool MainWindow::save_to_path(const std::string& path) {
   // is already the file. Rewriting would drop xattrs and bump mtime.
   // A deleted file is not "already the file": the buffer has to be written
   // back even when the text was not edited.
-  if (!dirty_ && !file_missing_ && same_loaded &&
+  // have_file_id_ is false for a new document bound to a path that does
+  // not exist yet: its first Save must create the file.
+  if (!dirty_ && !file_missing_ && same_loaded && have_file_id_ &&
       disk.kind == DiskIdentity::Unchanged && encoding_ == saved_encoding_ &&
       newline_style_ == saved_newline_style_) {
     remember_recent(path);

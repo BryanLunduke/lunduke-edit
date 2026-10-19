@@ -1,3 +1,12 @@
+lunduke-edit (0.9.5-1) unstable; urgency=medium
+
+  * Version for LCOS 0.9.5.
+  * Opening a path that does not exist (lunduke-edit newfile.txt) starts an
+    empty document bound to that path; the first Save creates the file. A
+    missing parent folder is reported clearly at save time.
+
+ -- Phil <phil@brushpad.local>  Mon, 19 Oct 2026 02:30:00 +0000
+
 lunduke-edit (0.9.4-2) unstable; urgency=medium
 
   * Fix round 9 review findings.
