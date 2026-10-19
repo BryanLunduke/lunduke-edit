@@ -27,6 +27,11 @@
     <category>TextEditor</category>
   </categories>
   <releases>
+    <release version="0.9.5" date="2026-10-18">
+      <description>
+        <p>Version for LCOS 0.9.5. Opening a file name that does not exist yet (for example lunduke-edit newfile.txt) starts an empty document for that file; the first Save creates it. Debian package 0.9.5-1.</p>
+      </description>
+    </release>
     <release version="0.9.4" date="2026-10-13">
       <description>
         <p>Version bump for LCOS 0.9.4. No functional changes. Debian package 0.9.4-1.</p>

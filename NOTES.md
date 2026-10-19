@@ -1,4 +1,4 @@
-# Lunduke Edit 0.9.4 — notes
+# Lunduke Edit 0.9.5 — notes
 
 ## Build
 
@@ -15,7 +15,7 @@ Requirements: C++17, Meson ≥0.56, gtkmm-3.0 ≥3.24, **gtksourceviewmm-3.0 ≥
 
 ```
 ./packaging/build-deb.sh
-# → packaging/debs/lunduke-edit_0.9.4-1_amd64.deb
+# → packaging/debs/lunduke-edit_0.9.5-1_amd64.deb
 ```
 
 Runtime Depends include the gtkmm-3.0 stack and **libgtksourceviewmm-3.0-0v5** (via shlibdeps). Ships `org.lunduke.LundukeEdit.desktop`. **Not** seeded into `lcos-live-06/config/packages.chroot` (optional overlay install only).
@@ -28,6 +28,11 @@ DISPLAY=:2 ./build/lunduke-edit &
 import -window "$(xdotool search --name 'Lunduke Edit' | head -1)" \
   /workspace/uploads/lunduke-edit-0.7-blank.png
 ```
+
+## 0.9.5-1
+
+- **LCOS identity**: app / Meson / About **0.9.5** / Debian package **0.9.5-1** for LCOS 0.9.5.
+- **New file from the command line**: `lunduke-edit newfile.txt` for a path that does not exist opens an empty document bound to that path (the title shows the file name). The first Save creates the file without a Save As dialog. A path whose folder does not exist still opens; Save then says the folder does not exist and names it. Permission denied, directories, dangling symlinks and other open errors are unchanged.
 
 ## 0.9.4-2 (round 9 fixes)
 

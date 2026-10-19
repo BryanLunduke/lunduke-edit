@@ -59,6 +59,10 @@ public:
   // path re-reads the file when it changed on disk.
   bool open_file(const std::string& path, bool discard_already_confirmed = false);
   bool open_file_body(const std::string& path);
+  // Launch (command line / file manager) open. A path that does not exist
+  // yet becomes an empty document bound to that path, so the first Save
+  // creates it. Every other open failure behaves like open_file.
+  bool open_file_or_new(const std::string& path);
   // Continue is close, quit, and File → New / Open. ReloadDisk is the
   // question after the user already chose Reload on a file that changed.
   enum class DiscardKind { Continue, ReloadDisk };
@@ -176,6 +180,8 @@ private:
 
   // File
   void on_new();
+  void clear_to_new_document();
+  void bind_new_file(const std::string& path);
   void on_open();
   void on_open_recent(const std::string& path);
   void on_save();
