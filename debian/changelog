@@ -1,3 +1,11 @@
+lunduke-edit (0.9.6-1) unstable; urgency=medium
+
+  * Version for LCOS 0.9.6.
+  * Set the text view caret color to match the light text area, so the
+    cursor is visible with dark themes (closes lunduke-edit#28).
+
+ -- Phil <phil@brushpad.local>  Wed, 21 Oct 2026 00:30:00 +0000
+
 lunduke-edit (0.9.5-1) unstable; urgency=medium
 
   * Version for LCOS 0.9.5.
