@@ -768,6 +768,56 @@ struct EditChecks {
   // 0.9.5-1: `lunduke-edit newfile.txt` for a path that does not exist opens
   // an empty document bound to that path; the first Save creates the file.
   // A missing parent directory is reported at save time, not at launch.
+  // #28: the text area is always light, so the caret color must not come
+  // from the theme. Adwaita's dark variant draws a white caret otherwise.
+  static GdkRGBA caret_color_of(GtkStyleContext* ctx) {
+    GdkRGBA* rgba = nullptr;
+    gtk_style_context_get(ctx, gtk_style_context_get_state(ctx), "caret-color",
+                          &rgba, nullptr);
+    GdkRGBA out{0, 0, 0, 0};
+    if (rgba != nullptr) {
+      out = *rgba;
+      gdk_rgba_free(rgba);
+    }
+    return out;
+  }
+
+  static bool is_dark_caret(const GdkRGBA& c) {
+    return c.alpha > 0.99 && std::fabs(c.red - 0x1a / 255.0) < 0.01 &&
+           std::fabs(c.green - 0x1a / 255.0) < 0.01 &&
+           std::fabs(c.blue - 0x1a / 255.0) < 0.01;
+  }
+
+  static void test_caret_color(MainWindow& w) {
+    GtkWidget* view = GTK_WIDGET(w.text_view_.gobj());
+    GtkStyleContext* ctx = gtk_widget_get_style_context(view);
+    expect(is_dark_caret(caret_color_of(ctx)),
+           "text view caret is #1a1a1a with the default theme");
+    GtkSettings* settings = gtk_settings_get_default();
+    gboolean prefer_dark = FALSE;
+    g_object_get(settings, "gtk-application-prefer-dark-theme", &prefer_dark,
+                 nullptr);
+    g_object_set(settings, "gtk-application-prefer-dark-theme", TRUE, nullptr);
+    flush_ui();
+    expect(is_dark_caret(caret_color_of(ctx)),
+           "text view caret stays #1a1a1a with a dark theme (#28)");
+    // The text child node, where the glyphs and the caret are drawn.
+    GtkWidgetPath* path = gtk_widget_path_copy(gtk_widget_get_path(view));
+    gtk_widget_path_append_type(path, G_TYPE_NONE);
+    gtk_widget_path_iter_set_object_name(path, -1, "text");
+    GtkStyleContext* text_ctx = gtk_style_context_new();
+    gtk_style_context_set_path(text_ctx, path);
+    gtk_style_context_set_parent(text_ctx, ctx);
+    gtk_style_context_set_screen(text_ctx, gtk_widget_get_screen(view));
+    expect(is_dark_caret(caret_color_of(text_ctx)),
+           "textview text node caret stays #1a1a1a with a dark theme (#28)");
+    g_object_unref(text_ctx);
+    gtk_widget_path_unref(path);
+    g_object_set(settings, "gtk-application-prefer-dark-theme", prefer_dark,
+                 nullptr);
+    flush_ui();
+  }
+
   static void test_open_new_path(Application& app, const std::string& dir) {
     const std::string fresh = dir + "/new-095-1.txt";
     const std::string nodir = dir + "/no-such-dir-095-1";
@@ -7814,6 +7864,7 @@ struct EditChecks {
     expect(w->text_view_.get_monospace(),
            "the default face keeps the monospace style");
 
+    test_caret_color(*w);
     test_columns_and_gutter(*w);
     test_gutter_trailing_newline(*w);
     test_save_open_undo(*w, dir);

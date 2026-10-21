@@ -158,13 +158,19 @@ void Application::install_css() {
     return;
   }
   auto css = Gtk::CssProvider::create();
+  // The text area is always light, so the caret must not follow a dark
+  // theme's light caret color (#28).
   css->load_from_data(
       "textview text {"
       "  background-color: #f7f4e8;"
       "  color: #1a1a1a;"
+      "  caret-color: #1a1a1a;"
+      "  -gtk-secondary-caret-color: #1a1a1a;"
       "}"
       "textview {"
       "  background-color: #f7f4e8;"
+      "  caret-color: #1a1a1a;"
+      "  -gtk-secondary-caret-color: #1a1a1a;"
       "}");
   Gtk::StyleContext::add_provider_for_screen(
       screen, css, GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
