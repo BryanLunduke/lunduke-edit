@@ -27,6 +27,11 @@
     <category>TextEditor</category>
   </categories>
   <releases>
+    <release version="0.9.7" date="2026-10-24">
+      <description>
+        <p>Version bump for LCOS 0.9.7. No functional changes. Debian package 0.9.7-1.</p>
+      </description>
+    </release>
     <release version="0.9.6" date="2026-10-20">
       <description>
         <p>Version for LCOS 0.9.6. The text cursor stays dark on the light text area with dark themes (#28). Debian package 0.9.6-1.</p>
