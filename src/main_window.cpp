@@ -98,7 +98,7 @@ namespace {
 
 using NewlineStyle = MainWindow::NewlineStyle;
 
-const char* kVersion = "0.9.6";
+const char* kVersion = "0.9.7";
 constexpr const char* kAppId = "org.lunduke.LundukeEdit";
 constexpr const char* kFallbackIcon = "accessories-text-editor";
 
